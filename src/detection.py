@@ -1,6 +1,11 @@
+from pathlib import Path
 from ultralytics import YOLO
 
-model = YOLO("yolo11s.pt")
+# Calcul du chemin absolu vers le modèle dans le dossier parent
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT_DIR / "models" / "yolo11s.pt"
+
+model = YOLO(str(MODEL_PATH))
 
 results = model.predict(source=0, classes=[0], conf=0.5, show=True)
 

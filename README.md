@@ -4,7 +4,7 @@ Ce projet implémente un pipeline de comptage de personnes en temps réel basé 
 
 ## 🚀 Fonctionnalités
 
-- **Détection de personnes en temps réel** à l'aide du modèle YOLO11 (`yolo11s.pt`).
+- **Détection de personnes en temps réel** à l'aide du modèle YOLO11 (`models/yolo11s.pt`).
 - **Suivi d'objets (Tracking)** pour surveiller le mouvement des personnes et éviter le double comptage.
 - **Comptage automatique** avec gestion de franchissement de ligne virtuelle (Entrées / Sorties).
 - **Script de lancement automatisé** assurant l'activation de l'environnement virtuel Python.
@@ -20,10 +20,11 @@ Le dépôt est structuré comme suit :
   - `Gantt_Comptage_Personnes.xlsx` : Planification temporelle du projet.
 * 📁 **`models/`** : Fichiers de configuration et poids pour les architectures de modèles supportées.
   - `coco.names` : Liste des classes COCO (dont la classe *person*).
-  - Configs et poids pour YOLOv4 (`yolov4.cfg` / `yolov4.weights`).
-* 📄 **`detection.py`** : Script Python principal effectuant la détection et affichant le flux vidéo traité.
+  - `yolov4.cfg` / `yolov4.weights` : Configuration et poids pour YOLOv4.
+  - `yolo11s.pt` : Poids pré-entraînés pour YOLO11.
+* 📁 **`src/`** : Code source de l'application.
+  - `detection.py` : Script Python principal effectuant la détection et affichant le flux vidéo.
 * 📄 **`run.sh`** : Script Bash utilitaire pour lancer le projet dans l'environnement virtuel local.
-* 📄 **`yolo11s.pt`** : Fichier de poids pré-entraînés pour YOLO11.
 
 ---
 
@@ -61,9 +62,10 @@ chmod +x run.sh
 
 Le script se chargera d'activer l'environnement virtuel `.venv` et lancera la détection en utilisant la webcam de votre machine par défaut (source `0`).
 
-### Paramètres de détection (dans `detection.py`)
-Vous pouvez modifier les paramètres de la fonction `model.predict()` dans `detection.py` :
+### Paramètres de détection (dans `src/detection.py`)
+Vous pouvez modifier les paramètres de la fonction `model.predict()` dans `src/detection.py` :
 - `source` : Index de la caméra (ex: `0` pour la webcam locale) ou chemin vers un fichier vidéo.
 - `classes` : Filtré sur `[0]` pour détecter uniquement les personnes.
 - `conf` : Seuil de confiance minimal (par défaut à `0.5`).
 - `show` : Affichage de la fenêtre vidéo en temps réel (`True`).
+

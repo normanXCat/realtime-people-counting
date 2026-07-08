@@ -12,4 +12,4 @@ else
 fi
 
 # Exécuter la détection
-python "$DIR/detection.py" "$@"
+python "$DIR/src/detection.py" "$@"
