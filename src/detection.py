@@ -1,3 +1,13 @@
+"""
+Script principal de détection, suivi (tracking) et comptage de personnes.
+
+Ce script initialise la capture d'images (webcam, fichier vidéo ou flux réseau),
+instancie le modèle YOLO (YOLO11 par défaut), charge le tracker ByteTrack
+pour suivre les objets détectés, et applique des overlays graphiques
+(ligne de franchissement virtuelle, trainées de trajectoires, HUD de statistiques)
+pour afficher le comptage des entrées et des sorties en temps réel.
+"""
+
 import argparse
 import cv2
 from pathlib import Path
@@ -11,12 +21,15 @@ from visualizer import Visualizer
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = ROOT_DIR / "models" / "yolo11s.pt"
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     """
     Configure et analyse les arguments passés en ligne de commande.
     
+    Permet à l'utilisateur de spécifier la source vidéo, le modèle YOLO,
+    la confiance de détection, la hauteur de la ligne virtuelle et le mode headless.
+    
     Returns:
-        argparse.Namespace: Les arguments parsés.
+        argparse.Namespace: Un objet contenant tous les arguments configurés et analysés.
     """
     parser = argparse.ArgumentParser(
         description="Suivi et comptage de personnes en temps réel avec YOLO11 & ByteTrack."
@@ -52,10 +65,13 @@ def parse_args():
     )
     return parser.parse_args()
 
-def main():
+def main() -> None:
     """
-    Point d'entrée principal du programme. Charge le modèle, initialise
-    le tracker, et démarre la boucle de capture vidéo.
+    Point d'entrée principal du programme.
+    
+    Valide les prérequis comme l'existence du modèle, initialise YOLO,
+    démarre le tracker et lance la boucle infinie de traitement vidéo.
+    Intercepte les signaux d'interruption utilisateur pour un nettoyage propre.
     """
     args = parse_args()
     
