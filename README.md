@@ -53,19 +53,45 @@ pip install ultralytics opencv-python
 
 ## 💻 Utilisation
 
-Pour exécuter le script de détection en temps réel, vous pouvez utiliser le script de démarrage fourni :
+Pour exécuter le projet avec le suivi ByteTrack et le comptage de franchissement de ligne, utilisez le script de démarrage fourni :
 
 ```bash
 chmod +x run.sh
 ./run.sh
 ```
 
-Le script se chargera d'activer l'environnement virtuel `.venv` et lancera la détection en utilisant la webcam de votre machine par défaut (source `0`).
+Le script active automatiquement l'environnement virtuel `.venv` et lance l'application.
 
-### Paramètres de détection (dans `src/detection.py`)
-Vous pouvez modifier les paramètres de la fonction `model.predict()` dans `src/detection.py` :
-- `source` : Index de la caméra (ex: `0` pour la webcam locale) ou chemin vers un fichier vidéo.
-- `classes` : Filtré sur `[0]` pour détecter uniquement les personnes.
-- `conf` : Seuil de confiance minimal (par défaut à `0.5`).
-- `show` : Affichage de la fenêtre vidéo en temps réel (`True`).
+### Options de ligne de commande
+
+Vous pouvez désormais passer des arguments pour configurer le comportement de l'application (qui seront transmis directement par `run.sh`) :
+
+```bash
+./run.sh [options]
+```
+
+#### Liste des options disponibles :
+- `--source <valeur>` : Source vidéo à analyser. Peut être l'index de votre caméra locale (ex: `0` par défaut) ou le chemin vers un fichier vidéo (ex: `/chemin/vers/video.mp4`).
+- `--model <chemin>` : Chemin vers le fichier de modèle YOLO (par défaut : `models/yolo11s.pt`).
+- `--conf <valeur>` : Seuil de confiance minimal de détection de 0.0 à 1.0 (par défaut : `0.5`).
+- `--line-pos <valeur>` : Position verticale de la ligne de franchissement virtuelle (fraction de la hauteur de l'image de 0.0 à 1.0, par défaut : `0.6` soit 60%).
+- `--no-show` : Désactive l'affichage graphique de la fenêtre OpenCV (utile pour le traitement en arrière-plan ou sans interface graphique).
+
+#### Exemples d'utilisation :
+
+1. **Lancer avec la webcam par défaut (source 0) et configurer la ligne à 50% de la hauteur :**
+   ```bash
+   ./run.sh --source 0 --line-pos 0.5
+   ```
+
+2. **Lancer le traitement sur un fichier vidéo avec un seuil de confiance de 0.4 :**
+   ```bash
+   ./run.sh --source "chemin/ma_video.mp4" --conf 0.4
+   ```
+
+3. **Lancer le traitement en tâche de fond (sans fenêtre OpenCV) :**
+   ```bash
+   ./run.sh --source "chemin/ma_video.mp4" --no-show
+   ```
+
 
