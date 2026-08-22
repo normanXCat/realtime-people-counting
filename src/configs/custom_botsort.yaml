@@ -1,0 +1,17 @@
+tracker_type: botsort
+# Seuil haut pour préserver les pistes quand la confiance baisse légèrement.
+track_high_thresh: 0.3
+# Seuil bas de la seconde passe ByteTrack intégrée à BoT-SORT.
+track_low_thresh: 0.05
+# N’initialise pas une piste sur un score très faible.
+new_track_thresh: 0.3
+# Une piste Lost reste disponible 60 frames (~2 secondes à 30 FPS).
+track_buffer: 60
+# Matching spatial assoupli conformément au réglage demandé.
+match_thresh: 0.8
+# Paramètres BoT-SORT natifs.
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+fuse_score: True
+with_reid: True
+gmc_method: sparseOptFlow
