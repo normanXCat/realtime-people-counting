@@ -120,3 +120,9 @@ Pour une caméra fixe et une vidéo à 30 FPS, un premier lancement peut être e
 ```
 
 Les tests unitaires de `tests/test_line_tracker.py` nécessitent `pytest`; la compilation statique et les assertions géométriques peuvent être vérifiées sans caméra avec `python3 -m py_compile src/*.py`.
+
+## Correctif occlusion complète
+
+Pour conserver une identité lorsqu’une personne disparaît entièrement puis réapparaît avec un nouvel ID ByteTrack, la branche `dev` utilise désormais les réglages suivants : `track_buffer=180` et `max_age=180`, soit environ 6 secondes à 30 FPS. Les détections faibles sont conservées avec `conf=0.25`, `track_high_thresh=0.25`, `track_low_thresh=0.05` et `new_track_thresh=0.25`.
+
+L’association Re-ID accepte maintenant une similarité cosinus minimale de **0.42** au lieu de 0.52 dans le module hybride. Son coût est pondéré à **85 % par l’apparence** et **15 % par le mouvement/IoU**, car la prédiction spatiale peut dériver fortement pendant une occlusion complète. La contrainte spatiale n’est donc plus éliminatoire : elle sert seulement de terme secondaire dans le coût d’association.

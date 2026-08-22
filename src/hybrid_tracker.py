@@ -35,10 +35,10 @@ class HybridAssociation:
     def __init__(
         self,
         occlusion_iou: float = 0.35,
-        max_age: int = 150,
-        appearance_threshold: float = 0.52,
-        motion_weight: float = 0.35,
-        appearance_weight: float = 0.65,
+        max_age: int = 180,
+        appearance_threshold: float = 0.42,
+        motion_weight: float = 0.15,
+        appearance_weight: float = 0.85,
     ) -> None:
         self.occlusion_iou = occlusion_iou
         self.max_age = max_age
@@ -128,6 +128,9 @@ class HybridAssociation:
                 predicted[:2] += state.velocity
                 predicted[2:] += state.velocity
                 iou = self._iou(box, predicted)
+                # Après une occlusion complète, la prédiction Kalman peut avoir
+                # dérivé : elle reste un terme faible, tandis que l'apparence
+                # porte l'essentiel de la décision Re-ID.
                 if similarity >= self.appearance_threshold:
                     cost[i, j] = self.appearance_weight * (1.0 - similarity) + self.motion_weight * (1.0 - iou)
         rows, cols = linear_sum_assignment(cost)

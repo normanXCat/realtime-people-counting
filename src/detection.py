@@ -53,8 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.35,
-        help="Seuil de confiance YOLO. 0.35 récupère davantage de personnes petites/partiellement masquées; ajuster selon les faux positifs.",
+        default=0.25,
+        help="Seuil de confiance YOLO. 0.25 laisse les détections faibles atteindre la seconde passe ByteTrack; ajuster selon les faux positifs.",
     )
     parser.add_argument(
         "--iou",
@@ -89,14 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-age",
         type=int,
-        default=150,
-        help="Nombre maximal de frames pendant lesquelles une identité absente reste récupérable.",
+        default=180,
+        help="Nombre maximal de frames pendant lesquelles une identité absente reste récupérable (environ 6 s à 30 FPS).",
     )
     parser.add_argument(
         "--occlusion-threshold",
         type=int,
         default=1,
-        help="Nombre de frames d'absence avant qu'un ID soit archivé en galerie Re-ID (1 pour archivage immédiat).",
+        help="Conservé pour compatibilité; la récupération hybride utilise désormais directement la fenêtre max-age.",
     )
     parser.add_argument(
         "--gallery-ttl",
@@ -107,8 +107,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--similarity-threshold",
         type=float,
-        default=0.45,
-        help="Seuil de similarité cosinus (0.45 par défaut) pour remapper un nouvel ID vers un ancien ID perdu.",
+        default=0.42,
+        help="Seuil de similarité cosinus (0.42) pour favoriser la récupération après occlusion complète.",
     )
     parser.add_argument(
         "--enhance-contrast",
@@ -211,7 +211,7 @@ def main() -> None:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
     print(f"Lancement du suivi hybride (ByteTrack + association DeepSORT/Re-ID) sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}, ReID-sim={args.similarity_threshold:.2f}, apparence=0.85, mouvement=0.15")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
