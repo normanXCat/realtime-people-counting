@@ -39,12 +39,14 @@ class HybridAssociation:
         appearance_threshold: float = 0.42,
         motion_weight: float = 0.15,
         appearance_weight: float = 0.85,
+        appearance_update_confidence: float = 0.70,
     ) -> None:
         self.occlusion_iou = occlusion_iou
         self.max_age = max_age
         self.appearance_threshold = appearance_threshold
         self.motion_weight = motion_weight
         self.appearance_weight = appearance_weight
+        self.appearance_update_confidence = appearance_update_confidence
         self.states: Dict[int, IdentityState] = {}
         self.raw_to_stable: Dict[int, int] = {}
         self.next_id = 1
@@ -58,10 +60,15 @@ class HybridAssociation:
         boxes: np.ndarray,
         frame: np.ndarray,
         frame_index: int,
+        confidences: Optional[Sequence[float]] = None,
     ) -> Tuple[List[int], bool]:
         """Retourne les IDs stables et indique si le mode DeepSORT a été activé."""
         raw_ids = [int(x) for x in raw_ids]
         boxes = np.asarray(boxes, dtype=np.float32)
+        if confidences is None:
+            confidences = [1.0] * len(boxes)
+        if len(confidences) != len(boxes):
+            raise ValueError("confidences et boxes doivent avoir la même longueur")
         if len(raw_ids) != len(boxes):
             raise ValueError("raw_ids et boxes doivent avoir la même longueur")
         if not raw_ids:
@@ -70,6 +77,9 @@ class HybridAssociation:
 
         has_reappearance = any(raw_id not in self.raw_to_stable for raw_id in raw_ids) and any(frame_index - state.last_seen <= self.max_age for state in self.states.values())
         imminent = self._has_imminent_occlusion(boxes) or len(set(raw_ids)) < len(raw_ids) or has_reappearance
+        # En mode hybride, on extrait une feature pour matcher même sur une
+        # détection faible; la règle de qualité ci-dessous interdit seulement
+        # de remplacer la galerie de référence par ce crop potentiellement pollué.
         embeddings = [self._embedding(frame, box) for box in boxes] if imminent else [None] * len(boxes)
         output: List[Optional[int]] = [None] * len(raw_ids)
         used: set[int] = set()
@@ -96,9 +106,10 @@ class HybridAssociation:
                 stable_id = self._new_id(used)
                 output[i] = stable_id
             state = self.states.get(stable_id)
-            should_refresh = imminent or state is None or (frame_index - state.last_seen >= 15)
-            emb = embeddings[i] if embeddings[i] is not None else (self._embedding(frame, boxes[i]) if should_refresh else state.embedding)
-            if emb is not None:
+            high_quality = self._feature_is_trustworthy(confidences[i], boxes[i], frame.shape[:2])
+            should_refresh = high_quality and (imminent or state is None or (frame_index - state.last_seen >= 15))
+            emb = embeddings[i] if embeddings[i] is not None else (self._embedding(frame, boxes[i]) if should_refresh else (state.embedding if state is not None else None))
+            if emb is not None and high_quality:
                 previous = state
                 velocity = boxes[i][:2] - previous.bbox[:2] if previous else np.zeros(2, dtype=np.float32)
                 self.states[stable_id] = IdentityState(emb, boxes[i].copy(), frame_index, velocity)
@@ -163,17 +174,39 @@ class HybridAssociation:
             self.states.pop(sid, None)
         self.raw_to_stable = {raw: sid for raw, sid in self.raw_to_stable.items() if sid in self.states}
 
+    def _feature_is_trustworthy(self, confidence: float, box: np.ndarray, shape) -> bool:
+        """N’autorise l’écriture dans la galerie que sur une vue complète et nette."""
+        h, w = shape
+        margin = 2
+        x1, y1, x2, y2 = box[:4]
+        truncated = x1 <= margin or y1 <= margin or x2 >= w - margin or y2 >= h - margin
+        return float(confidence) >= self.appearance_update_confidence and not truncated
+
     def _ensure_model(self) -> None:
         if self._model is not None:
             return
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
-        backbone.classifier = nn.Identity()
-        self._model = backbone.eval().to(self._device)
-        self._transform = transforms.Compose([
-            transforms.ToPILImage(), transforms.Resize((128, 64)), transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        # OSNet est privilégié pour la Re-ID personne. Le repli MobileNet est
+        # conservé pour les environnements sans torchreid ou sans poids OSNet.
+        try:
+            import torchreid
+            self._model = torchreid.models.build_model(
+                name="osnet_x0_25", num_classes=1000, pretrained=True
+            ).eval().to(self._device)
+            self._transform = transforms.Compose([
+                transforms.ToPILImage(), transforms.Resize((256, 128)), transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
+            return
+        except Exception:
+            backbone = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+            backbone.classifier = nn.Identity()
+            self._model = backbone.eval().to(self._device)
+        if self._transform is None:
+            self._transform = transforms.Compose([
+                transforms.ToPILImage(), transforms.Resize((128, 64)), transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ])
 
     @torch.no_grad()
     def _embedding(self, frame: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
