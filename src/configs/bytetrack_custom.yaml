@@ -1,9 +1,12 @@
-# Configuration ByteTrack optimisée pour la rétention maximale d'IDs et la tolérance aux occlusions.
-
-tracker_type: bytetrack # type de tracker (bytetrack)
-track_high_thresh: 0.4 # seuil de détection haute confiance pour la première passe d'association
-track_low_thresh: 0.05 # seuil de détection basse confiance pour récupérer les détections affaiblies/occultées
-new_track_thresh: 0.4 # seuil minimal pour initialiser une nouvelle piste de suivi
-track_buffer: 120 # nombre de frames (4 secondes à 30fps) pendant lesquelles garder une piste perdue en mémoire ByteTrack
-match_thresh: 0.8 # seuil maximal de distance d'association IoU
-fuse_score: True # fusionner les scores de détection avec les scores de suivi
+tracker_type: bytetrack
+# Première passe : seuil abaissé pour conserver les personnes partiellement masquées.
+track_high_thresh: 0.30
+# Seconde passe : récupère les détections faibles sans autoriser les scores nuls.
+track_low_thresh: 0.08
+# Seuil d'initialisation inférieur au seuil de confiance YOLO pour limiter la fragmentation.
+new_track_thresh: 0.30
+# Persistance d’une piste perdue (~5 s à 30 FPS), alignée sur --max-age.
+track_buffer: 150
+# Association IoU modérée : évite les fusions de personnes proches.
+match_thresh: 0.75
+fuse_score: True

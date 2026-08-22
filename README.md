@@ -95,3 +95,28 @@ Vous pouvez désormais passer des arguments pour configurer le comportement de l
    ```
 
 
+
+## Réglages recommandés sur la branche `dev`
+
+La branche `dev` conserve **ByteTrack comme chemin nominal** afin de limiter le coût d’inférence. Le module `src/hybrid_tracker.py` active une association de type DeepSORT uniquement lorsqu’une ambiguïté est détectée : recouvrement critique entre boîtes, ID ByteTrack dupliqué ou réapparition d’une piste dans la fenêtre de persistance. L’association secondaire combine similarité cosinus d’un embedding MobileNetV3, IoU avec une prédiction cinématique et l’algorithme hongrois.
+
+| Paramètre | Valeur par défaut | Rôle |
+|---|---:|---|
+| `--conf` | `0.35` | Récupère davantage de personnes petites ou partiellement occultées. |
+| `--iou` | `0.55` | Seuil IoU du NMS YOLO, compromis entre doublons et détections proches. |
+| `--imgsz` | `960` | Améliore la détection des personnes éloignées au prix d’une latence supérieure. |
+| `--occlusion-iou` | `0.35` | Déclenche le mode d’association apparence/mouvement. |
+| `--max-age` | `150` frames | Conserve une identité récupérable pendant environ 5 secondes à 30 FPS. |
+| `match_thresh` | `0.75` | Rend l’association ByteTrack moins permissive afin de réduire les fusions. |
+| `track_low_thresh` | `0.08` | Seconde passe ByteTrack pour les détections affaiblies. |
+| `track_buffer` | `150` frames | Évite la création d’un nouvel ID après une occultation courte. |
+
+Le comptage utilise désormais le centre de la boîte, une distance signée lissée, une bande d’hystérésis et la vérification que le segment entre deux centres consécutifs coupe réellement la ligne. Le cooldown par ID empêche les doubles comptages lors d’une hésitation autour de la ligne.
+
+Pour une caméra fixe et une vidéo à 30 FPS, un premier lancement peut être effectué avec :
+
+```bash
+./run.sh --source video.mp4 --conf 0.35 --iou 0.55 --imgsz 960 --no-show
+```
+
+Les tests unitaires de `tests/test_line_tracker.py` nécessitent `pytest`; la compilation statique et les assertions géométriques peuvent être vérifiées sans caméra avec `python3 -m py_compile src/*.py`.
