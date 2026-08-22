@@ -142,7 +142,7 @@ class LineCrossingTracker:
             else:
                 track_ids = boxes.id.round().int().cpu().tolist()
             xyxy_list = boxes.xyxy.cpu().numpy()
-            current_count = len(track_ids)
+            current_count = len(set(track_ids))
 
             for track_id, bbox in zip(track_ids, xyxy_list):
                 active_ids_in_frame.add(track_id)
@@ -152,7 +152,10 @@ class LineCrossingTracker:
                 cx: int = round((x1 + x2) / 2)
                 cy: int = round((y1 + y2) / 2)
 
-                # Mise à jour historique
+                # Mise à jour historique. Le dernier segment est conservé pour
+                # vérifier un franchissement géométrique réel, pas seulement un
+                # changement de signe dû au jitter de la boîte.
+                previous_point = self.track_history[track_id][-1] if track_id in self.track_history and self.track_history[track_id] else None
                 if track_id not in self.track_history:
                     self.track_history[track_id] = deque(maxlen=self.history_len)
                 self.track_history[track_id].append((cx, cy))
@@ -179,6 +182,12 @@ class LineCrossingTracker:
                 )
                 if (self._frame_index - last_count_frame) < self.min_cooldown_frames:
                     self.track_states[track_id] = zone
+                    continue
+
+                segment_crosses = previous_point is not None and self._segments_intersect(
+                    previous_point, (cx, cy), p1_px, p2_px
+                )
+                if not segment_crosses:
                     continue
 
                 if prev_state == "side_a" and zone == "side_b":
@@ -234,6 +243,21 @@ class LineCrossingTracker:
         if dist > margin_px:
             return "side_b"
         return None
+
+    @staticmethod
+    def _segments_intersect(a, b, c, d) -> bool:
+        """Retourne vrai si les segments AB et CD se coupent."""
+        def orient(p, q, r):
+            value = (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+            return 0 if abs(value) < 1e-6 else (1 if value > 0 else -1)
+
+        def on_segment(p, q, r):
+            return min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and min(p[1], r[1]) <= q[1] <= max(p[1], r[1])
+
+        o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+        if o1 != o2 and o3 != o4:
+            return True
+        return (o1 == 0 and on_segment(a, c, b)) or (o2 == 0 and on_segment(a, d, b)) or (o3 == 0 and on_segment(c, a, d)) or (o4 == 0 and on_segment(c, b, d))
 
     def _cleanup_lost_tracks(self, active_ids_in_frame: Set[int]) -> None:
         """Purge les danciennes pistes qui ont dépassé `max_lost_frames`."""

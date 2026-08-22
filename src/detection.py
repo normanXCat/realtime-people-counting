@@ -18,13 +18,13 @@ from ultralytics import YOLO
 
 # Importations des modules locaux
 from calibration import calibrate_line
-from reid import ReIDGallery
+from hybrid_tracker import HybridAssociation
 from tracker import LineCrossingTracker
 from visualizer import Visualizer
 
 # Configuration des chemins
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = ROOT_DIR / "models" / "yolo11n.pt"
+DEFAULT_MODEL_PATH = ROOT_DIR.parent / "models" / "yolo11s.pt"
 CUSTOM_BYTETRACK_CONFIG = ROOT_DIR / "configs" / "bytetrack_custom.yaml"
 
 
@@ -53,14 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.5,
-        help="Seuil de confiance de détection. 0.5 permet d'éliminer les ombres et faux positifs.",
+        default=0.35,
+        help="Seuil de confiance YOLO. 0.35 récupère davantage de personnes petites/partiellement masquées; ajuster selon les faux positifs.",
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.55,
+        help="Seuil IoU du NMS YOLO. Une valeur modérée conserve les personnes proches sans multiplier les doublons.",
     )
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=640,
-        help="Résolution d'inférence (640 par défaut, 960 ou 1280 pour détecter les personnes éloignées/petites).",
+        default=960,
+        help="Résolution d'inférence. 960 améliore les petites personnes; réduire à 640 si la latence devient prioritaire.",
     )
     parser.add_argument(
         "--line-p1",
@@ -73,6 +79,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Coordonnées (x,y) normalisées [0.0-1.0] du point 2 de la ligne (ex: '0.9,0.5'). Saute la calibration manuelle si fourni avec --line-p1.",
+    )
+    parser.add_argument(
+        "--occlusion-iou",
+        type=float,
+        default=0.35,
+        help="IoU entre deux boîtes qui déclenche l’association Re-ID de type DeepSORT.",
+    )
+    parser.add_argument(
+        "--max-age",
+        type=int,
+        default=150,
+        help="Nombre maximal de frames pendant lesquelles une identité absente reste récupérable.",
     )
     parser.add_argument(
         "--occlusion-threshold",
@@ -177,11 +195,11 @@ def main() -> None:
             line_p1, line_p2 = (0.0, 0.6), (1.0, 0.6)
 
     # 2. Initialisation du tracker et de la galerie Re-ID
-    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2)
-    reid_gallery = ReIDGallery(
-        occlusion_threshold=args.occlusion_threshold,
-        gallery_ttl=args.gallery_ttl,
-        similarity_threshold=args.similarity_threshold,
+    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=args.max_age)
+    hybrid = HybridAssociation(
+        occlusion_iou=args.occlusion_iou,
+        max_age=args.max_age,
+        appearance_threshold=args.similarity_threshold,
     )
 
     # Utilisation du fichier de config ByteTrack personnalisé si disponible
@@ -192,7 +210,8 @@ def main() -> None:
     # Prétraitement CLAHE optionnel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
-    print(f"Lancement du suivi (ByteTrack + Re-ID) sur la source : {source}")
+    print(f"Lancement du suivi hybride (ByteTrack + association DeepSORT/Re-ID) sur la source : {source}")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
@@ -205,12 +224,15 @@ def main() -> None:
             persist=True,
             classes=[0],  # 0 correspond à 'person' dans COCO
             conf=args.conf,
+            iou=args.iou,
             imgsz=args.imgsz,
             show=False,
             stream=True,
         )
 
+        frame_index = 0
         for result in results:
+            frame_index += 1
             frame = result.orig_img
             if frame is None:
                 continue
@@ -235,8 +257,12 @@ def main() -> None:
                 if result.boxes.conf is not None:
                     confidences = result.boxes.conf.cpu().numpy()
 
-                # Remapping d'IDs si réapparition après occlusion
-                remapped_ids = reid_gallery.remap_ids(raw_ids, xyxy_list, frame)
+                # ByteTrack est utilisé par défaut. L’association hybride active
+                # l’apparence uniquement en cas d’IoU critique, d’ID dupliqué ou
+                # de réapparition pendant la fenêtre max_age.
+                remapped_ids, deep_sort_active = hybrid.resolve(
+                    raw_ids, xyxy_list, frame, frame_index
+                )
 
             # Mise à jour du tracker et calcul du comptage
             current_count, active_ids = tracker.update(
