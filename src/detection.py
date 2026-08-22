@@ -89,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-age",
         type=int,
-        default=180,
-        help="Nombre maximal de frames pendant lesquelles une identité absente reste récupérable (environ 6 s à 30 FPS).",
+        default=120,
+        help="Nombre maximal de frames pendant lesquelles une piste Lost reste récupérable (environ 4 s à 30 FPS).",
     )
     parser.add_argument(
         "--occlusion-threshold",
@@ -211,7 +211,7 @@ def main() -> None:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
     print(f"Lancement du suivi hybride (ByteTrack + association DeepSORT/Re-ID) sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}, ReID-sim={args.similarity_threshold:.2f}, apparence=0.85, mouvement=0.15")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}, ReID-sim={args.similarity_threshold:.2f}, match-lost=0.70, trails=off")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
@@ -291,7 +291,6 @@ def main() -> None:
                 Visualizer.draw_boxes(frame_draw, xyxy_list, display_ids, confidences)
 
             Visualizer.draw_crossing_line(frame_draw, tracker.line_p1, tracker.line_p2)
-            Visualizer.draw_trails(frame_draw, tracker.track_history)
             Visualizer.draw_hud(frame_draw, current_count, tracker.entries, tracker.exits)
 
             if not args.no_show:

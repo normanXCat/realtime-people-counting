@@ -35,8 +35,8 @@ class HybridAssociation:
     def __init__(
         self,
         occlusion_iou: float = 0.35,
-        max_age: int = 180,
-        appearance_threshold: float = 0.42,
+        max_age: int = 120,
+        appearance_threshold: float = 0.40,
         motion_weight: float = 0.15,
         appearance_weight: float = 0.85,
         appearance_update_confidence: float = 0.70,
