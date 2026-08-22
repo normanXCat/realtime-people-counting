@@ -1,0 +1,35 @@
+# Model weights & binaries
+src/models/yolov4.weights
+*.weights
+models/
+*.pt
+*.onnx
+*.engine
+
+# Specific video files requested
+v.avi
+video1.mp4
+v.e_XwW1gO.avi.part
+
+# Video files & temporary media extensions
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.part
+
+# Test files, folders & temporary test artifacts
+test/
+tests/
+*test*
+test_*
+*_test.*
+
+# Environment & Cache
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

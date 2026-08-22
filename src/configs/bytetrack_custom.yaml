@@ -1,0 +1,9 @@
+# Configuration ByteTrack optimisée pour la rétention maximale d'IDs et la tolérance aux occlusions.
+
+tracker_type: bytetrack # type de tracker (bytetrack)
+track_high_thresh: 0.4 # seuil de détection haute confiance pour la première passe d'association
+track_low_thresh: 0.05 # seuil de détection basse confiance pour récupérer les détections affaiblies/occultées
+new_track_thresh: 0.4 # seuil minimal pour initialiser une nouvelle piste de suivi
+track_buffer: 120 # nombre de frames (4 secondes à 30fps) pendant lesquelles garder une piste perdue en mémoire ByteTrack
+match_thresh: 0.8 # seuil maximal de distance d'association IoU
+fuse_score: True # fusionner les scores de détection avec les scores de suivi
