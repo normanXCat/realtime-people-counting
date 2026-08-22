@@ -1,12 +1,12 @@
 tracker_type: bytetrack
-# Première passe : seuil abaissé pour conserver les personnes avant/après occlusion.
+# Première passe tolérante pour conserver les personnes avant une perte brève.
 track_high_thresh: 0.25
-# Seconde passe ByteTrack : récupère les détections faibles jusqu’à ce seuil.
+# Seconde passe low-confidence pour réassocier les détections faibles.
 track_low_thresh: 0.05
-# Initialisation plus tolérante, afin d’éviter une nouvelle piste après une détection affaiblie.
+# Évite de créer une piste neuve après une baisse momentanée de confiance.
 new_track_thresh: 0.25
-# Mémoire de 180 frames (~6 secondes à 30 FPS).
-track_buffer: 180
-# Association modérée; la ré-identification hybride prend le relais en cas d’ambiguïté.
-match_thresh: 0.75
+# État Lost conservé 120 frames (~4 secondes à 30 FPS).
+track_buffer: 120
+# Matching légèrement assoupli pour les pistes Lost, sans rendre l’association permissive.
+match_thresh: 0.70
 fuse_score: True
