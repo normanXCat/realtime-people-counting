@@ -1,12 +1,12 @@
 tracker_type: bytetrack
-# Première passe : seuil abaissé pour conserver les personnes partiellement masquées.
-track_high_thresh: 0.30
-# Seconde passe : récupère les détections faibles sans autoriser les scores nuls.
-track_low_thresh: 0.08
-# Seuil d'initialisation inférieur au seuil de confiance YOLO pour limiter la fragmentation.
-new_track_thresh: 0.30
-# Persistance d’une piste perdue (~5 s à 30 FPS), alignée sur --max-age.
-track_buffer: 150
-# Association IoU modérée : évite les fusions de personnes proches.
+# Première passe : seuil abaissé pour conserver les personnes avant/après occlusion.
+track_high_thresh: 0.25
+# Seconde passe ByteTrack : récupère les détections faibles jusqu’à ce seuil.
+track_low_thresh: 0.05
+# Initialisation plus tolérante, afin d’éviter une nouvelle piste après une détection affaiblie.
+new_track_thresh: 0.25
+# Mémoire de 180 frames (~6 secondes à 30 FPS).
+track_buffer: 180
+# Association modérée; la ré-identification hybride prend le relais en cas d’ambiguïté.
 match_thresh: 0.75
 fuse_score: True
