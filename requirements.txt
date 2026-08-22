@@ -8,3 +8,4 @@ scikit-learn>=1.2.0
 pillow>=9.5.0
 pyyaml>=6.0.0
 lap>=0.5.12
+torchreid>=0.2.5

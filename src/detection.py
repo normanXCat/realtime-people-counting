@@ -217,6 +217,11 @@ def main() -> None:
 
     window_initialized = False
 
+    # IDs d’affichage indépendants des IDs internes ByteTrack/Re-ID.
+    # Ils restent compacts et commencent toujours à 1 pour cette session.
+    id_mapping = {}
+    next_display_id = 1
+
     try:
         results = model.track(
             source=source,
@@ -251,6 +256,7 @@ def main() -> None:
             remapped_ids = None
             xyxy_list = None
             confidences = None
+            display_ids = []
             if result.boxes is not None and result.boxes.id is not None and result.boxes.xyxy is not None:
                 raw_ids = result.boxes.id.round().int().cpu().tolist()
                 xyxy_list = result.boxes.xyxy.cpu().numpy()
@@ -261,18 +267,27 @@ def main() -> None:
                 # l’apparence uniquement en cas d’IoU critique, d’ID dupliqué ou
                 # de réapparition pendant la fenêtre max_age.
                 remapped_ids, deep_sort_active = hybrid.resolve(
-                    raw_ids, xyxy_list, frame, frame_index
+                    raw_ids, xyxy_list, frame, frame_index, confidences=confidences
                 )
 
-            # Mise à jour du tracker et calcul du comptage
+                # Conversion définitive système -> affichage. Les modules de
+                # comptage et de visualisation ne reçoivent jamais raw_ids.
+                display_ids = []
+                for system_id in remapped_ids:
+                    if system_id not in id_mapping:
+                        id_mapping[system_id] = next_display_id
+                        next_display_id += 1
+                    display_ids.append(id_mapping[system_id])
+
+            # Mise à jour du tracker et calcul du comptage avec display_ids.
             current_count, active_ids = tracker.update(
-                result.boxes, height, width, override_track_ids=remapped_ids
+                result.boxes, height, width,
+                override_track_ids=display_ids if xyxy_list is not None else None,
             )
 
             # Visualisation
             frame_draw = frame.copy()
             if xyxy_list is not None:
-                display_ids = remapped_ids if remapped_ids is not None else raw_ids
                 Visualizer.draw_boxes(frame_draw, xyxy_list, display_ids, confidences)
 
             Visualizer.draw_crossing_line(frame_draw, tracker.line_p1, tracker.line_p2)
