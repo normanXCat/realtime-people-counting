@@ -18,14 +18,13 @@ from ultralytics import YOLO
 
 # Importations des modules locaux
 from calibration import calibrate_line
-from hybrid_tracker import HybridAssociation
 from tracker import LineCrossingTracker
 from visualizer import Visualizer
 
 # Configuration des chemins
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = ROOT_DIR.parent / "models" / "yolo11s.pt"
-CUSTOM_BYTETRACK_CONFIG = ROOT_DIR / "configs" / "bytetrack_custom.yaml"
+CUSTOM_BOTSORT_CONFIG = ROOT_DIR / "configs" / "custom_botsort.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,24 +193,15 @@ def main() -> None:
             print("[Calibration] Mode Headless : Utilisation de la ligne par défaut (60% hauteur).")
             line_p1, line_p2 = (0.0, 0.6), (1.0, 0.6)
 
-    # 2. Initialisation du tracker et de la galerie Re-ID
-    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=args.max_age)
-    hybrid = HybridAssociation(
-        occlusion_iou=args.occlusion_iou,
-        max_age=args.max_age,
-        appearance_threshold=args.similarity_threshold,
-    )
-
-    # Utilisation du fichier de config ByteTrack personnalisé si disponible
-    tracker_config = "bytetrack.yaml"
-    if CUSTOM_BYTETRACK_CONFIG.exists():
-        tracker_config = str(CUSTOM_BYTETRACK_CONFIG)
+    # 2. Tracker natif Ultralytics : BoT-SORT garde lui-même les pistes Lost.
+    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=60)
+    tracker_config = str(CUSTOM_BOTSORT_CONFIG) if CUSTOM_BOTSORT_CONFIG.exists() else "botsort.yaml"
 
     # Prétraitement CLAHE optionnel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
-    print(f"Lancement du suivi hybride (ByteTrack + association DeepSORT/Re-ID) sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, occlusion-IoU={args.occlusion_iou:.2f}, max_age={args.max_age}, ReID-sim={args.similarity_threshold:.2f}, match-lost=0.70, trails=off")
+    print(f"Lancement du suivi natif BoT-SORT sur la source : {source}")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=60, mapping_conf>0.50, trails=off")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
@@ -252,37 +242,43 @@ def main() -> None:
                 limg = cv2.merge((cl, a, b))
                 frame = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-            # --- Couche de réassociation Re-ID par apparence ---
-            remapped_ids = None
+            # --- IDs fournis directement par BoT-SORT natif ---
             xyxy_list = None
             confidences = None
             display_ids = []
+            boxes_for_count = result.boxes
             if result.boxes is not None and result.boxes.id is not None and result.boxes.xyxy is not None:
                 raw_ids = result.boxes.id.round().int().cpu().tolist()
-                xyxy_list = result.boxes.xyxy.cpu().numpy()
-                if result.boxes.conf is not None:
-                    confidences = result.boxes.conf.cpu().numpy()
+                xyxy_all = result.boxes.xyxy.cpu().numpy()
+                confidences_all = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(raw_ids))
 
-                # ByteTrack est utilisé par défaut. L’association hybride active
-                # l’apparence uniquement en cas d’IoU critique, d’ID dupliqué ou
-                # de réapparition pendant la fenêtre max_age.
-                remapped_ids, deep_sort_active = hybrid.resolve(
-                    raw_ids, xyxy_list, frame, frame_index, confidences=confidences
-                )
-
-                # Conversion définitive système -> affichage. Les modules de
-                # comptage et de visualisation ne reçoivent jamais raw_ids.
-                display_ids = []
-                for system_id in remapped_ids:
-                    if system_id not in id_mapping:
-                        id_mapping[system_id] = next_display_id
+                # Un nouvel ID système n’est mappé que si sa confiance dépasse
+                # 0.50. Un ID déjà stabilisé reste affiché même si sa confiance
+                # baisse momentanément.
+                keep_indices = []
+                for index, (track_id, conf) in enumerate(zip(raw_ids, confidences_all)):
+                    if track_id not in id_mapping and float(conf) <= 0.50:
+                        continue
+                    if track_id not in id_mapping:
+                        id_mapping[track_id] = next_display_id
+                        print(f"[DEBUG] Nouvel ID système {track_id} (Conf: {float(conf):.2f}) -> Mappé à l'utilisateur {next_display_id}")
                         next_display_id += 1
-                    display_ids.append(id_mapping[system_id])
+                    keep_indices.append(index)
+                    display_ids.append(id_mapping[track_id])
 
-            # Mise à jour du tracker et calcul du comptage avec display_ids.
+                # Les détections non mappées ne participent ni au comptage ni
+                # au dessin; cela évite de créer des IDs pour des faux positifs.
+                if keep_indices:
+                    boxes_for_count = result.boxes[keep_indices]
+                    xyxy_list = xyxy_all[keep_indices]
+                    confidences = confidences_all[keep_indices]
+                else:
+                    boxes_for_count = None
+
+            # Comptage uniquement avec les IDs séquentiels stabilisés.
             current_count, active_ids = tracker.update(
-                result.boxes, height, width,
-                override_track_ids=display_ids if xyxy_list is not None else None,
+                boxes_for_count, height, width,
+                override_track_ids=display_ids if display_ids else None,
             )
 
             # Visualisation
