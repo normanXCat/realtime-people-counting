@@ -42,11 +42,16 @@ def cross_product(a: Point, b: Point) -> float:
 
 
 class LineCrossingTracker:
-    """Suit les centroïdes et compte chaque direction au maximum une fois."""
+    """Suit les personnes par point médian bas et détecte le franchissement par produit vectoriel."""
 
     # Alias de compatibilité pour les intégrations appelant l’ancienne méthode.
     check_intersection = staticmethod(check_intersection)
     _segments_intersect = staticmethod(check_intersection)
+
+    @staticmethod
+    def get_bottom_center(bbox: Tuple[float, float, float, float]) -> Point:
+        """Point de référence : point médian bas (pieds) (x_center, y_max)."""
+        return (float((bbox[0] + bbox[2]) / 2.0), float(bbox[3]))
 
     def __init__(
         self,
@@ -93,31 +98,33 @@ class LineCrossingTracker:
             for track_id, bbox in zip(track_ids, xyxy):
                 track_id = int(track_id)
                 active_ids.add(track_id)
-                centroid = (float((bbox[0] + bbox[2]) / 2), float((bbox[1] + bbox[3]) / 2))
+                # Point de référence : point médian bas (les pieds) -> (x_center, y_max)
+                bottom_center = (float((bbox[0] + bbox[2]) / 2.0), float(bbox[3]))
                 history = self.track_history.setdefault(track_id, deque(maxlen=self.history_len))
                 previous = history[-1] if history else None
-                history.append(centroid)
+                history.append(bottom_center)
 
                 if previous is None:
                     continue
 
-                movement = (centroid[0] - previous[0], centroid[1] - previous[1])
+                movement = (bottom_center[0] - previous[0], bottom_center[1] - previous[1])
                 if abs(movement[0]) + abs(movement[1]) < 1e-6:
                     continue
-                if not check_intersection(previous, centroid, line_a, line_b):
-                    continue
 
-                # AB x mouvement : positif = côté A vers côté B (entrée),
-                # négatif = côté B vers côté A (sortie).
-                direction = cross_product(line_vector, movement)
-                if direction > 0 and track_id not in self.counted_in:
+                # Calcul du produit vectoriel entre AB et AP pour la frame précédente et courante :
+                # sign = (Bx - Ax) * (Py - Ay) - (By - Ay) * (Px - Ax)
+                sign_prev = cross_product(line_vector, (previous[0] - line_a[0], previous[1] - line_a[1]))
+                sign_curr = cross_product(line_vector, (bottom_center[0] - line_a[0], bottom_center[1] - line_a[1]))
+
+                # Franchissement avec changement de signe du produit vectoriel
+                if sign_prev < 0 and sign_curr > 0 and track_id not in self.counted_in:
                     self.counted_in.add(track_id)
                     self.entries += 1
-                    print(f"[COMPTAGE] Personne #{track_id} est ENTRÉE (segment intersecté)")
-                elif direction < 0 and track_id not in self.counted_out:
+                    print(f"[COMPTAGE] Personne #{track_id} est ENTRÉE (franchissement détecté)")
+                elif sign_prev > 0 and sign_curr < 0 and track_id not in self.counted_out:
                     self.counted_out.add(track_id)
                     self.exits += 1
-                    print(f"[COMPTAGE] Personne #{track_id} est SORTIE (segment intersecté)")
+                    print(f"[COMPTAGE] Personne #{track_id} est SORTIE (franchissement détecté)")
 
         self._cleanup_lost_tracks(active_ids)
         return len(active_ids), active_ids
