@@ -200,14 +200,14 @@ def main() -> None:
             line_p1, line_p2 = (0.0, 0.6), (1.0, 0.6)
 
     # 2. Tracker natif Ultralytics : BoT-SORT garde lui-même les pistes Lost.
-    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=60)
+    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=90)
     tracker_config = str(CUSTOM_BOTSORT_CONFIG) if CUSTOM_BOTSORT_CONFIG.exists() else "botsort.yaml"
 
     # Prétraitement CLAHE optionnel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
     print(f"Lancement du suivi natif BoT-SORT sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=60, mapping_conf>0.50, trails=off")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=90, mapping_conf>0.60, trails=off")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
@@ -262,18 +262,16 @@ def main() -> None:
 
                 keep_indices = []
                 for index, (track_id, conf) in enumerate(zip(raw_ids, confidences_all)):
-                    if track_id not in id_mapping and float(conf) <= 0.50:
-                        continue
+                    conf = float(conf)
                     if track_id not in id_mapping:
-                        id_mapping[track_id] = next_display_id
-                        print(
-                            f"[DEBUG] Nouvel ID système {track_id} "
-                            f"(Conf: {float(conf):.2f}) -> "
-                            f"Mappé à l'utilisateur {next_display_id}"
-                        )
-                        next_display_id += 1
-                    keep_indices.append(index)
-                    display_ids.append(id_mapping[track_id])
+                        if conf > 0.6:  # Seulement si on est sûr que c'est une personne solide
+                            id_mapping[track_id] = next_display_id
+                            print(f"[DEBUG] Nouvel ID: Tracker({track_id}) -> Display({next_display_id}) | Conf: {conf:.2f}")
+                            next_display_id += 1
+
+                    if track_id in id_mapping:
+                        keep_indices.append(index)
+                        display_ids.append(id_mapping[track_id])
 
                 # Les détections non mappées ne participent ni au comptage ni
                 # au dessin; cela évite de créer des IDs pour des faux positifs.

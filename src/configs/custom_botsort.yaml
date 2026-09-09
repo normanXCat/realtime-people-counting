@@ -5,14 +5,16 @@ track_high_thresh: 0.3
 track_low_thresh: 0.05
 # N’initialise pas une piste sur un score très faible.
 new_track_thresh: 0.3
-# Une piste Lost reste disponible 60 frames (~2 secondes à 30 FPS).
-track_buffer: 60
+# Une piste Lost reste disponible 90 frames (~3 secondes à 30 FPS) pour laisser le temps à l'occlusion de se terminer.
+track_buffer: 90
 # Matching spatial assoupli conformément au réglage demandé.
 match_thresh: 0.8
-# Paramètres BoT-SORT natifs.
+# Paramètres BoT-SORT natifs et Ré-Identification Visuelle (ReID).
 proximity_thresh: 0.5
 appearance_thresh: 0.25
 fuse_score: True
 with_reid: True
 model: auto
+reid_weights: osnet_x0_25_msmt17.pt
 gmc_method: sparseOptFlow
+
