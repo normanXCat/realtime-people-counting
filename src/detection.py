@@ -23,7 +23,7 @@ from visualizer import Visualizer
 
 # Configuration des chemins
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = ROOT_DIR.parent / "models" / "yolo11s.pt"
+DEFAULT_MODEL_PATH = ROOT_DIR.parent / "models" / "yolo11n.pt"
 CUSTOM_BOTSORT_CONFIG = ROOT_DIR / "configs" / "custom_botsort.yaml"
 
 
@@ -312,7 +312,8 @@ def main() -> None:
         print("\nArrêt demandé par l'utilisateur (Ctrl+C)...")
 
     finally:
-        cv2.destroyAllWindows()
+        if not args.no_show:
+            cv2.destroyAllWindows()
         print("\n--- STATISTIQUES FINALES ---")
         print(f"Total Entrées : {tracker.entries}")
         print(f"Total Sorties : {tracker.exits}")
