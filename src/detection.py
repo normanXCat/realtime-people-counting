@@ -131,6 +131,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Désactiver l'affichage de la fenêtre OpenCV (mode headless).",
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Chemin de sortie pour enregistrer la vidéo annotée (recommandé dans Google Colab).",
+    )
     return parser.parse_args()
 
 
@@ -206,6 +212,7 @@ def main() -> None:
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
     window_initialized = False
+    video_writer = None
 
     # IDs d’affichage indépendants des IDs internes ByteTrack/Re-ID.
     # Ils restent compacts et commencent toujours à 1 pour cette session.
@@ -289,6 +296,28 @@ def main() -> None:
             Visualizer.draw_crossing_line(frame_draw, tracker.line_p1, tracker.line_p2)
             Visualizer.draw_hud(frame_draw, current_count, tracker.entries, tracker.exits)
 
+            if args.output and video_writer is None:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                fps = 30.0
+                if isinstance(source, (str, Path)):
+                    capture = cv2.VideoCapture(str(source))
+                    detected_fps = capture.get(cv2.CAP_PROP_FPS)
+                    capture.release()
+                    if detected_fps and detected_fps > 0:
+                        fps = detected_fps
+                extension = output_path.suffix.lower()
+                codec = "mp4v" if extension == ".mp4" else "XVID"
+                video_writer = cv2.VideoWriter(
+                    str(output_path), cv2.VideoWriter_fourcc(*codec), fps, (width, height)
+                )
+                if not video_writer.isOpened():
+                    raise RuntimeError(f"Impossible de créer la vidéo de sortie : {output_path}")
+                print(f"[Output] Enregistrement de la vidéo annotée : {output_path}")
+
+            if video_writer is not None:
+                video_writer.write(frame_draw)
+
             if not args.no_show:
                 window_name = "Real-time People Counting & Tracking"
                 if not window_initialized:
@@ -312,6 +341,8 @@ def main() -> None:
         print("\nArrêt demandé par l'utilisateur (Ctrl+C)...")
 
     finally:
+        if video_writer is not None:
+            video_writer.release()
         if not args.no_show:
             cv2.destroyAllWindows()
         print("\n--- STATISTIQUES FINALES ---")
