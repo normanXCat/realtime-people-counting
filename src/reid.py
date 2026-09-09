@@ -160,7 +160,11 @@ class ReIDGallery:
         for gid in expired:
             self._gallery.pop(gid, None)
 
-        self._prev_active_ids = set(remapped)
+        # Conserver les IDs natifs de la frame précédente. Les IDs remappés
+        # peuvent être différents; utiliser les IDs réels ici permet de
+        # détecter correctement la disparition d'une piste BoT-SORT et de
+        # garder son embedding dans la galerie pour sa réapparition.
+        self._prev_active_ids = current_ids
         return remapped
 
     # ------------------------------------------------------------------

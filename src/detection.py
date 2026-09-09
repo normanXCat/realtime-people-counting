@@ -17,6 +17,7 @@ import numpy as np
 from ultralytics import YOLO
 
 # Importations des modules locaux
+from reid import ReIDGallery
 from calibration import calibrate_line
 from tracker import LineCrossingTracker
 from visualizer import Visualizer
@@ -200,8 +201,13 @@ def main() -> None:
             line_p1, line_p2 = (0.0, 0.6), (1.0, 0.6)
 
     # 2. Tracker natif Ultralytics : BoT-SORT garde lui-même les pistes Lost.
-    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=60)
+    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=args.max_age)
     tracker_config = str(CUSTOM_BOTSORT_CONFIG) if CUSTOM_BOTSORT_CONFIG.exists() else "botsort.yaml"
+    reid_gallery = ReIDGallery(
+        occlusion_threshold=args.occlusion_threshold,
+        gallery_ttl=args.gallery_ttl,
+        similarity_threshold=args.similarity_threshold,
+    )
 
     # Prétraitement CLAHE optionnel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
@@ -214,9 +220,10 @@ def main() -> None:
     window_initialized = False
     video_writer = None
 
-    # IDs d’affichage indépendants des IDs internes ByteTrack/Re-ID.
-    # Ils restent compacts et commencent toujours à 1 pour cette session.
-    id_mapping = {}
+    # IDs d’affichage indépendants des IDs internes BoT-SORT.
+    # Re-ID conserve l’identité après disparition; cette table garantit une
+    # numérotation compacte 1, 2, 3... sans reprendre les IDs du tracker.
+    stable_id_mapping = {}
     next_display_id = 1
 
     try:
@@ -249,7 +256,7 @@ def main() -> None:
                 limg = cv2.merge((cl, a, b))
                 frame = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-            # --- IDs fournis directement par BoT-SORT natif ---
+            # --- IDs fournis par BoT-SORT, puis stabilisés par Re-ID ---
             xyxy_list = None
             confidences = None
             display_ids = []
@@ -259,19 +266,19 @@ def main() -> None:
                 xyxy_all = result.boxes.xyxy.cpu().numpy()
                 confidences_all = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(raw_ids))
 
-                # Un nouvel ID système n’est mappé que si sa confiance dépasse
-                # 0.50. Un ID déjà stabilisé reste affiché même si sa confiance
-                # baisse momentanément.
+                # La galerie compare les nouvelles pistes aux personnes
+                # récemment perdues et renvoie l'identité réelle persistante.
+                identity_ids = reid_gallery.remap_ids(
+                    raw_ids, xyxy_all, frame
+                )
                 keep_indices = []
-                for index, (track_id, conf) in enumerate(zip(raw_ids, confidences_all)):
-                    if track_id not in id_mapping and float(conf) <= 0.50:
-                        continue
-                    if track_id not in id_mapping:
-                        id_mapping[track_id] = next_display_id
-                        print(f"[DEBUG] Nouvel ID système {track_id} (Conf: {float(conf):.2f}) -> Mappé à l'utilisateur {next_display_id}")
+                for index, (identity_id, conf) in enumerate(zip(identity_ids, confidences_all)):
+                    if identity_id not in stable_id_mapping:
+                        stable_id_mapping[identity_id] = next_display_id
+                        print(f"[ID] Nouvelle personne -> ID utilisateur #{next_display_id}")
                         next_display_id += 1
                     keep_indices.append(index)
-                    display_ids.append(id_mapping[track_id])
+                    display_ids.append(stable_id_mapping[identity_id])
 
                 # Les détections non mappées ne participent ni au comptage ni
                 # au dessin; cela évite de créer des IDs pour des faux positifs.
