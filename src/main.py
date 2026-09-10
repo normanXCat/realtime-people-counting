@@ -34,6 +34,17 @@ def verify_reid_weights(tracker_path: str) -> None:
     candidates = [Path(model_name), Path(tracker_path).parent / model_name, Path.cwd() / model_name]
     weight = next((path for path in candidates if path.exists()), None)
     if weight is None:
+        # Les poids YOLO de classification standards sont téléchargés par
+        # YOLO(...) au premier lancement; ils ne doivent pas être bloqués par
+        # ce contrôle local.
+        standard_ultralytics_weights = {
+            "yolo11n-cls.pt", "yolo11s-cls.pt", "yolo11m-cls.pt",
+            "yolo11l-cls.pt", "yolo11x-cls.pt",
+        }
+        if model_name in standard_ultralytics_weights:
+            print(f"[REID CHECK] Poids ReID Ultralytics absents localement : {model_name}")
+            print(f"[REID CHECK] Téléchargement automatique attendu par Ultralytics : {model_name}")
+            return
         raise FileNotFoundError(
             f"[REID CHECK] Poids ReID absents : {model_name}. "
             f"Placez ce fichier dans le dépôt ou dans le dossier courant."
