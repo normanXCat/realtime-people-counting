@@ -1,16 +1,16 @@
 tracker_type: botsort
 
 # Association et conservation des pistes pendant les occlusions.
-track_high_thresh: 0.3
-track_low_thresh: 0.05
-new_track_thresh: 0.3
-track_buffer: 90
-match_thresh: 0.8
+track_high_thresh: 0.4
+track_low_thresh: 0.1
+new_track_thresh: 0.7
+track_buffer: 150
+match_thresh: 0.9
 fuse_score: True
 
 # Re-identification native BoT-SORT.
 with_reid: True
-model: yolo11n-cls.pt
+model: osnet_x1_0_msmt17.pt
 proximity_thresh: 0.5
 appearance_thresh: 0.25
 

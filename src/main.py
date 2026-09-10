@@ -13,6 +13,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import yaml
 from ultralytics import YOLO
 
 
@@ -21,10 +22,29 @@ DEFAULT_MODEL = ROOT.parent / "models" / "yolo11n.pt"
 DEFAULT_TRACKER = ROOT / "configs" / "custom_botsort.yaml"
 
 
+def verify_reid_weights(tracker_path: str) -> None:
+    """Vérifie que le poids ReID demandé existe avant l'inférence."""
+    config = yaml.safe_load(Path(tracker_path).read_text())
+    if not config.get("with_reid", False):
+        raise RuntimeError("[REID CHECK] with_reid n'est pas activé dans la configuration")
+    model_name = str(config.get("model", "auto"))
+    if model_name == "auto":
+        print("[REID CHECK] ReID activée en mode auto (poids gérés par Ultralytics)")
+        return
+    candidates = [Path(model_name), Path(tracker_path).parent / model_name, Path.cwd() / model_name]
+    weight = next((path for path in candidates if path.exists()), None)
+    if weight is None:
+        raise FileNotFoundError(
+            f"[REID CHECK] Poids ReID absents : {model_name}. "
+            f"Placez ce fichier dans le dépôt ou dans le dossier courant."
+        )
+    print(f"[REID CHECK] Poids ReID trouvés : {weight.resolve()}")
+
+
 class IDManager:
     """Convertit les IDs BoT-SORT confirmés en IDs séquentiels persistants."""
 
-    def __init__(self, confirmation_confidence: float = 0.65) -> None:
+    def __init__(self, confirmation_confidence: float = 0.75) -> None:
         self.mapping_dict: dict[int, int] = {}
         self.next_id = 1
         self.confirmation_confidence = confirmation_confidence
@@ -114,7 +134,7 @@ class IDManager:
                 display_id = self.next_id
                 self.next_id += 1
                 self.mapping_dict[int(track_id)] = display_id
-                print(f"[INFO] Nouvelle personne confirmée : ID {display_id} (track_id={track_id}, conf={conf:.2f})")
+                print(f"[REID SUCCESS] Nouvelle entité confirmée : YOLO_ID {track_id} -> Affiche ID {display_id} (conf={conf:.2f})")
             center = ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
             if feature is not None:
                 old = self.features.get(display_id)
@@ -317,9 +337,10 @@ def arguments() -> argparse.Namespace:
 def main() -> None:
     args = arguments()
     model_path = Path(args.model)
+    verify_reid_weights(args.tracker)
     model = YOLO(str(model_path))
     line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
-    manager = IDManager(confirmation_confidence=0.65)
+    manager = IDManager(confirmation_confidence=0.75)
     counter = LineCounter(line_p1, line_p2)
     writer = None
     window_initialized = False
