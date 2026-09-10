@@ -1,18 +1,18 @@
 tracker_type: botsort
 
-# Favoriser la récupération d’une piste existante pendant une occultation.
-track_high_thresh: 0.25
+# Association et conservation des pistes pendant les occlusions.
+track_high_thresh: 0.3
 track_low_thresh: 0.05
-new_track_thresh: 0.30
-track_buffer: 180
-match_thresh: 0.80
+new_track_thresh: 0.3
+track_buffer: 90
+match_thresh: 0.8
 fuse_score: True
 
-# Ré-identification native BoT-SORT.
+# Re-identification native BoT-SORT.
 with_reid: True
 model: yolo11n-cls.pt
-proximity_thresh: 0.20
-appearance_thresh: 0.50
+proximity_thresh: 0.5
+appearance_thresh: 0.25
 
-# Caméra fixe : éviter d’injecter un mouvement global artificiel.
+# Caméra fixe.
 gmc_method: none
