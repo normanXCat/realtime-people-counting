@@ -28,6 +28,49 @@ class IDManager:
         self.mapping_dict: dict[int, int] = {}
         self.next_id = 1
         self.confirmation_confidence = confirmation_confidence
+        self.last_centers: dict[int, tuple[float, float]] = {}
+
+    def stabilize_assignments(
+        self,
+        assignments: list[tuple[int, int, tuple[float, float]]],
+        frame_diagonal: float,
+    ) -> list[tuple[int, int, tuple[float, float]]]:
+        """Corrige un échange évident entre deux pistes déjà connues.
+
+        BoT-SORT peut conserver deux track_id tout en les inversant après un
+        croisement. Lorsque l'affectation croisée est nettement plus proche
+        des dernières positions connues, on échange uniquement les display_id
+        pour cette frame et on met à jour le mapping interne.
+        """
+        if len(assignments) < 2:
+            return assignments
+        result = list(assignments)
+        max_switch_cost = frame_diagonal * 0.35
+        for i in range(len(result)):
+            track_a, display_a, center_a = result[i]
+            prev_a = self.last_centers.get(display_a)
+            if prev_a is None:
+                continue
+            for j in range(i + 1, len(result)):
+                track_b, display_b, center_b = result[j]
+                prev_b = self.last_centers.get(display_b)
+                if prev_b is None or display_a == display_b:
+                    continue
+                direct = self._distance(center_a, prev_a) + self._distance(center_b, prev_b)
+                crossed = self._distance(center_a, prev_b) + self._distance(center_b, prev_a)
+                if crossed + max_switch_cost < direct:
+                    result[i] = (track_a, display_b, center_a)
+                    result[j] = (track_b, display_a, center_b)
+                    self.mapping_dict[track_a] = display_b
+                    self.mapping_dict[track_b] = display_a
+                    print(f"[ID-LOCK] Échange corrigé entre IDs {display_a} et {display_b}")
+        for _track_id, display_id, center in result:
+            self.last_centers[display_id] = center
+        return result
+
+    @staticmethod
+    def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
     def get_display_id(self, track_id: int, confidence: float) -> Optional[int]:
         track_id = int(track_id)
@@ -189,12 +232,26 @@ def main() -> None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 ids = result.boxes.id.int().cpu().tolist()
                 confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(ids))
+                candidates: list[tuple[int, int, tuple[float, float], np.ndarray, float]] = []
                 for box, track_id, conf in zip(boxes, ids, confs):
                     display_id = manager.get_display_id(track_id, float(conf))
                     if display_id is None:
                         continue
                     x1, y1, x2, y2 = map(int, box[:4])
                     point = ((x1 + x2) / 2, float(y2))
+                    candidates.append((track_id, display_id, point, box, float(conf)))
+
+                locked = manager.stabilize_assignments(
+                    [(track_id, display_id, point) for track_id, display_id, point, _box, _conf in candidates],
+                    float(np.hypot(w, h)),
+                )
+                candidate_by_track = {
+                    track_id: (box, conf)
+                    for track_id, _display_id, _point, box, conf in candidates
+                }
+                for track_id, display_id, point in locked:
+                    box, _conf = candidate_by_track[track_id]
+                    x1, y1, x2, y2 = map(int, box[:4])
                     counter.update(display_id, point, w, h)
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
                     cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
