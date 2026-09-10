@@ -279,11 +279,20 @@ class LineCounter:
     def _line(self, width: int, height: int) -> tuple[tuple[float, float], tuple[float, float]]:
         return ((self.p1[0] * width, self.p1[1] * height), (self.p2[0] * width, self.p2[1] * height))
 
-    def draw(self, frame: np.ndarray) -> None:
+    def draw(self, frame: np.ndarray, present: int = 0) -> None:
         h, w = frame.shape[:2]
         a, b = self._line(w, h)
         cv2.line(frame, tuple(map(int, a)), tuple(map(int, b)), (0, 255, 0), 3)
-        cv2.putText(frame, f"IN: {self.entries}  OUT: {self.exits}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            f"IN: {self.entries}  OUT: {self.exits}  Present: {present}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
 
 def parse_point(value: str) -> tuple[float, float]:
@@ -366,6 +375,7 @@ def main() -> None:
                 continue
             h, w = frame.shape[:2]
             rendered = frame.copy()
+            present_count = 0
             if result.boxes is not None and result.boxes.id is not None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 ids = result.boxes.id.int().cpu().tolist()
@@ -380,13 +390,15 @@ def main() -> None:
                     frame_index,
                     float(np.hypot(w, h)),
                 )
-                for track_id, display_id, point, box, _conf in candidates:
+                present_count = len(candidates)
+                for track_id, display_id, point, box, conf in candidates:
                     x1, y1, x2, y2 = map(int, box[:4])
                     counter.update(display_id, point, w, h)
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
                     cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
-                    cv2.putText(rendered, f"ID: {display_id} person", (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
-            counter.draw(rendered)
+                    label = f"ID: {display_id} person {conf:.2f}"
+                    cv2.putText(rendered, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
+            counter.draw(rendered, present=present_count)
 
             if args.output and writer is None:
                 out = Path(args.output)
@@ -408,7 +420,7 @@ def main() -> None:
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             else:
-                print(f"\r[LIVE] IN={counter.entries} OUT={counter.exits}", end="")
+                print(f"\r[LIVE] IN={counter.entries} OUT={counter.exits} PRESENT={present_count}", end="")
     finally:
         if writer is not None:
             writer.release()

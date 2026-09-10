@@ -10,7 +10,7 @@ fuse_score: True
 
 # Re-identification native BoT-SORT.
 with_reid: True
-model: osnet_x1_0_msmt17.pt
+model: auto
 proximity_thresh: 0.5
 appearance_thresh: 0.25
 
