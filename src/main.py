@@ -62,12 +62,35 @@ class IDManager:
     ) -> list[tuple[int, int, tuple[float, float], np.ndarray, float]]:
         """Attribue les display IDs par apparence, avec mémoire des absents."""
         descriptors = [(tid, box, float(conf), self.appearance(frame, box)) for tid, box, conf in candidates]
+
+        # Détecter un échange de deux pistes connues : si les apparences
+        # correspondent nettement mieux en croisé qu'en direct, corriger le
+        # mapping avant le rendu et le comptage.
+        known = [
+            (tid, int(self.mapping_dict[tid]), feature)
+            for tid, _box, _conf, feature in descriptors
+            if tid in self.mapping_dict and feature is not None and self.mapping_dict[tid] in self.features
+        ]
+        if len(known) >= 2:
+            for i in range(len(known)):
+                tid_a, did_a, feat_a = known[i]
+                for j in range(i + 1, len(known)):
+                    tid_b, did_b, feat_b = known[j]
+                    direct = self.similarity(feat_a, self.features[did_a]) + self.similarity(feat_b, self.features[did_b])
+                    crossed = self.similarity(feat_a, self.features[did_b]) + self.similarity(feat_b, self.features[did_a])
+                    if crossed > direct + 0.12:
+                        self.mapping_dict[tid_a], self.mapping_dict[tid_b] = did_b, did_a
+                        print(f"[RE-ID-LOCK] Switch corrigé : track_id {tid_a}/{tid_b} -> IDs {did_b}/{did_a}")
         current_displays: set[int] = set()
         output = []
         for track_id, box, conf, feature in descriptors:
             display_id = self.mapping_dict.get(int(track_id))
             best_id, best_score = None, -1.0
-            if feature is not None:
+            # Un track_id déjà connu est verrouillé sur son display_id. La
+            # ReID ne doit jamais le remapper vers une autre personne active;
+            # elle ne sert qu'à récupérer l'ID d'un nouveau track_id après
+            # disparition de la piste précédente.
+            if display_id is None and feature is not None:
                 for candidate_id, candidate_feature in self.features.items():
                     if candidate_id in current_displays:
                         continue
