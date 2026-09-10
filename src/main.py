@@ -8,6 +8,8 @@ rendu. En mode --no-show, la ligne par défaut ou les points CLI sont utilisés.
 from __future__ import annotations
 
 import argparse
+import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -387,10 +389,14 @@ def main() -> None:
     person_status: dict[int, str] = {}
     last_foot_pos: dict[int, tuple[float, float]] = {}
     pending_crossing: dict[int, str] = {}
+    pred_events: list[dict] = []
+    frame_idx = 0
 
     results = model.track(source=int(args.source) if args.source.isdigit() else args.source, tracker=args.tracker, persist=True, classes=[0], conf=args.conf, iou=args.iou, imgsz=args.imgsz, show=False, stream=True)
     try:
         for result in results:
+            t_start_frame = time.perf_counter()
+            frame_idx += 1
             frame_index += 1
             frame = result.orig_img
             if frame is None:
@@ -438,9 +444,21 @@ def main() -> None:
                             if target == "inside":
                                 counter.entries += 1
                                 print(f"[COUNT] ID {display_id} -> IN")
+                                pred_events.append({
+                                    "frame": frame_idx,
+                                    "id": display_id,
+                                    "direction": "IN",
+                                    "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2),
+                                })
                             else:
                                 counter.exits += 1
                                 print(f"[COUNT] ID {display_id} -> OUT")
+                                pred_events.append({
+                                    "frame": frame_idx,
+                                    "id": display_id,
+                                    "direction": "OUT",
+                                    "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2),
+                                })
                             person_status[display_id] = target
                         pending_crossing.pop(display_id, None)
                     last_foot_pos[display_id] = current_foot
@@ -477,6 +495,8 @@ def main() -> None:
         if not args.no_show:
             cv2.destroyAllWindows()
         print(f"\n[FINAL] IN={counter.entries} OUT={counter.exits}")
+    with open("predictions_systeme.json", "w", encoding="utf-8") as f:
+        json.dump(pred_events, f, indent=4)
 
 
 if __name__ == "__main__":
