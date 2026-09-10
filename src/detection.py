@@ -207,7 +207,7 @@ def main() -> None:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
     print(f"Lancement du suivi natif BoT-SORT sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=180, native_reid=on, mapping_conf>0.50, trails=off")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=180, native_reid=yolo11n-cls, mapping_conf>0.60, trails=off")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
@@ -218,7 +218,7 @@ def main() -> None:
     # Un mapping est créé uniquement après confirmation par une détection
     # suffisamment fiable afin d’éviter les IDs fantômes.
     id_mapping = {}
-    next_display_id = 1
+    next_id = 1
 
     try:
         results = model.track(
@@ -265,9 +265,9 @@ def main() -> None:
                     conf = float(conf)
                     if track_id not in id_mapping:
                         if conf > 0.6:  # Seulement si on est sûr que c'est une personne solide
-                            id_mapping[track_id] = next_display_id
-                            print(f"[DEBUG] Nouvel ID: Tracker({track_id}) -> Display({next_display_id}) | Conf: {conf:.2f}")
-                            next_display_id += 1
+                            id_mapping[track_id] = next_id
+                            print(f"[INFO] Nouvelle personne confirmée : ID {next_id} (track_id={track_id}, conf={conf:.2f})")
+                            next_id += 1
 
                     if track_id in id_mapping:
                         keep_indices.append(index)
