@@ -222,6 +222,25 @@ class IDManager:
         return self.mapping_dict[track_id]
 
 
+HYSTERESIS_MARGIN = 20.0
+
+
+def check_line_crossing(
+    previous_foot: tuple[float, float],
+    current_foot: tuple[float, float],
+    line_a: tuple[float, float],
+    line_b: tuple[float, float],
+) -> bool:
+    """Retourne True uniquement si le segment du pied croise strictement la ligne."""
+    def ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+    return (
+        ccw(previous_foot, line_a, line_b) != ccw(current_foot, line_a, line_b)
+        and ccw(previous_foot, current_foot, line_a) != ccw(previous_foot, current_foot, line_b)
+    )
+
+
 class LineCounter:
     """Compte chaque display_id au plus une fois par direction."""
 
@@ -365,6 +384,9 @@ def main() -> None:
     writer = None
     window_initialized = False
     frame_index = 0
+    person_status: dict[int, str] = {}
+    last_foot_pos: dict[int, tuple[float, float]] = {}
+    pending_crossing: dict[int, str] = {}
 
     results = model.track(source=int(args.source) if args.source.isdigit() else args.source, tracker=args.tracker, persist=True, classes=[0], conf=args.conf, iou=args.iou, imgsz=args.imgsz, show=False, stream=True)
     try:
@@ -393,7 +415,35 @@ def main() -> None:
                 present_count = len(candidates)
                 for track_id, display_id, point, box, conf in candidates:
                     x1, y1, x2, y2 = map(int, box[:4])
-                    counter.update(display_id, point, w, h)
+                    line_a, line_b = counter._line(w, h)
+                    current_foot = (float(point[0]), float(point[1]))
+                    previous_foot = last_foot_pos.get(display_id)
+                    line_dx = line_b[0] - line_a[0]
+                    line_dy = line_b[1] - line_a[1]
+                    line_length = max(float(np.hypot(line_dx, line_dy)), 1.0)
+
+                    def signed_distance(foot):
+                        return ((foot[0] - line_a[0]) * line_dy - (foot[1] - line_a[1]) * line_dx) / line_length
+
+                    current_side = signed_distance(current_foot)
+                    if display_id not in person_status:
+                        person_status[display_id] = "inside" if current_side <= 0 else "outside"
+                    if previous_foot is not None and check_line_crossing(previous_foot, current_foot, line_a, line_b):
+                        target = "outside" if current_side > 0 else "inside"
+                        if target != person_status[display_id]:
+                            pending_crossing[display_id] = target
+                    target = pending_crossing.get(display_id)
+                    if target is not None and abs(current_side) >= HYSTERESIS_MARGIN:
+                        if target != person_status[display_id]:
+                            if target == "inside":
+                                counter.entries += 1
+                                print(f"[COUNT] ID {display_id} -> IN")
+                            else:
+                                counter.exits += 1
+                                print(f"[COUNT] ID {display_id} -> OUT")
+                            person_status[display_id] = target
+                        pending_crossing.pop(display_id, None)
+                    last_foot_pos[display_id] = current_foot
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
                     cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
                     label = f"ID: {display_id} person {conf:.2f}"
