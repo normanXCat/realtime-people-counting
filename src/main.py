@@ -60,15 +60,9 @@ class IDManager:
         self.next_id = 1
         self.confirmation_confidence = confirmation_confidence
         self.last_centers: dict[int, tuple[float, float]] = {}
-        self.last_centroids = self.last_centers
         self.features: dict[int, np.ndarray] = {}
         self.last_seen: dict[int, int] = {}
-        self.person_status: dict[int, str] = {}
         self.gallery_ttl = 300
-        self.max_jump_pixels = 150.0
-
-    def mark_out(self, display_id: int) -> None:
-        self.person_status[int(display_id)] = "out"
 
     @staticmethod
     def appearance(frame: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
@@ -122,33 +116,14 @@ class IDManager:
         output = []
         for track_id, box, conf, feature in descriptors:
             display_id = self.mapping_dict.get(int(track_id))
-            force_new_identity = False
-            # Une piste active qui saute brutalement vers une autre personne
-            # est considérée comme usurpée. Elle reçoit un nouvel ID au lieu
-            # de transférer l'identité précédente.
-            if display_id is not None and display_id in self.last_centers:
-                center_now = ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
-                age = frame_index - self.last_seen.get(display_id, frame_index)
-                jump = self._distance(center_now, self.last_centers[display_id])
-                if age <= 150 and jump > self.max_jump_pixels:
-                    print(f"[ID-GUARD] Téléportation rejetée : track_id={track_id}, ID={display_id}, distance={jump:.1f}px")
-                    self.mapping_dict.pop(int(track_id), None)
-                    display_id = None
-                    force_new_identity = True
-            if display_id is not None and self.person_status.get(display_id) == "out":
-                print(f"[LIFECYCLE] ID {display_id} est OUT : nouvelle identité pour track_id={track_id}")
-                self.mapping_dict.pop(int(track_id), None)
-                display_id = None
             best_id, best_score = None, -1.0
             # Un track_id déjà connu est verrouillé sur son display_id. La
             # ReID ne doit jamais le remapper vers une autre personne active;
             # elle ne sert qu'à récupérer l'ID d'un nouveau track_id après
             # disparition de la piste précédente.
-            if display_id is None and feature is not None and not force_new_identity:
+            if display_id is None and feature is not None:
                 for candidate_id, candidate_feature in self.features.items():
                     if candidate_id in current_displays:
-                        continue
-                    if self.person_status.get(candidate_id) == "out":
                         continue
                     # Ne jamais voler l’ID d’une personne vue récemment : la
                     # galerie sert aux pistes réellement disparues.
@@ -170,7 +145,6 @@ class IDManager:
                 display_id = self.next_id
                 self.next_id += 1
                 self.mapping_dict[int(track_id)] = display_id
-                self.person_status[display_id] = "inside"
                 print(f"[REID SUCCESS] Nouvelle entité confirmée : YOLO_ID {track_id} -> Affiche ID {display_id} (conf={conf:.2f})")
             center = ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
             if feature is not None:
@@ -409,8 +383,6 @@ def main() -> None:
                 for track_id, display_id, point, box, _conf in candidates:
                     x1, y1, x2, y2 = map(int, box[:4])
                     counter.update(display_id, point, w, h)
-                    if display_id in counter.counted_out:
-                        manager.mark_out(display_id)
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
                     cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
                     cv2.putText(rendered, f"ID: {display_id} person", (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
