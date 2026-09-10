@@ -29,6 +29,87 @@ class IDManager:
         self.next_id = 1
         self.confirmation_confidence = confirmation_confidence
         self.last_centers: dict[int, tuple[float, float]] = {}
+        self.features: dict[int, np.ndarray] = {}
+        self.last_seen: dict[int, int] = {}
+        self.gallery_ttl = 300
+
+    @staticmethod
+    def appearance(frame: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
+        """Signature légère de couleur/texture, calculée sur le crop personne."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = map(int, box[:4])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 - x1 < 8 or y2 - y1 < 16:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [24, 8], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+        return hist
+
+    @staticmethod
+    def similarity(a: np.ndarray, b: np.ndarray) -> float:
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
+
+    def assign_frame(
+        self,
+        candidates: list[tuple[int, np.ndarray, float]],
+        frame: np.ndarray,
+        frame_index: int,
+        frame_diagonal: float,
+    ) -> list[tuple[int, int, tuple[float, float], np.ndarray, float]]:
+        """Attribue les display IDs par apparence, avec mémoire des absents."""
+        descriptors = [(tid, box, float(conf), self.appearance(frame, box)) for tid, box, conf in candidates]
+        current_displays: set[int] = set()
+        output = []
+        for track_id, box, conf, feature in descriptors:
+            display_id = self.mapping_dict.get(int(track_id))
+            best_id, best_score = None, -1.0
+            if feature is not None:
+                for candidate_id, candidate_feature in self.features.items():
+                    if candidate_id in current_displays:
+                        continue
+                    # Ne jamais voler l’ID d’une personne vue récemment : la
+                    # galerie sert aux pistes réellement disparues.
+                    if frame_index - self.last_seen.get(candidate_id, frame_index) < 3:
+                        continue
+                    score = self.similarity(feature, candidate_feature)
+                    if score > best_score:
+                        best_id, best_score = candidate_id, score
+            # Une nouvelle piste peut récupérer un ID ancien seulement avec
+            # une vraie ressemblance; sinon elle reçoit un nouvel ID confirmé.
+            if best_id is not None and best_score >= 0.78:
+                if display_id is None or best_id != display_id:
+                    display_id = best_id
+                    self.mapping_dict[int(track_id)] = display_id
+                    print(f"[RE-ID] track_id={track_id} récupère l'ID mémorisé {display_id} (similarité={best_score:.2f})")
+            if display_id is None:
+                if conf <= self.confirmation_confidence:
+                    continue
+                display_id = self.next_id
+                self.next_id += 1
+                self.mapping_dict[int(track_id)] = display_id
+                print(f"[INFO] Nouvelle personne confirmée : ID {display_id} (track_id={track_id}, conf={conf:.2f})")
+            center = ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
+            if feature is not None:
+                old = self.features.get(display_id)
+                self.features[display_id] = feature if old is None else (0.85 * old + 0.15 * feature)
+                norm = np.linalg.norm(self.features[display_id])
+                if norm > 1e-8:
+                    self.features[display_id] /= norm
+            self.last_centers[display_id] = center
+            self.last_seen[display_id] = frame_index
+            current_displays.add(display_id)
+            output.append((int(track_id), display_id, center, box, conf))
+        # Conserver la mémoire, mais purger les identités très anciennes.
+        expired = [did for did, seen in self.last_seen.items() if frame_index - seen > self.gallery_ttl]
+        for did in expired:
+            self.features.pop(did, None)
+            self.last_centers.pop(did, None)
+            self.last_seen.pop(did, None)
+        return output
 
     def stabilize_assignments(
         self,
@@ -232,25 +313,17 @@ def main() -> None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 ids = result.boxes.id.int().cpu().tolist()
                 confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(ids))
-                candidates: list[tuple[int, int, tuple[float, float], np.ndarray, float]] = []
+                raw_candidates: list[tuple[int, np.ndarray, float]] = []
                 for box, track_id, conf in zip(boxes, ids, confs):
-                    display_id = manager.get_display_id(track_id, float(conf))
-                    if display_id is None:
-                        continue
-                    x1, y1, x2, y2 = map(int, box[:4])
-                    point = ((x1 + x2) / 2, float(y2))
-                    candidates.append((track_id, display_id, point, box, float(conf)))
+                    raw_candidates.append((track_id, box, float(conf)))
 
-                locked = manager.stabilize_assignments(
-                    [(track_id, display_id, point) for track_id, display_id, point, _box, _conf in candidates],
+                candidates = manager.assign_frame(
+                    raw_candidates,
+                    frame,
+                    frame_index,
                     float(np.hypot(w, h)),
                 )
-                candidate_by_track = {
-                    track_id: (box, conf)
-                    for track_id, _display_id, _point, box, conf in candidates
-                }
-                for track_id, display_id, point in locked:
-                    box, _conf = candidate_by_track[track_id]
+                for track_id, display_id, point, box, _conf in candidates:
                     x1, y1, x2, y2 = map(int, box[:4])
                     counter.update(display_id, point, w, h)
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
