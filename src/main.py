@@ -323,10 +323,12 @@ def main() -> None:
     counter = LineCounter(line_p1, line_p2)
     writer = None
     window_initialized = False
+    frame_index = 0
 
     results = model.track(source=int(args.source) if args.source.isdigit() else args.source, tracker=args.tracker, persist=True, classes=[0], conf=args.conf, iou=args.iou, imgsz=args.imgsz, show=False, stream=True)
     try:
         for result in results:
+            frame_index += 1
             frame = result.orig_img
             if frame is None:
                 continue
