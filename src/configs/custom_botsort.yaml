@@ -1,20 +1,18 @@
 tracker_type: botsort
-# Seuil haut pour préserver les pistes quand la confiance baisse légèrement.
-track_high_thresh: 0.3
-# Seuil bas de la seconde passe ByteTrack intégrée à BoT-SORT.
+
+# Favoriser la récupération d’une piste existante pendant une occultation.
+track_high_thresh: 0.25
 track_low_thresh: 0.05
-# N’initialise pas une piste sur un score très faible.
-new_track_thresh: 0.3
-# Une piste Lost reste disponible 90 frames (~3 secondes à 30 FPS) pour laisser le temps à l'occlusion de se terminer.
-track_buffer: 90
-# Matching spatial assoupli conformément au réglage demandé.
-match_thresh: 0.8
-# Paramètres BoT-SORT natifs et Ré-Identification Visuelle (ReID).
-proximity_thresh: 0.5
-appearance_thresh: 0.25
+new_track_thresh: 0.30
+track_buffer: 180
+match_thresh: 0.80
 fuse_score: True
+
+# Ré-identification native BoT-SORT.
 with_reid: True
 model: auto
-reid_weights: osnet_x0_25_msmt17.pt
-gmc_method: sparseOptFlow
+proximity_thresh: 0.20
+appearance_thresh: 0.80
 
+# Caméra fixe : éviter d’injecter un mouvement global artificiel.
+gmc_method: none

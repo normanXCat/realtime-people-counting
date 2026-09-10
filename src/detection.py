@@ -200,14 +200,14 @@ def main() -> None:
             line_p1, line_p2 = (0.0, 0.6), (1.0, 0.6)
 
     # 2. Tracker natif Ultralytics : BoT-SORT garde lui-même les pistes Lost.
-    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=90)
+    tracker = LineCrossingTracker(line_p1=line_p1, line_p2=line_p2, max_lost_frames=180)
     tracker_config = str(CUSTOM_BOTSORT_CONFIG) if CUSTOM_BOTSORT_CONFIG.exists() else "botsort.yaml"
 
     # Prétraitement CLAHE optionnel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) if args.enhance_contrast else None
 
     print(f"Lancement du suivi natif BoT-SORT sur la source : {source}")
-    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=90, mapping_conf>0.60, trails=off")
+    print(f"Paramètres: conf={args.conf:.2f}, NMS-IoU={args.iou:.2f}, imgsz={args.imgsz}, track_buffer=180, native_reid=on, mapping_conf>0.50, trails=off")
     print(f"Résolution d'inférence : {args.imgsz}x{args.imgsz}")
     print("Appuyez sur 'q' dans la fenêtre vidéo pour quitter, ou Ctrl+C dans le terminal.")
 
