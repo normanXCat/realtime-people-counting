@@ -300,10 +300,11 @@ class LineCounter:
     def _line(self, width: int, height: int) -> tuple[tuple[float, float], tuple[float, float]]:
         return ((self.p1[0] * width, self.p1[1] * height), (self.p2[0] * width, self.p2[1] * height))
 
-    def draw(self, frame: np.ndarray, present: int = 0) -> None:
+    def draw(self, frame: np.ndarray, present: int = 0, draw_line: bool = True) -> None:
         h, w = frame.shape[:2]
-        a, b = self._line(w, h)
-        cv2.line(frame, tuple(map(int, a)), tuple(map(int, b)), (0, 255, 0), 3)
+        if draw_line:
+            a, b = self._line(w, h)
+            cv2.line(frame, tuple(map(int, a)), tuple(map(int, b)), (0, 255, 0), 3)
         cv2.putText(
             frame,
             f"IN: {self.entries}  OUT: {self.exits}  Present: {present}",
@@ -323,6 +324,20 @@ def parse_point(value: str) -> tuple[float, float]:
     return x, y
 
 
+def ask_counting_mode() -> bool:
+    """Demande à l'utilisateur si les passages doivent être comptabilisés."""
+    while True:
+        answer = input(
+            "Souhaitez-vous compter les personnes qui entrent et sortent ? (o/n) : "
+        ).strip().lower()
+        if answer in {"o", "oui", "y", "yes"}:
+            return True
+        if answer in {"n", "non", "no"}:
+            print("Mode suivi uniquement activé : aucun comptage de passages.")
+            return False
+        print("Réponse invalide. Répondez par o pour oui ou n pour non.")
+
+
 def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) -> tuple[tuple[float, float], tuple[float, float]]:
     if p1 and p2:
         return parse_point(p1), parse_point(p2)
@@ -340,7 +355,7 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
             points.append((x, y))
 
-    window = "Calibration - cliquez 2 points puis appuyez sur c"
+    window = "Calibration - cliquez 2 points, c=valider, g=réinitialiser"
     cv2.namedWindow(window)
     cv2.setMouseCallback(window, on_click)
     while True:
@@ -355,6 +370,9 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
             cv2.destroyWindow(window)
             h, w = frame.shape[:2]
             return (points[0][0] / w, points[0][1] / h), (points[1][0] / w, points[1][1] / h)
+        if key == ord("g"):
+            points.clear()
+            print("[Calibration] Ligne réinitialisée. Cliquez à nouveau sur deux points.")
         if key == 27:
             cv2.destroyWindow(window)
             raise KeyboardInterrupt
@@ -380,7 +398,11 @@ def main() -> None:
     model_path = Path(args.model)
     verify_reid_weights(args.tracker)
     model = YOLO(str(model_path))
-    line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
+    counting_enabled = ask_counting_mode()
+    if counting_enabled:
+        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
+    else:
+        line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
     manager = IDManager(confirmation_confidence=0.75)
     counter = LineCounter(line_p1, line_p2)
     writer = None
@@ -421,7 +443,10 @@ def main() -> None:
                 present_count = len(candidates)
                 for track_id, display_id, point, box, conf in candidates:
                     x1, y1, x2, y2 = map(int, box[:4])
-                    line_a, line_b = counter._line(w, h)
+                    if counting_enabled:
+                        line_a, line_b = counter._line(w, h)
+                    else:
+                        line_a = line_b = (0.0, 0.0)
                     current_foot = (float(point[0]), float(point[1]))
                     previous_foot = last_foot_pos.get(display_id)
                     line_dx = line_b[0] - line_a[0]
@@ -431,42 +456,33 @@ def main() -> None:
                     def signed_distance(foot):
                         return ((foot[0] - line_a[0]) * line_dy - (foot[1] - line_a[1]) * line_dx) / line_length
 
-                    current_side = signed_distance(current_foot)
-                    if display_id not in person_status:
-                        person_status[display_id] = "inside" if current_side <= 0 else "outside"
-                    if previous_foot is not None and check_line_crossing(previous_foot, current_foot, line_a, line_b):
-                        target = "outside" if current_side > 0 else "inside"
-                        if target != person_status[display_id]:
-                            pending_crossing[display_id] = target
-                    target = pending_crossing.get(display_id)
-                    if target is not None and abs(current_side) >= HYSTERESIS_MARGIN:
-                        if target != person_status[display_id]:
-                            if target == "inside":
-                                counter.entries += 1
-                                print(f"[COUNT] ID {display_id} -> IN")
-                                pred_events.append({
-                                    "frame": frame_idx,
-                                    "id": display_id,
-                                    "direction": "IN",
-                                    "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2),
-                                })
-                            else:
-                                counter.exits += 1
-                                print(f"[COUNT] ID {display_id} -> OUT")
-                                pred_events.append({
-                                    "frame": frame_idx,
-                                    "id": display_id,
-                                    "direction": "OUT",
-                                    "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2),
-                                })
-                            person_status[display_id] = target
-                        pending_crossing.pop(display_id, None)
-                    last_foot_pos[display_id] = current_foot
+                    if counting_enabled:
+                        current_side = signed_distance(current_foot)
+                        if display_id not in person_status:
+                            person_status[display_id] = "inside" if current_side <= 0 else "outside"
+                        if previous_foot is not None and check_line_crossing(previous_foot, current_foot, line_a, line_b):
+                            target = "outside" if current_side > 0 else "inside"
+                            if target != person_status[display_id]:
+                                pending_crossing[display_id] = target
+                        target = pending_crossing.get(display_id)
+                        if target is not None and abs(current_side) >= HYSTERESIS_MARGIN:
+                            if target != person_status[display_id]:
+                                if target == "inside":
+                                    counter.entries += 1
+                                    print(f"[COUNT] ID {display_id} -> IN")
+                                    pred_events.append({"frame": frame_idx, "id": display_id, "direction": "IN", "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2)})
+                                else:
+                                    counter.exits += 1
+                                    print(f"[COUNT] ID {display_id} -> OUT")
+                                    pred_events.append({"frame": frame_idx, "id": display_id, "direction": "OUT", "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2)})
+                                person_status[display_id] = target
+                            pending_crossing.pop(display_id, None)
+                        last_foot_pos[display_id] = current_foot
                     cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
                     cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
                     label = f"ID: {display_id} person {conf:.2f}"
                     cv2.putText(rendered, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
-            counter.draw(rendered, present=present_count)
+            counter.draw(rendered, present=present_count, draw_line=counting_enabled)
 
             if args.output and writer is None:
                 out = Path(args.output)
