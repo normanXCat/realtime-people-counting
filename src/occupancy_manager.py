@@ -31,6 +31,7 @@ DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
 DEFAULT_TRAJECTORY_MAXLEN = 60       # Taille max de l'historique de trajectoire
 OUT_CONFIRMATION_FRAMES = 3          # Frames extérieures consécutives avant OUT
+DEFAULT_GATE_WIDTH_PX = 40.0         # Largeur du sas automatique côté extérieur
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,7 @@ class OccupancyManager:
         line_p2: tuple[float, float],
         line2_p1: tuple[float, float] | None = None,
         line2_p2: tuple[float, float] | None = None,
+        gate_width_px: float = DEFAULT_GATE_WIDTH_PX,
         dead_zone_margin: float = DEFAULT_DEAD_ZONE_MARGIN,
         init_duration_frames: int = DEFAULT_INIT_DURATION_FRAMES,
         confirmation_threshold: int = DEFAULT_CONFIRMATION_THRESHOLD,
@@ -145,6 +147,7 @@ class OccupancyManager:
         self.line_p2 = line_p2
         self.line2_p1 = line2_p1
         self.line2_p2 = line2_p2
+        self.gate_width_px = gate_width_px
 
         # Paramètres
         self.dead_zone_margin = dead_zone_margin
@@ -207,7 +210,15 @@ class OccupancyManager:
 
     def line2_px(self, width: int, height: int):
         if self.line2_p1 is None or self.line2_p2 is None:
-            return None
+            if self.gate_width_px <= 0:
+                return None
+            (ax, ay), (bx, by) = self.line_px(width, height)
+            dx, dy = bx - ax, by - ay
+            length = max(float(np.hypot(dx, dy)), 1.0)
+            # Normale positive : côté extérieur avec la convention actuelle.
+            nx, ny = dy / length, -dx / length
+            ox, oy = nx * self.gate_width_px, ny * self.gate_width_px
+            return ((ax + ox, ay + oy), (bx + ox, by + oy))
         return (
             (self.line2_p1[0] * width, self.line2_p1[1] * height),
             (self.line2_p2[0] * width, self.line2_p2[1] * height),
@@ -215,9 +226,9 @@ class OccupancyManager:
 
     def classify_point(self, point, width: int, height: int) -> Zone:
         line1 = self.line_px(width, height)
-        if self.line2_p1 is None or self.line2_p2 is None:
-            return classify_zone(signed_perpendicular_distance(point, *line1), self.dead_zone_margin)
         line2 = self.line2_px(width, height)
+        if line2 is None:
+            return classify_zone(signed_perpendicular_distance(point, *line1), self.dead_zone_margin)
         d1 = signed_perpendicular_distance(point, *line1)
         d2 = signed_perpendicular_distance(point, *line2)
         if d1 < -self.dead_zone_margin:
@@ -312,7 +323,7 @@ class OccupancyManager:
                 continue
 
             # -- Gestion de la zone morte --
-            if zone == Zone.MORTE and self.line2_p1 is None:
+            if zone == Zone.MORTE and self.line2_px(w, h) is None:
                 if track.state not in (TrackState.EN_ZONE_LIGNE, TrackState.SORTIE_CONFIRMEE):
                     track.state = TrackState.EN_ZONE_LIGNE
                     track.pending_direction = "OUT" if track.counted_in_occupancy else track.pending_direction
@@ -333,7 +344,7 @@ class OccupancyManager:
                 crossed = False
 
             # -- Machine à états --
-            if self.line2_p1 is not None and self.line2_p2 is not None:
+            if self.line2_px(w, h) is not None:
                 l2 = self.line2_px(w, h)
                 crossed2 = prev_pos is not None and check_line_crossing(prev_pos, anchor, *l2)
                 evt = self._transition_double(track, logical_id, zone, crossed, crossed2, frame_index)

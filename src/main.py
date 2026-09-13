@@ -309,6 +309,8 @@ def arguments() -> argparse.Namespace:
     # Paramètres OccupancyManager
     parser.add_argument("--dead-zone", type=float, default=20.0,
                         help="Épaisseur de la zone morte en pixels (hystérésis)")
+    parser.add_argument("--gate-width", type=float, default=40.0,
+                        help="Largeur du sas automatique côté extérieur, en pixels")
     parser.add_argument("--warmup-frames", type=int, default=15,
                         help="Nombre de frames de warm-up (~500ms à 30fps)")
     parser.add_argument("--confirm-frames", type=int, default=15,
@@ -343,6 +345,7 @@ def main() -> None:
         line_p2=line_p2,
         line2_p1=line2_p1,
         line2_p2=line2_p2,
+        gate_width_px=args.gate_width,
         dead_zone_margin=args.dead_zone,
         init_duration_frames=args.warmup_frames,
         confirmation_threshold=args.confirm_frames,
@@ -412,7 +415,7 @@ def main() -> None:
                     line2_px = occupancy.line2_px(w, h)
                     if line2_px is not None:
                         cv2.line(rendered, tuple(map(int, line2_px[0])), tuple(map(int, line2_px[1])), (255, 0, 255), 3, cv2.LINE_AA)
-                        cv2.putText(rendered, "L2: EXTERIEUR", tuple(map(int, line2_px[0])), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
+                        cv2.putText(rendered, "L2: EXTERIEUR (SAS)", tuple(map(int, line2_px[0])), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
                 else:
                     # Mode suivi uniquement : bounding boxes simples
                     for track_id, display_id, point, box, conf in candidates:
