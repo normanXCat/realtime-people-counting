@@ -251,41 +251,43 @@ class OccupancyManager:
         x1, y1, x2, y2 = map(float, box[:4])
         bottom = ((x1 + x2) / 2.0, y2)
         top = ((x1 + x2) / 2.0, y1)
-        top_l1 = signed_perpendicular_distance(top, *l1)
         bottom_l1 = signed_perpendicular_distance(bottom, *l1)
-        top_l2 = signed_perpendicular_distance(top, *l2)
+        top_l1 = signed_perpendicular_distance(top, *l1)
         bottom_l2 = signed_perpendicular_distance(bottom, *l2)
+        top_l2 = signed_perpendicular_distance(top, *l2)
         event = None
 
-        # OUT : le haut franchit d'abord L1, puis le bas franchit L2.
-        if top_l1 >= -self.dead_zone_margin:
+        # OUT inversé demandé : le bas franchit d'abord L1,
+        # puis le haut franchit L2.
+        if bottom_l1 >= -self.dead_zone_margin:
             track.exit_l1_crossed = True
-        elif track.exit_l1_crossed and top_l1 < -self.dead_zone_margin:
+        elif track.exit_l1_crossed and bottom_l1 < -self.dead_zone_margin:
             track.exit_l1_crossed = False
-        if bottom_l2 >= -self.dead_zone_margin:
+        if top_l2 >= -self.dead_zone_margin:
             if track.exit_l1_crossed and track.counted_in_occupancy:
                 track.state = TrackState.SORTIE_CONFIRMEE
                 track.counted_in_occupancy = False
                 track.is_counted_out = True
                 track.exit_l1_crossed = False
                 self.total_out += 1
-                print(f"[COUNT] ID {logical_id} → OUT (haut L1 puis bas L2)")
-                event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "top_L1_then_bottom_L2"}
+                print(f"[COUNT] ID {logical_id} → OUT (bas L1 puis haut L2)")
+                event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "bottom_L1_then_top_L2"}
 
-        # IN : le bas franchit d'abord L2, puis le haut franchit L1.
-        if bottom_l2 <= self.dead_zone_margin:
+        # IN inversé demandé : le haut franchit d'abord L2,
+        # puis le bas franchit L1.
+        if top_l2 <= self.dead_zone_margin:
             track.entry_l2_crossed = True
-        elif track.entry_l2_crossed and bottom_l2 > self.dead_zone_margin:
+        elif track.entry_l2_crossed and top_l2 > self.dead_zone_margin:
             track.entry_l2_crossed = False
-        if top_l1 <= self.dead_zone_margin:
+        if bottom_l1 <= self.dead_zone_margin:
             if track.entry_l2_crossed and not track.counted_in_occupancy:
                 track.state = TrackState.PRESENTE
                 track.counted_in_occupancy = True
                 track.is_counted_out = False
                 track.entry_l2_crossed = False
                 self.total_in += 1
-                print(f"[COUNT] ID {logical_id} → IN (bas L2 puis haut L1)")
-                event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "bottom_L2_then_top_L1"}
+                print(f"[COUNT] ID {logical_id} → IN (haut L2 puis bas L1)")
+                event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "top_L2_then_bottom_L1"}
 
         track.previous_bottom_l1 = bottom_l1
         track.previous_top_l2 = top_l2
