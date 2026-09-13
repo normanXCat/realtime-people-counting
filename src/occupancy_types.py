@@ -58,3 +58,5 @@ class LogicalTrack:
     is_counted_out: bool = False
     confidence: float = 0.0
     trajectory_history: list[tuple[float, float]] = field(default_factory=list)
+    previous_zone: Zone = Zone.INTERIEURE
+    pending_direction: str | None = None

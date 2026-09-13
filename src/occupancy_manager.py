@@ -130,6 +130,8 @@ class OccupancyManager:
         self,
         line_p1: tuple[float, float],
         line_p2: tuple[float, float],
+        line2_p1: tuple[float, float] | None = None,
+        line2_p2: tuple[float, float] | None = None,
         dead_zone_margin: float = DEFAULT_DEAD_ZONE_MARGIN,
         init_duration_frames: int = DEFAULT_INIT_DURATION_FRAMES,
         confirmation_threshold: int = DEFAULT_CONFIRMATION_THRESHOLD,
@@ -140,6 +142,8 @@ class OccupancyManager:
         # Ligne virtuelle (normalisée)
         self.line_p1 = line_p1
         self.line_p2 = line_p2
+        self.line2_p1 = line2_p1
+        self.line2_p2 = line2_p2
 
         # Paramètres
         self.dead_zone_margin = dead_zone_margin
@@ -200,6 +204,27 @@ class OccupancyManager:
             (self.line_p2[0] * width, self.line_p2[1] * height),
         )
 
+    def line2_px(self, width: int, height: int):
+        if self.line2_p1 is None or self.line2_p2 is None:
+            return None
+        return (
+            (self.line2_p1[0] * width, self.line2_p1[1] * height),
+            (self.line2_p2[0] * width, self.line2_p2[1] * height),
+        )
+
+    def classify_point(self, point, width: int, height: int) -> Zone:
+        line1 = self.line_px(width, height)
+        if self.line2_p1 is None or self.line2_p2 is None:
+            return classify_zone(signed_perpendicular_distance(point, *line1), self.dead_zone_margin)
+        line2 = self.line2_px(width, height)
+        d1 = signed_perpendicular_distance(point, *line1)
+        d2 = signed_perpendicular_distance(point, *line2)
+        if d1 > self.dead_zone_margin:
+            return Zone.INTERIEURE
+        if d2 < -self.dead_zone_margin:
+            return Zone.EXTERIEURE
+        return Zone.MORTE
+
     # -----------------------------------------------------------------------
     # Traitement d'une frame
     # -----------------------------------------------------------------------
@@ -228,7 +253,7 @@ class OccupancyManager:
 
         for track_id, display_id, anchor, box, conf in candidates:
             dist = signed_perpendicular_distance(anchor, l_start, l_end)
-            zone = classify_zone(dist, self.dead_zone_margin)
+            zone = self.classify_point(anchor, w, h)
 
             # -- Association technique → logique --
             logical_id = self._get_or_create_logical(
@@ -273,7 +298,7 @@ class OccupancyManager:
                 continue
 
             # -- Gestion de la zone morte --
-            if zone == Zone.MORTE:
+            if zone == Zone.MORTE and self.line2_p1 is None:
                 if track.state not in (TrackState.EN_ZONE_LIGNE, TrackState.SORTIE_CONFIRMEE):
                     track.state = TrackState.EN_ZONE_LIGNE
                 continue
@@ -285,7 +310,12 @@ class OccupancyManager:
                 crossed = False
 
             # -- Machine à états --
-            evt = self._transition(track, logical_id, zone, crossed, dist, frame_index)
+            if self.line2_p1 is not None and self.line2_p2 is not None:
+                l2 = self.line2_px(w, h)
+                crossed2 = prev_pos is not None and check_line_crossing(prev_pos, anchor, *l2)
+                evt = self._transition_double(track, logical_id, zone, crossed, crossed2, frame_index)
+            else:
+                evt = self._transition(track, logical_id, zone, crossed, dist, frame_index)
             if evt:
                 events.append(evt)
 
@@ -293,6 +323,44 @@ class OccupancyManager:
         self._handle_missing_tracks(seen_logical_ids, frame_index)
 
         return events
+
+    def _transition_double(self, track, logical_id, zone, crossed1, crossed2, frame_index):
+        """Valide un passage seulement après les deux lignes du sas."""
+        if track.state == TrackState.SORTIE_CONFIRMEE:
+            if crossed2:
+                track.pending_direction = "IN"
+                track.state = TrackState.EN_ZONE_LIGNE
+            return None
+        if track.state == TrackState.PRESENTE and crossed1:
+            track.pending_direction = "OUT"
+            track.state = TrackState.EN_ZONE_LIGNE
+            return None
+        if track.state == TrackState.EN_ZONE_LIGNE:
+            if track.pending_direction == "OUT":
+                if zone == Zone.INTERIEURE and crossed1:
+                    track.pending_direction = None
+                    track.state = TrackState.PRESENTE
+                elif crossed2 and zone == Zone.EXTERIEURE and track.counted_in_occupancy:
+                    track.pending_direction = None
+                    track.state = TrackState.SORTIE_CONFIRMEE
+                    track.counted_in_occupancy = False
+                    track.is_counted_out = True
+                    self.total_out += 1
+                    print(f"[COUNT] ID {logical_id} → OUT (sas, Total OUT: {self.total_out})")
+                    return {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "sas"}
+            elif track.pending_direction == "IN":
+                if zone == Zone.EXTERIEURE and crossed2:
+                    track.pending_direction = None
+                    track.state = TrackState.SORTIE_CONFIRMEE
+                elif crossed1 and zone == Zone.INTERIEURE:
+                    track.pending_direction = None
+                    track.state = TrackState.PRESENTE
+                    track.counted_in_occupancy = True
+                    track.is_counted_out = False
+                    self.total_in += 1
+                    print(f"[COUNT] ID {logical_id} → IN (sas, Total IN: {self.total_in})")
+                    return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "sas"}
+        return None
 
     # -----------------------------------------------------------------------
     # Machine à états interne

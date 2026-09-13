@@ -302,6 +302,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--line-p1", default=None)
     parser.add_argument("--line-p2", default=None)
+    parser.add_argument("--line2-p1", default=None, help="Première extrémité de la ligne extérieure du sas")
+    parser.add_argument("--line2-p2", default=None, help="Deuxième extrémité de la ligne extérieure du sas")
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-show", action="store_true")
     # Paramètres OccupancyManager
@@ -327,13 +329,20 @@ def main() -> None:
 
     if counting_enabled:
         line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
+        line2_p1 = parse_point(args.line2_p1) if args.line2_p1 else None
+        line2_p2 = parse_point(args.line2_p2) if args.line2_p2 else None
+        if (line2_p1 is None) != (line2_p2 is None):
+            raise ValueError("--line2-p1 et --line2-p2 doivent être fournis ensemble")
     else:
         line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
+        line2_p1 = line2_p2 = None
 
     id_manager = IDManager(confirmation_confidence=0.75)
     occupancy = OccupancyManager(
         line_p1=line_p1,
         line_p2=line_p2,
+        line2_p1=line2_p1,
+        line2_p2=line2_p2,
         dead_zone_margin=args.dead_zone,
         init_duration_frames=args.warmup_frames,
         confirmation_threshold=args.confirm_frames,
@@ -400,6 +409,10 @@ def main() -> None:
 
                     # Rendu avec bounding boxes colorées par état + HUD
                     occupancy.draw_overlay(rendered, candidates, visible_count)
+                    line2_px = occupancy.line2_px(w, h)
+                    if line2_px is not None:
+                        cv2.line(rendered, tuple(map(int, line2_px[0])), tuple(map(int, line2_px[1])), (255, 0, 255), 3, cv2.LINE_AA)
+                        cv2.putText(rendered, "L2: EXTERIEUR", tuple(map(int, line2_px[0])), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
                 else:
                     # Mode suivi uniquement : bounding boxes simples
                     for track_id, display_id, point, box, conf in candidates:
