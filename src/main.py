@@ -307,7 +307,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-show", action="store_true")
     # Paramètres OccupancyManager
-    parser.add_argument("--dead-zone", type=float, default=30.0,
+    parser.add_argument("--dead-zone", type=float, default=20.0,
                         help="Épaisseur de la zone morte en pixels (hystérésis)")
     parser.add_argument("--warmup-frames", type=int, default=15,
                         help="Nombre de frames de warm-up (~500ms à 30fps)")
