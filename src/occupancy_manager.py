@@ -25,7 +25,7 @@ from occupancy_types import LogicalTrack, OriginType, TrackState, Zone
 # Paramètres par défaut (surchargeables via config YAML ou CLI)
 # ---------------------------------------------------------------------------
 DEFAULT_DEAD_ZONE_MARGIN = 30.0      # Pixels de zone morte autour de la ligne
-DEFAULT_INIT_DURATION_FRAMES = 90    # Frames de warm-up (~3s à 30fps)
+DEFAULT_INIT_DURATION_FRAMES = 30    # Frames de warm-up (~1s à 30fps)
 DEFAULT_CONFIRMATION_THRESHOLD = 15  # Frames consécutives pour confirmer nouvelle présence
 DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
@@ -301,11 +301,19 @@ class OccupancyManager:
             if zone == Zone.MORTE and self.line2_p1 is None:
                 if track.state not in (TrackState.EN_ZONE_LIGNE, TrackState.SORTIE_CONFIRMEE):
                     track.state = TrackState.EN_ZONE_LIGNE
+                elif track.state == TrackState.SORTIE_CONFIRMEE:
+                    track.pending_direction = "IN"
                 continue
 
             # -- Détection de franchissement vectoriel (CCW) --
             if prev_pos is not None and prev_pos != anchor:
                 crossed = check_line_crossing(prev_pos, anchor, l_start, l_end)
+                # Avec un flux temps réel, une frame peut être perdue et le
+                # point peut passer directement de l'extérieur à l'intérieur.
+                # La transition signée complète reste alors un franchissement.
+                prev_dist = signed_perpendicular_distance(prev_pos, l_start, l_end)
+                if track.state == TrackState.SORTIE_CONFIRMEE and zone == Zone.INTERIEURE:
+                    crossed = crossed or (prev_dist < -self.dead_zone_margin and dist > self.dead_zone_margin)
             else:
                 crossed = False
 
@@ -379,10 +387,11 @@ class OccupancyManager:
 
         # --- Entrée depuis l'extérieur (sortie confirmée ou piste venant de l'extérieur) ---
         if state == TrackState.SORTIE_CONFIRMEE:
-            if zone == Zone.INTERIEURE and crossed:
+            if zone == Zone.INTERIEURE and (crossed or track.pending_direction == "IN"):
                 track.state = TrackState.A_RETOURNE if track.is_counted_out else TrackState.PRESENTE
                 track.counted_in_occupancy = True
                 track.is_counted_out = False
+                track.pending_direction = None
                 self.total_in += 1
                 label = "retour" if track.state == TrackState.A_RETOURNE else "entrée"
                 print(f"[COUNT] ID {logical_id} → IN ({label}, Total IN: {self.total_in})")
