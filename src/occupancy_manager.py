@@ -60,7 +60,7 @@ def signed_perpendicular_distance(
 ) -> float:
     """Distance orthogonale signée d'un point par rapport à la ligne.
 
-    Positif = côté intérieur (salle), négatif = côté extérieur.
+    Positif = côté extérieur, négatif = côté intérieur (salle).
     """
     dx = line_end[0] - line_start[0]
     dy = line_end[1] - line_start[1]
@@ -77,7 +77,7 @@ def classify_zone(
     """Classifie un point selon sa distance signée à la ligne."""
     if abs(dist) <= dead_zone_margin:
         return Zone.MORTE
-    return Zone.INTERIEURE if dist > 0 else Zone.EXTERIEURE
+    return Zone.EXTERIEURE if dist > 0 else Zone.INTERIEURE
 
 
 def compute_anchor(
@@ -219,9 +219,9 @@ class OccupancyManager:
         line2 = self.line2_px(width, height)
         d1 = signed_perpendicular_distance(point, *line1)
         d2 = signed_perpendicular_distance(point, *line2)
-        if d1 > self.dead_zone_margin:
+        if d1 < -self.dead_zone_margin:
             return Zone.INTERIEURE
-        if d2 < -self.dead_zone_margin:
+        if d2 > self.dead_zone_margin:
             return Zone.EXTERIEURE
         return Zone.MORTE
 
@@ -301,6 +301,7 @@ class OccupancyManager:
             if zone == Zone.MORTE and self.line2_p1 is None:
                 if track.state not in (TrackState.EN_ZONE_LIGNE, TrackState.SORTIE_CONFIRMEE):
                     track.state = TrackState.EN_ZONE_LIGNE
+                    track.pending_direction = "OUT" if track.counted_in_occupancy else track.pending_direction
                 elif track.state == TrackState.SORTIE_CONFIRMEE:
                     track.pending_direction = "IN"
                 continue
@@ -313,7 +314,7 @@ class OccupancyManager:
                 # La transition signée complète reste alors un franchissement.
                 prev_dist = signed_perpendicular_distance(prev_pos, l_start, l_end)
                 if track.state == TrackState.SORTIE_CONFIRMEE and zone == Zone.INTERIEURE:
-                    crossed = crossed or (prev_dist < -self.dead_zone_margin and dist > self.dead_zone_margin)
+                    crossed = crossed or (prev_dist > self.dead_zone_margin and dist < -self.dead_zone_margin)
             else:
                 crossed = False
 
@@ -427,12 +428,13 @@ class OccupancyManager:
 
         # --- Personne en zone extérieure ---
         if zone == Zone.EXTERIEURE:
-            if crossed and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
+            if (crossed or track.pending_direction == "OUT") and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
                 # Franchissement validé : OUT
                 if track.counted_in_occupancy:
                     track.state = TrackState.SORTIE_CONFIRMEE
                     track.counted_in_occupancy = False
                     track.is_counted_out = True
+                    track.pending_direction = None
                     self.total_out += 1
                     print(f"[COUNT] ID {logical_id} → OUT (Total OUT: {self.total_out})")
                     return {"type": "OUT", "id": logical_id, "frame": frame_index}
