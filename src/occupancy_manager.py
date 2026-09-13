@@ -361,9 +361,21 @@ class OccupancyManager:
     def _transition_double(self, track, logical_id, zone, crossed1, crossed2, frame_index):
         """Valide un passage seulement après les deux lignes du sas."""
         if track.state == TrackState.SORTIE_CONFIRMEE:
-            if crossed2:
+            # Une entrée peut commencer alors que la première détection de la
+            # piste se trouve déjà dans le sas : on mémorise alors la séquence
+            # par zone, sans exiger que le point touche exactement L2.
+            if zone == Zone.INTERIEURE and (crossed1 or crossed2 or track.interior_streak >= 2):
+                track.pending_direction = None
+                track.state = TrackState.A_RETOURNE
+                track.counted_in_occupancy = True
+                track.is_counted_out = False
+                self.total_in += 1
+                print(f"[COUNT] ID {logical_id} → IN (sas, Total IN: {self.total_in})")
+                return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "sas"}
+            if zone == Zone.MORTE or crossed2:
                 track.pending_direction = "IN"
                 track.state = TrackState.EN_ZONE_LIGNE
+                return None
             return None
         if track.state == TrackState.PRESENTE and crossed1:
             track.pending_direction = "OUT"
@@ -386,7 +398,7 @@ class OccupancyManager:
                 if zone == Zone.EXTERIEURE and crossed2:
                     track.pending_direction = None
                     track.state = TrackState.SORTIE_CONFIRMEE
-                elif crossed1 and zone == Zone.INTERIEURE:
+                elif zone == Zone.INTERIEURE and (crossed1 or track.interior_streak >= 2):
                     track.pending_direction = None
                     track.state = TrackState.PRESENTE
                     track.counted_in_occupancy = True
