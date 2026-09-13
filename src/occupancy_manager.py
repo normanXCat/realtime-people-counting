@@ -255,13 +255,16 @@ class OccupancyManager:
         top_l2 = signed_perpendicular_distance(top, *l2)
         event = None
 
-        if track.previous_bottom_l1 is not None and track.previous_bottom_l1 < 0 <= bottom_l1:
+        # On utilise une bande de tolérance autour de chaque ligne : une
+        # frame peut sauter au-dessus de la ligne sans que le signe exact soit
+        # observé entre deux images.
+        if bottom_l1 >= -self.dead_zone_margin:
             track.exit_l1_crossed = True
         elif track.exit_l1_crossed and bottom_l1 < -self.dead_zone_margin:
             # La personne est revenue côté salle avant L2 : sortie annulée.
             track.exit_l1_crossed = False
-        if track.previous_top_l2 is not None and track.previous_top_l2 <= 0 < top_l2:
-            if track.exit_l1_crossed:
+        if top_l2 >= -self.dead_zone_margin:
+            if track.exit_l1_crossed and track.counted_in_occupancy:
                 track.state = TrackState.SORTIE_CONFIRMEE
                 track.counted_in_occupancy = False
                 track.is_counted_out = True
@@ -270,12 +273,12 @@ class OccupancyManager:
                 print(f"[COUNT] ID {logical_id} → OUT (bas L1 puis haut L2)")
                 event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "bottom_L1_then_top_L2"}
 
-        if track.previous_top_l2 is not None and track.previous_top_l2 > 0 >= top_l2:
+        if top_l2 <= self.dead_zone_margin:
             track.entry_l2_crossed = True
         elif track.entry_l2_crossed and top_l2 > self.dead_zone_margin:
             # La personne est repartie vers l'extérieur avant L1 : entrée annulée.
             track.entry_l2_crossed = False
-        if track.previous_bottom_l1 is not None and track.previous_bottom_l1 >= 0 > bottom_l1:
+        if bottom_l1 <= self.dead_zone_margin:
             if track.entry_l2_crossed and not track.counted_in_occupancy:
                 track.state = TrackState.PRESENTE
                 track.counted_in_occupancy = True
