@@ -309,8 +309,8 @@ def arguments() -> argparse.Namespace:
     # Paramètres OccupancyManager
     parser.add_argument("--dead-zone", type=float, default=30.0,
                         help="Épaisseur de la zone morte en pixels (hystérésis)")
-    parser.add_argument("--warmup-frames", type=int, default=30,
-                        help="Nombre de frames de warm-up (~1s à 30fps)")
+    parser.add_argument("--warmup-frames", type=int, default=15,
+                        help="Nombre de frames de warm-up (~500ms à 30fps)")
     parser.add_argument("--confirm-frames", type=int, default=15,
                         help="Frames consécutives pour confirmer une nouvelle présence")
     parser.add_argument("--grace-frames", type=int, default=300,

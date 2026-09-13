@@ -25,7 +25,7 @@ from occupancy_types import LogicalTrack, OriginType, TrackState, Zone
 # Paramètres par défaut (surchargeables via config YAML ou CLI)
 # ---------------------------------------------------------------------------
 DEFAULT_DEAD_ZONE_MARGIN = 30.0      # Pixels de zone morte autour de la ligne
-DEFAULT_INIT_DURATION_FRAMES = 30    # Frames de warm-up (~1s à 30fps)
+DEFAULT_INIT_DURATION_FRAMES = 15    # Frames de warm-up (~500ms à 30fps)
 DEFAULT_CONFIRMATION_THRESHOLD = 15  # Frames consécutives pour confirmer nouvelle présence
 DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
