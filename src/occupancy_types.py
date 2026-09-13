@@ -66,3 +66,5 @@ class LogicalTrack:
     entry_l2_crossed: bool = False
     previous_bottom_l1: float | None = None
     previous_top_l2: float | None = None
+    previous_top_l1: float | None = None
+    previous_bottom_l2: float | None = None
