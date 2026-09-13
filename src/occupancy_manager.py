@@ -31,7 +31,8 @@ DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
 DEFAULT_TRAJECTORY_MAXLEN = 60       # Taille max de l'historique de trajectoire
 OUT_CONFIRMATION_FRAMES = 3          # Frames extérieures consécutives avant OUT
-DEFAULT_GATE_WIDTH_PX = 40.0         # Largeur du sas automatique côté extérieur
+DEFAULT_GATE_WIDTH_PX = 0.0          # L2 désactivée : comptage mono-ligne
+LINE_CONFIRMATION_FRAMES = 3         # Frames du nouveau côté avant validation
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +296,45 @@ class OccupancyManager:
         track.previous_bottom_l2 = bottom_l2
         return event
 
+    def _process_single_line(self, track, logical_id: int, anchor, width: int, height: int, frame_index: int):
+        """Compte IN/OUT avec une seule ligne et le point des pieds."""
+        l1 = self.line_px(width, height)
+        foot_distance = signed_perpendicular_distance(anchor, *l1)
+        inside = foot_distance < -self.dead_zone_margin
+        outside = foot_distance > self.dead_zone_margin
+        event = None
+
+        if track.counted_in_occupancy:
+            if outside:
+                track.crossing_out_streak += 1
+                track.crossing_in_streak = 0
+                if track.crossing_out_streak >= LINE_CONFIRMATION_FRAMES:
+                    track.state = TrackState.SORTIE_CONFIRMEE
+                    track.counted_in_occupancy = False
+                    track.is_counted_out = True
+                    track.crossing_out_streak = 0
+                    self.total_out += 1
+                    print(f"[COUNT] ID {logical_id} → OUT (ligne unique, pieds côté extérieur)")
+                    event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "single_line_feet"}
+            elif inside:
+                track.crossing_out_streak = 0
+        else:
+            if inside:
+                track.crossing_in_streak += 1
+                track.crossing_out_streak = 0
+                if track.crossing_in_streak >= LINE_CONFIRMATION_FRAMES:
+                    track.state = TrackState.PRESENTE
+                    track.counted_in_occupancy = True
+                    track.is_counted_out = False
+                    track.crossing_in_streak = 0
+                    self.total_in += 1
+                    print(f"[COUNT] ID {logical_id} → IN (ligne unique, pieds côté intérieur)")
+                    event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "single_line_feet"}
+            elif outside:
+                track.crossing_in_streak = 0
+
+        return event
+
     # -----------------------------------------------------------------------
     # Traitement d'une frame
     # -----------------------------------------------------------------------
@@ -380,26 +420,28 @@ class OccupancyManager:
                     track.state = TrackState.EN_ZONE_LIGNE
                 continue
 
-            # Mode sas : le comptage repose sur les bords de la boîte. On ne
-            # laisse pas l'ancienne logique au centre de boîte produire un
-            # événement concurrent.
-            if self.line2_px(w, h) is not None:
-                gate_event = self._process_box_gate(track, logical_id, box, w, h, frame_index)
-                if gate_event:
-                    events.append(gate_event)
-                if (
-                    gate_event is None
-                    and zone == Zone.INTERIEURE
-                    and not track.counted_in_occupancy
-                    and track.origin == OriginType.APPARITION_INTERIEURE
-                    and track.interior_streak >= self.confirmation_threshold
-                ):
-                    track.state = TrackState.NOUVELLE_PRESENCE
-                    track.counted_in_occupancy = True
-                    self.total_new_presences += 1
-                    print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
-                    events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
-                continue
+            # Mode mono-ligne : L2, si elle est dessinée, est uniquement
+            # visuelle. Le comptage utilise le point des pieds et L1.
+            line_event = None
+            if track.origin != OriginType.APPARITION_INTERIEURE or track.counted_in_occupancy:
+                line_event = self._process_single_line(
+                    track, logical_id, anchor, w, h, frame_index,
+                )
+            if line_event:
+                events.append(line_event)
+            if (
+                line_event is None
+                and zone == Zone.INTERIEURE
+                and not track.counted_in_occupancy
+                and track.origin == OriginType.APPARITION_INTERIEURE
+                and track.interior_streak >= self.confirmation_threshold
+            ):
+                track.state = TrackState.NOUVELLE_PRESENCE
+                track.counted_in_occupancy = True
+                self.total_new_presences += 1
+                print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
+                events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
+            continue
 
             # -- Gestion de la zone morte --
             if zone == Zone.MORTE and self.line2_px(w, h) is None:

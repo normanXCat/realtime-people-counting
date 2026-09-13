@@ -392,10 +392,9 @@ def main() -> None:
     counting_enabled = ask_counting_mode()
 
     if counting_enabled:
-        line_p1, line_p2, line2_p1, line2_p2 = calibrate_two_lines(
-            args.source, args.no_show,
-            args.line_p1, args.line_p2, args.line2_p1, args.line2_p2,
-        )
+        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
+        # L2 est abandonnée : le comptage utilise uniquement L1 et le point des pieds.
+        line2_p1 = line2_p2 = None
     else:
         line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
         line2_p1 = line2_p2 = None
@@ -473,10 +472,6 @@ def main() -> None:
 
                     # Rendu avec bounding boxes colorées par état + HUD
                     occupancy.draw_overlay(rendered, candidates, visible_count)
-                    line2_px = occupancy.line2_px(w, h)
-                    if line2_px is not None:
-                        cv2.line(rendered, tuple(map(int, line2_px[0])), tuple(map(int, line2_px[1])), (255, 0, 255), 3, cv2.LINE_AA)
-                        cv2.putText(rendered, "L2: EXTERIEUR (SAS)", tuple(map(int, line2_px[0])), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
                 else:
                     # Mode suivi uniquement : bounding boxes simples
                     for track_id, display_id, point, box, conf in candidates:

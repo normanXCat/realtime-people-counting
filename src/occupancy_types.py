@@ -68,3 +68,5 @@ class LogicalTrack:
     previous_top_l2: float | None = None
     previous_top_l1: float | None = None
     previous_bottom_l2: float | None = None
+    crossing_in_streak: int = 0
+    crossing_out_streak: int = 0
