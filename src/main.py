@@ -1,8 +1,13 @@
-"""Comptage de personnes YOLO11 + BoT-SORT avec IDs d'affichage séquentiels.
+"""Comptage de personnes YOLO11 + BoT-SORT avec gestion d'occupation robuste.
 
-Le tracker reste responsable des pistes; IDManager ne fait que convertir les
-IDs internes confirmés en IDs d'affichage 1, 2, 3, ... . Aucun trail n'est
-rendu. En mode --no-show, la ligne par défaut ou les points CLI sont utilisés.
+Pipeline :
+1. IDManager convertit les track_id BoT-SORT en display_id séquentiels (ReID).
+2. OccupancyManager applique la machine à états FSM avec :
+   - Intersection vectorielle CCW pour détecter les franchissements
+   - Zone morte (hystérésis) autour de la ligne virtuelle
+   - Phase de warm-up pour calibrer l'effectif initial
+   - Gestion des occultations (disparition ≠ sortie)
+3. Le rendu visuel affiche les bounding boxes colorées par état et le HUD d'occupation.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ import cv2
 import numpy as np
 import yaml
 from ultralytics import YOLO
+
+from occupancy_manager import OccupancyManager, compute_anchor
 
 
 ROOT = Path(__file__).resolve().parent
@@ -127,7 +134,7 @@ class IDManager:
                 for candidate_id, candidate_feature in self.features.items():
                     if candidate_id in current_displays:
                         continue
-                    # Ne jamais voler l’ID d’une personne vue récemment : la
+                    # Ne jamais voler l'ID d'une personne vue récemment : la
                     # galerie sert aux pistes réellement disparues.
                     if frame_index - self.last_seen.get(candidate_id, frame_index) < 3:
                         continue
@@ -148,7 +155,7 @@ class IDManager:
                 self.next_id += 1
                 self.mapping_dict[int(track_id)] = display_id
                 print(f"[REID SUCCESS] Nouvelle entité confirmée : YOLO_ID {track_id} -> Affiche ID {display_id} (conf={conf:.2f})")
-            center = ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
+            center = compute_anchor(box)
             if feature is not None:
                 old = self.features.get(display_id)
                 self.features[display_id] = feature if old is None else (0.85 * old + 0.15 * feature)
@@ -224,99 +231,6 @@ class IDManager:
         return self.mapping_dict[track_id]
 
 
-HYSTERESIS_MARGIN = 20.0
-
-
-def check_line_crossing(
-    previous_foot: tuple[float, float],
-    current_foot: tuple[float, float],
-    line_a: tuple[float, float],
-    line_b: tuple[float, float],
-) -> bool:
-    """Retourne True uniquement si le segment du pied croise strictement la ligne."""
-    def ccw(a, b, c):
-        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
-
-    return (
-        ccw(previous_foot, line_a, line_b) != ccw(current_foot, line_a, line_b)
-        and ccw(previous_foot, current_foot, line_a) != ccw(previous_foot, current_foot, line_b)
-    )
-
-
-class LineCounter:
-    """Compte chaque display_id au plus une fois par direction."""
-
-    def __init__(self, p1: tuple[float, float], p2: tuple[float, float]) -> None:
-        self.p1 = p1
-        self.p2 = p2
-        self.previous: dict[int, tuple[float, float]] = {}
-        self.counted_in: set[int] = set()
-        self.counted_out: set[int] = set()
-        self.entries = 0
-        self.exits = 0
-
-    @staticmethod
-    def cross(a: tuple[float, float], b: tuple[float, float]) -> float:
-        return a[0] * b[1] - a[1] * b[0]
-
-    @staticmethod
-    def segments_intersect(
-        a: tuple[float, float], b: tuple[float, float],
-        c: tuple[float, float], d: tuple[float, float],
-    ) -> bool:
-        def orient(p, q, r):
-            return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-
-        def on_segment(p, q, r):
-            return min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and min(p[1], r[1]) <= q[1] <= max(p[1], r[1])
-
-        eps = 1e-9
-        o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
-        if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)):
-            return True
-        return ((abs(o1) <= eps and on_segment(a, c, b)) or
-                (abs(o2) <= eps and on_segment(a, d, b)) or
-                (abs(o3) <= eps and on_segment(c, a, d)) or
-                (abs(o4) <= eps and on_segment(c, b, d)))
-
-    def update(self, display_id: int, point: tuple[float, float], width: int, height: int) -> None:
-        previous = self.previous.get(display_id)
-        self.previous[display_id] = point
-        if previous is None or not self.segments_intersect(previous, point, self._line(width, height)[0], self._line(width, height)[1]):
-            return
-        a, b = self._line(width, height)
-        line_vector = (b[0] - a[0], b[1] - a[1])
-        before = self.cross(line_vector, (previous[0] - a[0], previous[1] - a[1]))
-        after = self.cross(line_vector, (point[0] - a[0], point[1] - a[1]))
-        if before < 0 < after and display_id not in self.counted_in:
-            self.counted_in.add(display_id)
-            self.entries += 1
-            print(f"[COUNT] ID {display_id} -> IN")
-        elif before > 0 > after and display_id not in self.counted_out:
-            self.counted_out.add(display_id)
-            self.exits += 1
-            print(f"[COUNT] ID {display_id} -> OUT")
-
-    def _line(self, width: int, height: int) -> tuple[tuple[float, float], tuple[float, float]]:
-        return ((self.p1[0] * width, self.p1[1] * height), (self.p2[0] * width, self.p2[1] * height))
-
-    def draw(self, frame: np.ndarray, present: int = 0, draw_line: bool = True) -> None:
-        h, w = frame.shape[:2]
-        if draw_line:
-            a, b = self._line(w, h)
-            cv2.line(frame, tuple(map(int, a)), tuple(map(int, b)), (0, 255, 0), 3)
-        cv2.putText(
-            frame,
-            f"IN: {self.entries}  OUT: {self.exits}  Present: {present}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-
 def parse_point(value: str) -> tuple[float, float]:
     x, y = (float(v.strip()) for v in value.split(","))
     if not (0 <= x <= 1 and 0 <= y <= 1):
@@ -355,7 +269,7 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
             points.append((x, y))
 
-    window = "Calibration - cliquez 2 points, c=valider, g=réinitialiser"
+    window = "Calibration - cliquez 2 points, c=valider, g=reinitialiser"
     cv2.namedWindow(window)
     cv2.setMouseCallback(window, on_click)
     while True:
@@ -379,7 +293,7 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
 
 
 def arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="YOLO11 + BoT-SORT people counting")
+    parser = argparse.ArgumentParser(description="YOLO11 + BoT-SORT people counting (FSM)")
     parser.add_argument("--source", default="0")
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--tracker", default=str(DEFAULT_TRACKER))
@@ -390,6 +304,17 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--line-p2", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-show", action="store_true")
+    # Paramètres OccupancyManager
+    parser.add_argument("--dead-zone", type=float, default=30.0,
+                        help="Épaisseur de la zone morte en pixels (hystérésis)")
+    parser.add_argument("--warmup-frames", type=int, default=90,
+                        help="Nombre de frames de warm-up (~3s à 30fps)")
+    parser.add_argument("--confirm-frames", type=int, default=15,
+                        help="Frames consécutives pour confirmer une nouvelle présence")
+    parser.add_argument("--grace-frames", type=int, default=300,
+                        help="Frames de délai de grâce pour les pistes occultées")
+    parser.add_argument("--zenithal", action="store_true",
+                        help="Vue zénithale : utiliser le centre de boîte au lieu du bas")
     return parser.parse_args()
 
 
@@ -399,33 +324,51 @@ def main() -> None:
     verify_reid_weights(args.tracker)
     model = YOLO(str(model_path))
     counting_enabled = ask_counting_mode()
+
     if counting_enabled:
         line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
     else:
         line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
-    manager = IDManager(confirmation_confidence=0.75)
-    counter = LineCounter(line_p1, line_p2)
+
+    id_manager = IDManager(confirmation_confidence=0.75)
+    occupancy = OccupancyManager(
+        line_p1=line_p1,
+        line_p2=line_p2,
+        dead_zone_margin=args.dead_zone,
+        init_duration_frames=args.warmup_frames,
+        confirmation_threshold=args.confirm_frames,
+        grace_period_frames=args.grace_frames,
+        is_zenithal=args.zenithal,
+    )
+
     writer = None
     window_initialized = False
     frame_index = 0
-    person_status: dict[int, str] = {}
-    last_foot_pos: dict[int, tuple[float, float]] = {}
-    pending_crossing: dict[int, str] = {}
     pred_events: list[dict] = []
-    frame_idx = 0
 
-    results = model.track(source=int(args.source) if args.source.isdigit() else args.source, tracker=args.tracker, persist=True, classes=[0], conf=args.conf, iou=args.iou, imgsz=args.imgsz, show=False, stream=True)
+    results = model.track(
+        source=int(args.source) if args.source.isdigit() else args.source,
+        tracker=args.tracker,
+        persist=True,
+        classes=[0],
+        conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
+        show=False,
+        stream=True,
+    )
+
     try:
         for result in results:
-            t_start_frame = time.perf_counter()
-            frame_idx += 1
+            t_start = time.perf_counter()
             frame_index += 1
             frame = result.orig_img
             if frame is None:
                 continue
             h, w = frame.shape[:2]
             rendered = frame.copy()
-            present_count = 0
+            visible_count = 0
+
             if result.boxes is not None and result.boxes.id is not None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 ids = result.boxes.id.int().cpu().tolist()
@@ -434,56 +377,48 @@ def main() -> None:
                 for box, track_id, conf in zip(boxes, ids, confs):
                     raw_candidates.append((track_id, box, float(conf)))
 
-                candidates = manager.assign_frame(
+                # IDManager : attribution des display_id séquentiels
+                candidates = id_manager.assign_frame(
                     raw_candidates,
                     frame,
                     frame_index,
                     float(np.hypot(w, h)),
                 )
-                present_count = len(candidates)
-                for track_id, display_id, point, box, conf in candidates:
-                    x1, y1, x2, y2 = map(int, box[:4])
-                    if counting_enabled:
-                        line_a, line_b = counter._line(w, h)
-                    else:
-                        line_a = line_b = (0.0, 0.0)
-                    current_foot = (float(point[0]), float(point[1]))
-                    previous_foot = last_foot_pos.get(display_id)
-                    line_dx = line_b[0] - line_a[0]
-                    line_dy = line_b[1] - line_a[1]
-                    line_length = max(float(np.hypot(line_dx, line_dy)), 1.0)
+                visible_count = len(candidates)
 
-                    def signed_distance(foot):
-                        return ((foot[0] - line_a[0]) * line_dy - (foot[1] - line_a[1]) * line_dx) / line_length
+                if counting_enabled:
+                    # OccupancyManager : FSM + comptage
+                    events = occupancy.process_frame(
+                        candidates=candidates,
+                        frame=frame,
+                        frame_index=frame_index,
+                        features=id_manager.features,
+                    )
+                    for evt in events:
+                        evt["latency_ms"] = round((time.perf_counter() - t_start) * 1000, 2)
+                        pred_events.append(evt)
 
-                    if counting_enabled:
-                        current_side = signed_distance(current_foot)
-                        if display_id not in person_status:
-                            person_status[display_id] = "inside" if current_side <= 0 else "outside"
-                        if previous_foot is not None and check_line_crossing(previous_foot, current_foot, line_a, line_b):
-                            target = "outside" if current_side > 0 else "inside"
-                            if target != person_status[display_id]:
-                                pending_crossing[display_id] = target
-                        target = pending_crossing.get(display_id)
-                        if target is not None and abs(current_side) >= HYSTERESIS_MARGIN:
-                            if target != person_status[display_id]:
-                                if target == "inside":
-                                    counter.entries += 1
-                                    print(f"[COUNT] ID {display_id} -> IN")
-                                    pred_events.append({"frame": frame_idx, "id": display_id, "direction": "IN", "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2)})
-                                else:
-                                    counter.exits += 1
-                                    print(f"[COUNT] ID {display_id} -> OUT")
-                                    pred_events.append({"frame": frame_idx, "id": display_id, "direction": "OUT", "latency_ms": round((time.perf_counter() - t_start_frame) * 1000, 2)})
-                                person_status[display_id] = target
-                            pending_crossing.pop(display_id, None)
-                        last_foot_pos[display_id] = current_foot
-                    cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
-                    cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
-                    label = f"ID: {display_id} person {conf:.2f}"
-                    cv2.putText(rendered, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
-            counter.draw(rendered, present=present_count, draw_line=counting_enabled)
+                    # Rendu avec bounding boxes colorées par état + HUD
+                    occupancy.draw_overlay(rendered, candidates, visible_count)
+                else:
+                    # Mode suivi uniquement : bounding boxes simples
+                    for track_id, display_id, point, box, conf in candidates:
+                        x1, y1, x2, y2 = map(int, box[:4])
+                        cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
+                        cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
+                        label = f"ID: {display_id} person {conf:.2f}"
+                        cv2.putText(rendered, label, (x1, max(25, y1 - 8)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
+                    # HUD minimal
+                    cv2.putText(rendered, f"Present: {visible_count}", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            else:
+                if counting_enabled:
+                    # Aucune détection : gérer les occultations
+                    occupancy.process_frame([], frame, frame_index)
+                    occupancy.draw_overlay(rendered, [], 0)
 
+            # -- Écriture vidéo --
             if args.output and writer is None:
                 out = Path(args.output)
                 out.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +431,8 @@ def main() -> None:
                 print(f"[OUTPUT] {out}")
             if writer is not None:
                 writer.write(rendered)
+
+            # -- Affichage --
             if not args.no_show:
                 if not window_initialized:
                     cv2.namedWindow("People counting", cv2.WINDOW_NORMAL)
@@ -504,15 +441,34 @@ def main() -> None:
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
             else:
-                print(f"\r[LIVE] IN={counter.entries} OUT={counter.exits} PRESENT={present_count}", end="")
+                if counting_enabled:
+                    print(
+                        f"\r[LIVE] OCCUPANCY={occupancy.occupancy_count} "
+                        f"IN={occupancy.total_in} OUT={occupancy.total_out} "
+                        f"NEW={occupancy.total_new_presences} "
+                        f"VISIBLE={visible_count} PHASE={occupancy.phase}",
+                        end="",
+                    )
+                else:
+                    print(f"\r[LIVE] PRESENT={visible_count}", end="")
+
     finally:
         if writer is not None:
             writer.release()
         if not args.no_show:
             cv2.destroyAllWindows()
-        print(f"\n[FINAL] IN={counter.entries} OUT={counter.exits}")
-    with open("predictions_systeme.json", "w", encoding="utf-8") as f:
-        json.dump(pred_events, f, indent=4)
+        if counting_enabled:
+            print(
+                f"\n[FINAL] OCCUPANCY={occupancy.occupancy_count} "
+                f"IN={occupancy.total_in} OUT={occupancy.total_out} "
+                f"NEW={occupancy.total_new_presences}"
+            )
+        else:
+            print(f"\n[FINAL] Session terminée.")
+
+    if pred_events:
+        with open("predictions_systeme.json", "w", encoding="utf-8") as f:
+            json.dump(pred_events, f, indent=4)
 
 
 if __name__ == "__main__":
