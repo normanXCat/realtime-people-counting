@@ -292,6 +292,68 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
             raise KeyboardInterrupt
 
 
+def calibrate_two_lines(
+    source: str,
+    no_show: bool,
+    line1_p1: Optional[str],
+    line1_p2: Optional[str],
+    line2_p1: Optional[str],
+    line2_p2: Optional[str],
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Calibre L1 et L2 manuellement, ou lit quatre points CLI normalisés."""
+    if line1_p1 and line1_p2 and line2_p1 and line2_p2:
+        return (
+            parse_point(line1_p1), parse_point(line1_p2),
+            parse_point(line2_p1), parse_point(line2_p2),
+        )
+    if any((line1_p1, line1_p2, line2_p1, line2_p2)):
+        raise ValueError("Les quatre points L1/L2 doivent être fournis ensemble")
+    if no_show:
+        raise ValueError("Le mode --no-show exige --line-p1, --line-p2, --line2-p1 et --line2-p2")
+
+    capture = cv2.VideoCapture(int(source) if source.isdigit() else source)
+    ok, frame = capture.read()
+    capture.release()
+    if not ok:
+        raise RuntimeError(f"Impossible de lire la première frame : {source}")
+    h, w = frame.shape[:2]
+    points: list[tuple[int, int]] = []
+    canvas = frame.copy()
+
+    def on_click(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append((x, y))
+
+    window = "Calibration - L1 puis L2 | 4 points, c=valider, g=reinitialiser"
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, on_click)
+    while True:
+        display = canvas.copy()
+        for i, point in enumerate(points):
+            cv2.circle(display, point, 6, (0, 0, 255), -1)
+            cv2.putText(display, str(i + 1), (point[0] + 8, point[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        if len(points) >= 2:
+            cv2.line(display, points[0], points[1], (0, 255, 0), 3, cv2.LINE_AA)
+            cv2.putText(display, "L1", points[0], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+        if len(points) == 4:
+            cv2.line(display, points[2], points[3], (255, 0, 255), 3, cv2.LINE_AA)
+            cv2.putText(display, "L2", points[2], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(display, "Cliquez L1 gauche/droite, puis L2 gauche/droite | c=valider | g=reset",
+                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.imshow(window, display)
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord("c") and len(points) == 4:
+            cv2.destroyWindow(window)
+            return tuple((x / w, y / h) for x, y in points)  # type: ignore[return-value]
+        if key == ord("g"):
+            points.clear()
+            print("[Calibration] L1 et L2 réinitialisées.")
+        if key == 27:
+            cv2.destroyWindow(window)
+            raise KeyboardInterrupt
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YOLO11 + BoT-SORT people counting (FSM)")
     parser.add_argument("--source", default="0")
@@ -302,15 +364,15 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--line-p1", default=None)
     parser.add_argument("--line-p2", default=None)
-    parser.add_argument("--line2-p1", default=None, help="Première extrémité de la ligne extérieure du sas")
-    parser.add_argument("--line2-p2", default=None, help="Deuxième extrémité de la ligne extérieure du sas")
+    parser.add_argument("--line2-p1", default=None, help="Première extrémité de L2, coordonnées x,y normalisées")
+    parser.add_argument("--line2-p2", default=None, help="Deuxième extrémité de L2, coordonnées x,y normalisées")
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-show", action="store_true")
     # Paramètres OccupancyManager
     parser.add_argument("--dead-zone", type=float, default=20.0,
                         help="Épaisseur de la zone morte en pixels (hystérésis)")
-    parser.add_argument("--gate-width", type=float, default=40.0,
-                        help="Largeur du sas automatique côté extérieur, en pixels")
+    parser.add_argument("--gate-width", type=float, default=0.0,
+                        help="Ancien décalage automatique de L2 (0 = désactivé)")
     parser.add_argument("--warmup-frames", type=int, default=15,
                         help="Nombre de frames de warm-up (~500ms à 30fps)")
     parser.add_argument("--confirm-frames", type=int, default=15,
@@ -330,11 +392,10 @@ def main() -> None:
     counting_enabled = ask_counting_mode()
 
     if counting_enabled:
-        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
-        line2_p1 = parse_point(args.line2_p1) if args.line2_p1 else None
-        line2_p2 = parse_point(args.line2_p2) if args.line2_p2 else None
-        if (line2_p1 is None) != (line2_p2 is None):
-            raise ValueError("--line2-p1 et --line2-p2 doivent être fournis ensemble")
+        line_p1, line_p2, line2_p1, line2_p2 = calibrate_two_lines(
+            args.source, args.no_show,
+            args.line_p1, args.line_p2, args.line2_p1, args.line2_p2,
+        )
     else:
         line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
         line2_p1 = line2_p2 = None
