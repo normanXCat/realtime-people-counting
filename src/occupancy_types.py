@@ -62,3 +62,7 @@ class LogicalTrack:
     pending_direction: str | None = None
     exterior_streak: int = 0
     interior_streak: int = 0
+    exit_l1_crossed: bool = False
+    entry_l2_crossed: bool = False
+    previous_bottom_l1: float | None = None
+    previous_top_l2: float | None = None

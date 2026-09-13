@@ -237,6 +237,52 @@ class OccupancyManager:
             return Zone.EXTERIEURE
         return Zone.MORTE
 
+    def _process_box_gate(self, track, logical_id: int, box, width: int, height: int, frame_index: int):
+        """Compte le sas avec les bords de la boîte, pas avec son centre.
+
+        Convention actuelle : côté salle = distance signée négative. Une
+        sortie exige donc : bas de boîte franchit L1, puis haut de boîte
+        franchit L2. Une entrée valide la séquence inverse.
+        """
+        l1 = self.line_px(width, height)
+        l2 = self.line2_px(width, height)
+        if l2 is None:
+            return None
+        x1, y1, x2, y2 = map(float, box[:4])
+        bottom = ((x1 + x2) / 2.0, y2)
+        top = ((x1 + x2) / 2.0, y1)
+        bottom_l1 = signed_perpendicular_distance(bottom, *l1)
+        top_l2 = signed_perpendicular_distance(top, *l2)
+        event = None
+
+        if track.previous_bottom_l1 is not None and track.previous_bottom_l1 < 0 <= bottom_l1:
+            track.exit_l1_crossed = True
+        if track.previous_top_l2 is not None and track.previous_top_l2 <= 0 < top_l2:
+            if track.exit_l1_crossed:
+                track.state = TrackState.SORTIE_CONFIRMEE
+                track.counted_in_occupancy = False
+                track.is_counted_out = True
+                track.exit_l1_crossed = False
+                self.total_out += 1
+                print(f"[COUNT] ID {logical_id} → OUT (bas L1 puis haut L2)")
+                event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "bottom_L1_then_top_L2"}
+
+        if track.previous_top_l2 is not None and track.previous_top_l2 > 0 >= top_l2:
+            track.entry_l2_crossed = True
+        if track.previous_bottom_l1 is not None and track.previous_bottom_l1 >= 0 > bottom_l1:
+            if track.entry_l2_crossed and not track.counted_in_occupancy:
+                track.state = TrackState.PRESENTE
+                track.counted_in_occupancy = True
+                track.is_counted_out = False
+                track.entry_l2_crossed = False
+                self.total_in += 1
+                print(f"[COUNT] ID {logical_id} → IN (haut L2 puis bas L1)")
+                event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "top_L2_then_bottom_L1"}
+
+        track.previous_bottom_l1 = bottom_l1
+        track.previous_top_l2 = top_l2
+        return event
+
     # -----------------------------------------------------------------------
     # Traitement d'une frame
     # -----------------------------------------------------------------------
@@ -320,6 +366,27 @@ class OccupancyManager:
                     track.state = TrackState.OCCULTEE
                 else:
                     track.state = TrackState.EN_ZONE_LIGNE
+                continue
+
+            # Mode sas : le comptage repose sur les bords de la boîte. On ne
+            # laisse pas l'ancienne logique au centre de boîte produire un
+            # événement concurrent.
+            if self.line2_px(w, h) is not None:
+                gate_event = self._process_box_gate(track, logical_id, box, w, h, frame_index)
+                if gate_event:
+                    events.append(gate_event)
+                if (
+                    gate_event is None
+                    and zone == Zone.INTERIEURE
+                    and not track.counted_in_occupancy
+                    and track.origin == OriginType.APPARITION_INTERIEURE
+                    and track.interior_streak >= self.confirmation_threshold
+                ):
+                    track.state = TrackState.NOUVELLE_PRESENCE
+                    track.counted_in_occupancy = True
+                    self.total_new_presences += 1
+                    print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
+                    events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
                 continue
 
             # -- Gestion de la zone morte --
