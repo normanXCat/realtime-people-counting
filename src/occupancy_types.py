@@ -60,3 +60,5 @@ class LogicalTrack:
     trajectory_history: list[tuple[float, float]] = field(default_factory=list)
     previous_zone: Zone = Zone.INTERIEURE
     pending_direction: str | None = None
+    exterior_streak: int = 0
+    interior_streak: int = 0

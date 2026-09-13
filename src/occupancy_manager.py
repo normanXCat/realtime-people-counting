@@ -30,6 +30,7 @@ DEFAULT_CONFIRMATION_THRESHOLD = 15  # Frames consécutives pour confirmer nouve
 DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
 DEFAULT_TRAJECTORY_MAXLEN = 60       # Taille max de l'historique de trajectoire
+OUT_CONFIRMATION_FRAMES = 3          # Frames extérieures consécutives avant OUT
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +268,15 @@ class OccupancyManager:
             track.last_position = anchor
             track.last_seen_frame = frame_index
             track.confidence = conf
+            if zone == Zone.EXTERIEURE:
+                track.exterior_streak += 1
+                track.interior_streak = 0
+            elif zone == Zone.INTERIEURE:
+                track.interior_streak += 1
+                track.exterior_streak = 0
+            else:
+                track.exterior_streak = 0
+                track.interior_streak = 0
             track.trajectory_history.append(anchor)
             if len(track.trajectory_history) > DEFAULT_TRAJECTORY_MAXLEN:
                 track.trajectory_history = track.trajectory_history[-DEFAULT_TRAJECTORY_MAXLEN:]
@@ -289,10 +299,14 @@ class OccupancyManager:
             if track.state == TrackState.OCCULTEE:
                 if zone == Zone.INTERIEURE:
                     track.state = TrackState.PRESENTE
+                    track.counted_in_occupancy = True
+                    track.is_counted_out = False
                     print(f"[REAPPEAR] ID {logical_id} réapparu côté intérieur → PRESENTE")
                 elif zone == Zone.EXTERIEURE:
-                    # Réapparition côté extérieur → maintenir comme sortie
-                    track.state = TrackState.SORTIE_CONFIRMEE
+                    # Une réapparition extérieure ne valide jamais une sortie
+                    # à elle seule : la piste reste occultée jusqu'à une
+                    # trajectoire extérieure stable et observée.
+                    track.state = TrackState.OCCULTEE
                 else:
                     track.state = TrackState.EN_ZONE_LIGNE
                 continue
@@ -428,7 +442,9 @@ class OccupancyManager:
 
         # --- Personne en zone extérieure ---
         if zone == Zone.EXTERIEURE:
-            if (crossed or track.pending_direction == "OUT") and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
+            if crossed and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
+                track.pending_direction = "OUT"
+            if (crossed or track.pending_direction == "OUT") and track.exterior_streak >= OUT_CONFIRMATION_FRAMES and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
                 # Franchissement validé : OUT
                 if track.counted_in_occupancy:
                     track.state = TrackState.SORTIE_CONFIRMEE
@@ -443,8 +459,9 @@ class OccupancyManager:
                     track.state = TrackState.SORTIE_CONFIRMEE
                     print(f"[SKIP] ID {logical_id} → OUT ignoré (jamais comptabilisé)")
             elif not crossed and state == TrackState.EN_ZONE_LIGNE:
-                # Apparition directe côté extérieur depuis la zone morte sans croisement
-                track.state = TrackState.SORTIE_CONFIRMEE
+                # Ne pas confirmer OUT sur une seule frame extérieure : la
+                # stabilité est vérifiée par exterior_streak ci-dessus.
+                return None
 
             # Entrée par franchissement depuis l'extérieur
             if crossed and state == TrackState.SORTIE_CONFIRMEE:
