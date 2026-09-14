@@ -1,8 +1,8 @@
 """Gestionnaire d'occupation robuste avec machine à états, hystérésis et warm-up.
 
 Ce module implémente OccupancyManager, le cœur du système de comptage :
-- Intersection vectorielle CCW pour détecter les franchissements
-- Machine à états (TrackState) pour chaque personne
+- Intersection vectorielle stricte CCW pour détecter les franchissements de ligne
+- Machine à états (TrackState) pour chaque personne avec anti-rebond par hystérésis
 - Zone morte (hystérésis) autour de la ligne virtuelle
 - Phase de warm-up pour calibrer l'effectif initial
 - Gestion des occultations (disparition ≠ sortie)
@@ -24,15 +24,13 @@ from occupancy_types import LogicalTrack, OriginType, TrackState, Zone
 # ---------------------------------------------------------------------------
 # Paramètres par défaut (surchargeables via config YAML ou CLI)
 # ---------------------------------------------------------------------------
-DEFAULT_DEAD_ZONE_MARGIN = 20.0      # Pixels de zone morte autour de la ligne
+DEFAULT_DEAD_ZONE_MARGIN = 20.0      # Pixels d'hystérésis extérieur
+DEFAULT_DEAD_ZONE_INSIDE = 10.0      # Pixels d'hystérésis intérieur (réduit pour valider IN plus facilement)
 DEFAULT_INIT_DURATION_FRAMES = 15    # Frames de warm-up (~500ms à 30fps)
-DEFAULT_CONFIRMATION_THRESHOLD = 15  # Frames consécutives pour confirmer nouvelle présence
+DEFAULT_CONFIRMATION_THRESHOLD = 6   # Frames pour confirmer une présence (~200ms à 30fps)
 DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
 DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
 DEFAULT_TRAJECTORY_MAXLEN = 60       # Taille max de l'historique de trajectoire
-OUT_CONFIRMATION_FRAMES = 3          # Frames extérieures consécutives avant OUT
-DEFAULT_GATE_WIDTH_PX = 0.0          # L2 désactivée : comptage mono-ligne
-LINE_CONFIRMATION_FRAMES = 3         # Frames du nouveau côté avant validation
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +61,9 @@ def signed_perpendicular_distance(
 ) -> float:
     """Distance orthogonale signée d'un point par rapport à la ligne.
 
-    Positif = côté extérieur, négatif = côté intérieur (salle).
+    Par produit vectoriel 2D normalisé avec le vecteur directeur (line_start -> line_end).
+    Signe positif (> 0) : côté A
+    Signe négatif (< 0) : côté B
     """
     dx = line_end[0] - line_start[0]
     dy = line_end[1] - line_start[1]
@@ -76,11 +76,16 @@ def signed_perpendicular_distance(
 def classify_zone(
     dist: float,
     dead_zone_margin: float,
+    dead_zone_inside: float | None = None,
 ) -> Zone:
     """Classifie un point selon sa distance signée à la ligne."""
-    if abs(dist) <= dead_zone_margin:
-        return Zone.MORTE
-    return Zone.EXTERIEURE if dist > 0 else Zone.INTERIEURE
+    m_out = dead_zone_margin
+    m_in = dead_zone_inside if dead_zone_inside is not None else dead_zone_margin
+    if dist > m_out:
+        return Zone.EXTERIEURE
+    elif dist < -m_in:
+        return Zone.INTERIEURE
+    return Zone.MORTE
 
 
 def compute_anchor(
@@ -113,15 +118,12 @@ STATE_COLORS: dict[TrackState, tuple[int, int, int]] = {
 
 
 class OccupancyManager:
-    """Gestionnaire d'occupation par machine à états finis.
-
-    Gère le registre de LogicalTrack, détecte les franchissements
-    vectoriels, applique l'hystérésis et calcule l'effectif.
+    """Gestionnaire d'occupation par machine à états finis et intersection vectorielle.
 
     Args:
         line_p1: Premier point de la ligne (coordonnées normalisées 0–1).
         line_p2: Second point de la ligne (coordonnées normalisées 0–1).
-        dead_zone_margin: Épaisseur de la zone morte en pixels.
+        dead_zone_margin: Épaisseur de la zone morte (hystérésis) en pixels.
         init_duration_frames: Nombre de frames de warm-up.
         confirmation_threshold: Frames consécutives pour confirmer une nouvelle présence.
         grace_period_frames: Délai avant purge d'une piste occultée.
@@ -135,8 +137,9 @@ class OccupancyManager:
         line_p2: tuple[float, float],
         line2_p1: tuple[float, float] | None = None,
         line2_p2: tuple[float, float] | None = None,
-        gate_width_px: float = DEFAULT_GATE_WIDTH_PX,
+        gate_width_px: float = 0.0,
         dead_zone_margin: float = DEFAULT_DEAD_ZONE_MARGIN,
+        dead_zone_inside: float | None = None,
         init_duration_frames: int = DEFAULT_INIT_DURATION_FRAMES,
         confirmation_threshold: int = DEFAULT_CONFIRMATION_THRESHOLD,
         grace_period_frames: int = DEFAULT_GRACE_PERIOD_FRAMES,
@@ -152,6 +155,7 @@ class OccupancyManager:
 
         # Paramètres
         self.dead_zone_margin = dead_zone_margin
+        self.dead_zone_inside = dead_zone_inside if dead_zone_inside is not None else dead_zone_margin
         self.init_duration_frames = init_duration_frames
         self.confirmation_threshold = confirmation_threshold
         self.grace_period_frames = grace_period_frames
@@ -216,7 +220,6 @@ class OccupancyManager:
             (ax, ay), (bx, by) = self.line_px(width, height)
             dx, dy = bx - ax, by - ay
             length = max(float(np.hypot(dx, dy)), 1.0)
-            # Normale positive : côté extérieur avec la convention actuelle.
             nx, ny = dy / length, -dx / length
             ox, oy = nx * self.gate_width_px, ny * self.gate_width_px
             return ((ax + ox, ay + oy), (bx + ox, by + oy))
@@ -225,115 +228,10 @@ class OccupancyManager:
             (self.line2_p2[0] * width, self.line2_p2[1] * height),
         )
 
-    def classify_point(self, point, width: int, height: int) -> Zone:
-        line1 = self.line_px(width, height)
-        line2 = self.line2_px(width, height)
-        if line2 is None:
-            return classify_zone(signed_perpendicular_distance(point, *line1), self.dead_zone_margin)
-        d1 = signed_perpendicular_distance(point, *line1)
-        d2 = signed_perpendicular_distance(point, *line2)
-        if d1 < -self.dead_zone_margin:
-            return Zone.INTERIEURE
-        if d2 > self.dead_zone_margin:
-            return Zone.EXTERIEURE
-        return Zone.MORTE
-
-    def _process_box_gate(self, track, logical_id: int, box, width: int, height: int, frame_index: int):
-        """Compte le sas avec les bords de la boîte, pas avec son centre.
-
-        Convention actuelle : côté salle = distance signée négative. Une
-        sortie exige donc : bas de boîte franchit L1, puis haut de boîte
-        franchit L2. Une entrée valide la séquence inverse.
-        """
+    def classify_point(self, point: tuple[float, float], width: int, height: int) -> Zone:
         l1 = self.line_px(width, height)
-        l2 = self.line2_px(width, height)
-        if l2 is None:
-            return None
-        x1, y1, x2, y2 = map(float, box[:4])
-        bottom = ((x1 + x2) / 2.0, y2)
-        top = ((x1 + x2) / 2.0, y1)
-        bottom_l1 = signed_perpendicular_distance(bottom, *l1)
-        top_l1 = signed_perpendicular_distance(top, *l1)
-        bottom_l2 = signed_perpendicular_distance(bottom, *l2)
-        top_l2 = signed_perpendicular_distance(top, *l2)
-        event = None
-
-        # OUT inversé demandé : le bas franchit d'abord L1,
-        # puis le haut franchit L2.
-        if bottom_l1 >= -self.dead_zone_margin:
-            track.exit_l1_crossed = True
-        elif track.exit_l1_crossed and bottom_l1 < -self.dead_zone_margin:
-            track.exit_l1_crossed = False
-        if top_l2 >= -self.dead_zone_margin:
-            if track.exit_l1_crossed and track.counted_in_occupancy:
-                track.state = TrackState.SORTIE_CONFIRMEE
-                track.counted_in_occupancy = False
-                track.is_counted_out = True
-                track.exit_l1_crossed = False
-                self.total_out += 1
-                print(f"[COUNT] ID {logical_id} → OUT (bas L1 puis haut L2)")
-                event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "bottom_L1_then_top_L2"}
-
-        # IN inversé demandé : le haut franchit d'abord L2,
-        # puis le bas franchit L1.
-        if top_l2 <= self.dead_zone_margin:
-            track.entry_l2_crossed = True
-        elif track.entry_l2_crossed and top_l2 > self.dead_zone_margin:
-            track.entry_l2_crossed = False
-        if bottom_l1 <= self.dead_zone_margin:
-            if track.entry_l2_crossed and not track.counted_in_occupancy:
-                track.state = TrackState.PRESENTE
-                track.counted_in_occupancy = True
-                track.is_counted_out = False
-                track.entry_l2_crossed = False
-                self.total_in += 1
-                print(f"[COUNT] ID {logical_id} → IN (haut L2 puis bas L1)")
-                event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "top_L2_then_bottom_L1"}
-
-        track.previous_bottom_l1 = bottom_l1
-        track.previous_top_l2 = top_l2
-        track.previous_top_l1 = top_l1
-        track.previous_bottom_l2 = bottom_l2
-        return event
-
-    def _process_single_line(self, track, logical_id: int, anchor, width: int, height: int, frame_index: int):
-        """Compte IN/OUT avec une seule ligne et le point des pieds."""
-        l1 = self.line_px(width, height)
-        foot_distance = signed_perpendicular_distance(anchor, *l1)
-        inside = foot_distance < -self.dead_zone_margin
-        outside = foot_distance > self.dead_zone_margin
-        event = None
-
-        if track.counted_in_occupancy:
-            if outside:
-                track.crossing_out_streak += 1
-                track.crossing_in_streak = 0
-                if track.crossing_out_streak >= LINE_CONFIRMATION_FRAMES:
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                    track.counted_in_occupancy = False
-                    track.is_counted_out = True
-                    track.crossing_out_streak = 0
-                    self.total_out += 1
-                    print(f"[COUNT] ID {logical_id} → OUT (ligne unique, pieds côté extérieur)")
-                    event = {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "single_line_feet"}
-            elif inside:
-                track.crossing_out_streak = 0
-        else:
-            if inside:
-                track.crossing_in_streak += 1
-                track.crossing_out_streak = 0
-                if track.crossing_in_streak >= LINE_CONFIRMATION_FRAMES:
-                    track.state = TrackState.PRESENTE
-                    track.counted_in_occupancy = True
-                    track.is_counted_out = False
-                    track.crossing_in_streak = 0
-                    self.total_in += 1
-                    print(f"[COUNT] ID {logical_id} → IN (ligne unique, pieds côté intérieur)")
-                    event = {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "single_line_feet"}
-            elif outside:
-                track.crossing_in_streak = 0
-
-        return event
+        dist = signed_perpendicular_distance(point, *l1)
+        return classify_zone(dist, self.dead_zone_margin, self.dead_zone_inside)
 
     # -----------------------------------------------------------------------
     # Traitement d'une frame
@@ -363,38 +261,27 @@ class OccupancyManager:
 
         for track_id, display_id, anchor, box, conf in candidates:
             dist = signed_perpendicular_distance(anchor, l_start, l_end)
-            zone = self.classify_point(anchor, w, h)
+            side = "inside" if dist <= 0 else "outside"
+            zone = classify_zone(dist, self.dead_zone_margin, self.dead_zone_inside)
 
             # -- Association technique → logique --
             logical_id = self._get_or_create_logical(
-                track_id, display_id, anchor, frame_index, conf, features, initial_zone=zone,
+                track_id, display_id, anchor, frame_index, conf, features, initial_side=side,
             )
             seen_logical_ids.add(logical_id)
             track = self.tracks[logical_id]
 
-            # Mettre à jour la position et la confiance
             prev_pos = track.last_position
             track.last_position = anchor
             track.last_seen_frame = frame_index
             track.confidence = conf
-            if zone == Zone.EXTERIEURE:
-                track.exterior_streak += 1
-                track.interior_streak = 0
-            elif zone == Zone.INTERIEURE:
-                track.interior_streak += 1
-                track.exterior_streak = 0
-            else:
-                track.exterior_streak = 0
-                track.interior_streak = 0
             track.trajectory_history.append(anchor)
             if len(track.trajectory_history) > DEFAULT_TRAJECTORY_MAXLEN:
                 track.trajectory_history = track.trajectory_history[-DEFAULT_TRAJECTORY_MAXLEN:]
 
-            # Mettre à jour le vecteur ReID si disponible
-            if features and display_id in features:
-                feat = features[display_id]
-                if feat is not None:
-                    track.feature_vector = feat
+            feat = features.get(display_id) if features else None
+            if feat is not None:
+                track.feature_vector = feat
 
             # -- Phase warm-up --
             if not self._warmup_done:
@@ -406,190 +293,62 @@ class OccupancyManager:
 
             # -- Réactivation d'une piste occultée --
             if track.state == TrackState.OCCULTEE:
-                if zone == Zone.INTERIEURE:
+                if side == "inside":
                     track.state = TrackState.PRESENTE
-                    track.counted_in_occupancy = True
-                    track.is_counted_out = False
-                    print(f"[REAPPEAR] ID {logical_id} réapparu côté intérieur → PRESENTE")
-                elif zone == Zone.EXTERIEURE:
-                    # Une réapparition extérieure ne valide jamais une sortie
-                    # à elle seule : la piste reste occultée jusqu'à une
-                    # trajectoire extérieure stable et observée.
-                    track.state = TrackState.OCCULTEE
+                    if track.counted_in_occupancy:
+                        track.is_counted_out = False
+                    print(f"[REAPPEAR] ID {logical_id} réapparu côté intérieur → PRESENTE (déjà compté={track.counted_in_occupancy})")
                 else:
-                    track.state = TrackState.EN_ZONE_LIGNE
-                continue
+                    # Reste dehors
+                    track.state = TrackState.SORTIE_CONFIRMEE
+                # Ne pas faire continue : permet la détection de franchissement
+                # pendant l'occultation ou la confirmation de présence.
 
-            # Mode mono-ligne : L2, si elle est dessinée, est uniquement
-            # visuelle. Le comptage utilise le point des pieds et L1.
-            line_event = None
-            if track.origin != OriginType.APPARITION_INTERIEURE or track.counted_in_occupancy:
-                line_event = self._process_single_line(
-                    track, logical_id, anchor, w, h, frame_index,
-                )
-            if line_event:
-                events.append(line_event)
-            if (
-                line_event is None
-                and zone == Zone.INTERIEURE
-                and not track.counted_in_occupancy
-                and track.origin == OriginType.APPARITION_INTERIEURE
-                and track.interior_streak >= self.confirmation_threshold
-            ):
-                track.state = TrackState.NOUVELLE_PRESENCE
-                track.counted_in_occupancy = True
-                self.total_new_presences += 1
-                print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
-                events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
-            continue
-
-            # -- Gestion de la zone morte --
-            if zone == Zone.MORTE and self.line2_px(w, h) is None:
-                if track.state not in (TrackState.EN_ZONE_LIGNE, TrackState.SORTIE_CONFIRMEE):
-                    track.state = TrackState.EN_ZONE_LIGNE
-                    track.pending_direction = "OUT" if track.counted_in_occupancy else track.pending_direction
-                elif track.state == TrackState.SORTIE_CONFIRMEE:
-                    track.pending_direction = "IN"
-                continue
-
-            # -- Détection de franchissement vectoriel (CCW) --
+            # -- Détection d'intersection vectorielle stricte CCW --
+            crossed = False
             if prev_pos is not None and prev_pos != anchor:
                 crossed = check_line_crossing(prev_pos, anchor, l_start, l_end)
-                # Avec un flux temps réel, une frame peut être perdue et le
-                # point peut passer directement de l'extérieur à l'intérieur.
-                # La transition signée complète reste alors un franchissement.
+
+            # -- Détection de l'intention de franchissement --
+            current_target = "outside" if side == "outside" else "inside"
+            if crossed:
+                # La trajectoire vectorielle a traversé la ligne
+                if track.counted_in_occupancy and current_target == "outside":
+                    track.pending_direction = "OUT"
+                elif not track.counted_in_occupancy and current_target == "inside":
+                    # Une personne ne peut être comptée en IN QUE SI elle n'est pas déjà dans la salle
+                    track.pending_direction = "IN"
+            elif (
+                not track.counted_in_occupancy
+                and track.pending_direction is None
+                and prev_pos is not None
+            ):
+                # Cas d'une personne masquée à l'extérieur par une autre personne :
+                # elle apparaît pour la première fois près du seuil de la porte et avance vers l'intérieur.
                 prev_dist = signed_perpendicular_distance(prev_pos, l_start, l_end)
-                if track.state == TrackState.SORTIE_CONFIRMEE and zone == Zone.INTERIEURE:
-                    crossed = crossed or (prev_dist > self.dead_zone_margin and dist < -self.dead_zone_margin)
-            else:
-                crossed = False
+                door_zone = max(35.0, self.dead_zone_inside + 15.0)
+                if abs(prev_dist) <= door_zone and side == "inside" and (dist < prev_dist - 1.5):
+                    track.pending_direction = "IN"
 
-            # -- Machine à états --
-            if self.line2_px(w, h) is not None:
-                l2 = self.line2_px(w, h)
-                crossed2 = prev_pos is not None and check_line_crossing(prev_pos, anchor, *l2)
-                evt = self._transition_double(track, logical_id, zone, crossed, crossed2, frame_index)
-            else:
-                evt = self._transition(track, logical_id, zone, crossed, dist, frame_index)
-            if evt:
-                events.append(evt)
-
-        # -- Gestion des pistes disparues (occultation) --
-        self._handle_missing_tracks(seen_logical_ids, frame_index)
-
-        return events
-
-    def _transition_double(self, track, logical_id, zone, crossed1, crossed2, frame_index):
-        """Valide un passage seulement après les deux lignes du sas."""
-        if track.state == TrackState.SORTIE_CONFIRMEE:
-            # Une entrée peut commencer alors que la première détection de la
-            # piste se trouve déjà dans le sas : on mémorise alors la séquence
-            # par zone, sans exiger que le point touche exactement L2.
-            if zone == Zone.INTERIEURE and (crossed1 or crossed2 or track.interior_streak >= 2):
-                track.pending_direction = None
-                track.state = TrackState.A_RETOURNE
-                track.counted_in_occupancy = True
-                track.is_counted_out = False
-                self.total_in += 1
-                print(f"[COUNT] ID {logical_id} → IN (sas, Total IN: {self.total_in})")
-                return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "sas"}
-            if zone == Zone.MORTE or crossed2:
-                track.pending_direction = "IN"
-                track.state = TrackState.EN_ZONE_LIGNE
-                return None
-            return None
-        if track.state == TrackState.PRESENTE and crossed1:
-            track.pending_direction = "OUT"
-            track.state = TrackState.EN_ZONE_LIGNE
-            return None
-        if track.state == TrackState.EN_ZONE_LIGNE:
-            if track.pending_direction == "OUT":
-                if zone == Zone.INTERIEURE and crossed1:
-                    track.pending_direction = None
-                    track.state = TrackState.PRESENTE
-                elif crossed2 and zone == Zone.EXTERIEURE and track.counted_in_occupancy:
-                    track.pending_direction = None
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                    track.counted_in_occupancy = False
-                    track.is_counted_out = True
-                    self.total_out += 1
-                    print(f"[COUNT] ID {logical_id} → OUT (sas, Total OUT: {self.total_out})")
-                    return {"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "sas"}
-            elif track.pending_direction == "IN":
-                if zone == Zone.EXTERIEURE and crossed2:
-                    track.pending_direction = None
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                elif zone == Zone.INTERIEURE and (crossed1 or track.interior_streak >= 2):
-                    track.pending_direction = None
-                    track.state = TrackState.PRESENTE
+            # -- Validation par marge d'hystérésis --
+            target = track.pending_direction
+            if target == "IN" and side == "inside" and abs(dist) > self.dead_zone_inside:
+                # Entrée confirmée : valide dès que le pied sort totalement de la zone morte intérieure
+                if not track.counted_in_occupancy:
+                    is_return = track.is_counted_out
+                    track.state = TrackState.A_RETOURNE if is_return else TrackState.PRESENTE
                     track.counted_in_occupancy = True
                     track.is_counted_out = False
+                    track.pending_direction = None
                     self.total_in += 1
-                    print(f"[COUNT] ID {logical_id} → IN (sas, Total IN: {self.total_in})")
-                    return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "sas"}
-        return None
+                    label = "retour" if is_return else "entrée"
+                    print(f"[COUNT] ID {logical_id} → IN ({label}, Total IN: {self.total_in})")
+                    events.append({"type": "IN", "id": logical_id, "frame": frame_index, "reason": label})
+                else:
+                    track.pending_direction = None
 
-    # -----------------------------------------------------------------------
-    # Machine à états interne
-    # -----------------------------------------------------------------------
-    def _transition(
-        self,
-        track: LogicalTrack,
-        logical_id: int,
-        zone: Zone,
-        crossed: bool,
-        dist: float,
-        frame_index: int,
-    ) -> Optional[dict]:
-        """Applique les transitions d'état et retourne un événement si comptage."""
-        state = track.state
-
-        # --- Entrée depuis l'extérieur (sortie confirmée ou piste venant de l'extérieur) ---
-        if state == TrackState.SORTIE_CONFIRMEE:
-            if zone == Zone.INTERIEURE and (crossed or track.pending_direction == "IN"):
-                track.state = TrackState.A_RETOURNE if track.is_counted_out else TrackState.PRESENTE
-                track.counted_in_occupancy = True
-                track.is_counted_out = False
-                track.pending_direction = None
-                self.total_in += 1
-                label = "retour" if track.state == TrackState.A_RETOURNE else "entrée"
-                print(f"[COUNT] ID {logical_id} → IN ({label}, Total IN: {self.total_in})")
-                return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": label}
-            return None
-
-        # --- Personne en zone intérieure ---
-        if zone == Zone.INTERIEURE:
-            if crossed and state == TrackState.EN_ZONE_LIGNE and not track.counted_in_occupancy:
-                # Traversée complète de la zone morte depuis l'extérieur
-                track.state = TrackState.PRESENTE
-                track.counted_in_occupancy = True
-                self.total_in += 1
-                print(f"[COUNT] ID {logical_id} → IN (Total IN: {self.total_in})")
-                return {"type": "IN", "id": logical_id, "frame": frame_index, "reason": "entrée"}
-            elif state == TrackState.EN_ZONE_LIGNE:
-                # Retour en arrière depuis la zone morte vers l'intérieur sans franchissement
-                track.state = TrackState.PRESENTE
-            elif state == TrackState.NOUVELLE_PRESENCE:
-                track.state = TrackState.PRESENTE
-
-            # Confirmation d'une nouvelle présence intérieure
-            if not track.counted_in_occupancy and track.origin == OriginType.APPARITION_INTERIEURE:
-                track.consecutive_interior_frames += 1
-                if track.consecutive_interior_frames >= self.confirmation_threshold:
-                    track.state = TrackState.NOUVELLE_PRESENCE
-                    track.counted_in_occupancy = True
-                    self.total_new_presences += 1
-                    print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
-                    return {"type": "NEW", "id": logical_id, "frame": frame_index}
-
-            return None
-
-        # --- Personne en zone extérieure ---
-        if zone == Zone.EXTERIEURE:
-            if crossed and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
-                track.pending_direction = "OUT"
-            if (crossed or track.pending_direction == "OUT") and track.exterior_streak >= OUT_CONFIRMATION_FRAMES and state in (TrackState.PRESENTE, TrackState.EN_ZONE_LIGNE, TrackState.A_RETOURNE, TrackState.NOUVELLE_PRESENCE):
-                # Franchissement validé : OUT
+            elif target == "OUT" and side == "outside" and dist > self.dead_zone_margin:
+                # Sortie confirmée : exige que le pied soit totalement et strictement hors de la zone morte extérieure
                 if track.counted_in_occupancy:
                     track.state = TrackState.SORTIE_CONFIRMEE
                     track.counted_in_occupancy = False
@@ -597,24 +356,38 @@ class OccupancyManager:
                     track.pending_direction = None
                     self.total_out += 1
                     print(f"[COUNT] ID {logical_id} → OUT (Total OUT: {self.total_out})")
-                    return {"type": "OUT", "id": logical_id, "frame": frame_index}
+                    events.append({"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "crossed_out"})
                 else:
-                    # Personne jamais comptabilisée comme présente → sortie sans décrémentation
                     track.state = TrackState.SORTIE_CONFIRMEE
-                    print(f"[SKIP] ID {logical_id} → OUT ignoré (jamais comptabilisé)")
-            elif not crossed and state == TrackState.EN_ZONE_LIGNE:
-                # Ne pas confirmer OUT sur une seule frame extérieure : la
-                # stabilité est vérifiée par exterior_streak ci-dessus.
-                return None
+                    track.pending_direction = None
 
-            # Entrée par franchissement depuis l'extérieur
-            if crossed and state == TrackState.SORTIE_CONFIRMEE:
-                # Ce cas est géré en haut de la méthode
-                pass
+            elif target == "IN" and side == "outside" and dist > self.dead_zone_margin:
+                # Demi-tour vers l'extérieur : annuler la tentative d'entrée
+                track.pending_direction = None
+            elif target == "OUT" and side == "inside" and abs(dist) > self.dead_zone_inside:
+                # Demi-tour vers l'intérieur : annuler la tentative de sortie
+                track.pending_direction = None
 
-            return None
+            # -- Confirmation d'une nouvelle présence apparue directement à l'intérieur --
+            if (
+                not track.counted_in_occupancy
+                and track.origin == OriginType.APPARITION_INTERIEURE
+                and side == "inside"
+                and abs(dist) > self.dead_zone_inside
+                and track.pending_direction != "IN"
+            ):
+                track.consecutive_interior_frames += 1
+                if track.consecutive_interior_frames >= self.confirmation_threshold:
+                    track.state = TrackState.NOUVELLE_PRESENCE
+                    track.counted_in_occupancy = True
+                    self.total_new_presences += 1
+                    print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
+                    events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
 
-        return None
+        # -- Gestion des pistes disparues (occultation) --
+        self._handle_missing_tracks(seen_logical_ids, frame_index)
+
+        return events
 
     # -----------------------------------------------------------------------
     # Warm-up
@@ -624,7 +397,6 @@ class OccupancyManager:
         if zone == Zone.INTERIEURE:
             self._warmup_candidates[logical_id] = self._warmup_candidates.get(logical_id, 0) + 1
         else:
-            # Réinitialiser le compteur si la personne quitte l'intérieur
             self._warmup_candidates.pop(logical_id, None)
 
     def _finalize_warmup(self) -> None:
@@ -651,10 +423,9 @@ class OccupancyManager:
         frame_index: int,
         conf: float,
         features: dict[int, np.ndarray] | None,
-        initial_zone: Zone = Zone.INTERIEURE,
+        initial_side: str = "inside",
     ) -> int:
         """Retourne le logical_id associé au track_id, ou en crée un nouveau."""
-        # Vérifier si le track_id a déjà un logical_id
         if track_id in self.tech_to_logical:
             return self.tech_to_logical[track_id]
 
@@ -669,21 +440,19 @@ class OccupancyManager:
                     print(f"[RE-ID OCCUPANCY] track_id={track_id} réassocié → logical_id={match_id}")
                     return match_id
 
-        # Création d'une nouvelle piste logique
         logical_id = self.next_logical_id
         self.next_logical_id += 1
         self.tech_to_logical[track_id] = logical_id
 
         feat = features.get(display_id) if features else None
-        if initial_zone == Zone.EXTERIEURE:
+        if initial_side == "outside":
             init_state = TrackState.SORTIE_CONFIRMEE
             init_origin = OriginType.ENTREE_LIGNE
-        elif initial_zone == Zone.MORTE:
-            init_state = TrackState.EN_ZONE_LIGNE
-            init_origin = OriginType.APPARITION_INTERIEURE
+            counted = False
         else:
             init_state = TrackState.PRESENTE
             init_origin = OriginType.APPARITION_INTERIEURE
+            counted = False
 
         track = LogicalTrack(
             logical_id=logical_id,
@@ -694,6 +463,7 @@ class OccupancyManager:
             last_seen_frame=frame_index,
             feature_vector=feat,
             confidence=conf,
+            counted_in_occupancy=counted,
         )
         self.tracks[logical_id] = track
         return logical_id
@@ -809,14 +579,18 @@ class OccupancyManager:
         dx = l_end[0] - l_start[0]
         dy = l_end[1] - l_start[1]
         length = max(float(np.hypot(dx, dy)), 1.0)
-        nx, ny = -dy / length, dx / length  # Normale unitaire
-        m = self.dead_zone_margin
+        # Normale unitaire vers le côté extérieur (dist > 0)
+        nx_out, ny_out = dy / length, -dx / length
+        # Normale unitaire vers le côté intérieur (dist < 0)
+        nx_in, ny_in = -dy / length, dx / length
+        m_out = self.dead_zone_margin
+        m_in = self.dead_zone_inside
 
         pts = np.array([
-            [l_start[0] + nx * m, l_start[1] + ny * m],
-            [l_end[0] + nx * m, l_end[1] + ny * m],
-            [l_end[0] - nx * m, l_end[1] - ny * m],
-            [l_start[0] - nx * m, l_start[1] - ny * m],
+            [l_start[0] + nx_out * m_out, l_start[1] + ny_out * m_out],
+            [l_end[0] + nx_out * m_out, l_end[1] + ny_out * m_out],
+            [l_end[0] + nx_in * m_in, l_end[1] + ny_in * m_in],
+            [l_start[0] + nx_in * m_in, l_start[1] + ny_in * m_in],
         ], dtype=np.int32)
 
         overlay = frame.copy()
@@ -841,12 +615,10 @@ class OccupancyManager:
         line_h = int(22 * scale)
         pad = int(10 * scale)
 
-        # Mesurer la largeur max du texte
         max_text_w = max(cv2.getTextSize(l, font, f_scale, th)[0][0] for l in lines)
         box_w = max_text_w + 2 * pad
         box_h = len(lines) * line_h + 2 * pad
 
-        # Fond semi-transparent
         overlay = frame.copy()
         cv2.rectangle(overlay, (10, 10), (10 + box_w, 10 + box_h), (15, 15, 15), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)

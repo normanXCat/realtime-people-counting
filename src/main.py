@@ -23,6 +23,8 @@ import numpy as np
 import yaml
 from ultralytics import YOLO
 
+from anchor_stabilizer import AnchorStabilizer
+from bbox_height_locker import BBoxHeightLocker
 from occupancy_manager import OccupancyManager, compute_anchor
 
 
@@ -371,6 +373,8 @@ def arguments() -> argparse.Namespace:
     # Paramètres OccupancyManager
     parser.add_argument("--dead-zone", type=float, default=20.0,
                         help="Épaisseur de la zone morte en pixels (hystérésis)")
+    parser.add_argument("--dead-zone-inside", type=float, default=None,
+                        help="Épaisseur de la zone morte intérieure en pixels (par défaut identique à --dead-zone)")
     parser.add_argument("--gate-width", type=float, default=0.0,
                         help="Ancien décalage automatique de L2 (0 = désactivé)")
     parser.add_argument("--warmup-frames", type=int, default=15,
@@ -381,6 +385,10 @@ def arguments() -> argparse.Namespace:
                         help="Frames de délai de grâce pour les pistes occultées")
     parser.add_argument("--zenithal", action="store_true",
                         help="Vue zénithale : utiliser le centre de boîte au lieu du bas")
+    parser.add_argument("--stabilizer-tolerance", type=float, default=20.0,
+                        help="Tolérance en pixels pour la stabilisation de l'ancrage par la tête")
+    parser.add_argument("--no-stabilizer", action="store_true",
+                        help="Désactiver la stabilisation cinématique de l'ancrage")
     return parser.parse_args()
 
 
@@ -399,7 +407,10 @@ def main() -> None:
         line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
         line2_p1 = line2_p2 = None
 
+    dead_inside = args.dead_zone_inside if args.dead_zone_inside is not None else args.dead_zone
     id_manager = IDManager(confirmation_confidence=0.75)
+    stabilizer = None if args.no_stabilizer else AnchorStabilizer(tolerance_px=args.stabilizer_tolerance)
+    locker = BBoxHeightLocker(min_height_ratio=0.70)
     occupancy = OccupancyManager(
         line_p1=line_p1,
         line_p2=line_p2,
@@ -407,6 +418,7 @@ def main() -> None:
         line2_p2=line2_p2,
         gate_width_px=args.gate_width,
         dead_zone_margin=args.dead_zone,
+        dead_zone_inside=dead_inside,
         init_duration_frames=args.warmup_frames,
         confirmation_threshold=args.confirm_frames,
         grace_period_frames=args.grace_frames,
@@ -447,7 +459,8 @@ def main() -> None:
                 confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(ids))
                 raw_candidates: list[tuple[int, np.ndarray, float]] = []
                 for box, track_id, conf in zip(boxes, ids, confs):
-                    raw_candidates.append((track_id, box, float(conf)))
+                    bbox_corrigee = locker.process_bbox(track_id, box)
+                    raw_candidates.append((track_id, bbox_corrigee, float(conf)))
 
                 # IDManager : attribution des display_id séquentiels
                 candidates = id_manager.assign_frame(
@@ -457,6 +470,16 @@ def main() -> None:
                     float(np.hypot(w, h)),
                 )
                 visible_count = len(candidates)
+
+                # Stabilisation cinématique du point d'ancrage guidée par la tête
+                if stabilizer is not None and not args.zenithal:
+                    stabilized_candidates = []
+                    for track_id, display_id, anchor, box, conf in candidates:
+                        stab_anchor = stabilizer.get_stabilized_anchor(track_id, box)
+                        stabilized_candidates.append((track_id, display_id, stab_anchor, box, conf))
+                    candidates = stabilized_candidates
+                    stabilizer.purge_lost_tracks(set(ids))
+                locker.purge_lost_tracks(set(ids))
 
                 if counting_enabled:
                     # OccupancyManager : FSM + comptage
