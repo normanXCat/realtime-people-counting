@@ -1,5 +1,13 @@
 # Prompt pour Antigravity — Amélioration du système de comptage existant
 
+> **Note de contexte (document historique, conservé tel quel).** Ce prompt a été
+> exécuté sur une version antérieure du dépôt (`detection.py`, `tracker.py`,
+> `visualizer.py`), depuis remplacée par le pipeline unique autour de
+> `src/main.py` (voir `docs/audit_livrable0.md`). La sélection manuelle de la ligne
+> décrite ci-dessous est désormais **obligatoire** et `--line-p1`/`--line-p2`
+> (échappatoire prévue alors) ont été supprimés : voir `src/calibration.py`,
+> `docs/rapport_final.md` §4.4 et le README.
+
 ## Contexte
 
 J'ai un projet Python fonctionnel de comptage de personnes par caméra, structuré en trois fichiers :

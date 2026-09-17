@@ -1,0 +1,107 @@
+# Protocole d'évaluation (spec section 9, livrable 7).
+#
+# Ce fichier déclare :
+#   - les deux ensembles DISJOINTS de vidéos (9.1) : calibration et test ;
+#   - le critère d'acceptation chiffré (9.3), à figer AVANT les mesures ;
+#   - les baselines et variantes d'ablation (9.4).
+#
+# Rappel de discipline (9.1) : tous les seuils se choisissent sur l'ensemble de
+# calibration. L'ensemble de test n'est exécuté qu'une fois, pour le rapport
+# final. `scripts/run_protocol.py` refuse d'exécuter un ensemble dont les vidéos
+# chevauchent l'autre ensemble.
+
+schema_version: 1
+
+base_config: config/pipeline.yaml
+output_root: results/protocol
+
+# 9.3 — critère d'acceptation. Les valeurs ci-dessous sont des PROPOSITIONS :
+# elles doivent être écrites puis figées avant les mesures finales, faute de
+# quoi le système ne peut pas être déclaré « acceptable ».
+acceptance:
+  min_f1: 0.90              # F1 des franchissements (IN/OUT/NEW)
+  max_occupancy_mae: 1.0    # erreur absolue moyenne d'occupation (personne)
+  min_fps: null             # à fixer sur le matériel de référence documenté
+  tolerance_seconds: 1.0    # tolérance d'appariement temporel GT <-> prédiction
+
+# 9.1 / 9.2 — vérité terrain d'événements (IN/OUT horodatés + occupation par
+# intervalles) sur l'ensemble complet ; vérité terrain MOT dense (boîtes frame
+# par frame) sur un sous-ensemble restreint, évaluée séparément avec py-motmetrics.
+datasets:
+  calibration:
+    # - video: data/videos/calib/cam01_matin.mp4
+    #   ground_truth: data/gt/calib/cam01_matin.json
+    []
+  test:
+    # - video: data/videos/test/cam01_soir.mp4
+    #   ground_truth: data/gt/test/cam01_soir.json
+    []
+
+# 9.4 — baselines et ablations. Chaque variante ne diffère de la variante 1 que
+# par le facteur étudié ; `config` surcharge le YAML de base, `cli` ajoute les
+# drapeaux correspondants de src/main.py.
+variants:
+  baseline_1:
+    description: "YOLO11n + BoT-SORT, sans ReID long terme"
+    config:
+      reid:
+        long_term:
+          enabled: false
+    cli: ["--no-long-term-reid"]
+
+  baseline_2:
+    description: "YOLO11s + BoT-SORT, sans ReID long terme (coût/précision)"
+    config:
+      model:
+        path: models/yolo11s.pt
+        expected_sha256: "85a76fe86dd8afe384648546b56a7a78580c7cb7b404fc595f97969322d502d5"
+      reid:
+        long_term:
+          enabled: false
+    cli: ["--no-long-term-reid"]
+
+  variant_1:
+    description: "YOLO11n + BoT-SORT + ReID long terme (configuration de référence)"
+    config: {}
+    cli: []
+
+  variant_2:
+    description: "Variante 1 avec marge de sécurité désactivée (apport de la marge)"
+    config:
+      reid:
+        long_term:
+          safety_margin: 0.0
+    cli: ["--no-safety-margin"]
+
+  variant_3:
+    description: "Variante 1 avec contrainte spatio-temporelle désactivée"
+    config:
+      reid:
+        long_term:
+          v_max_ratio: 1000000.0
+          spatial_margin_ratio: 1000000.0
+    cli: ["--no-spatial-constraint"]
+
+  variant_4:
+    description: "Variante 1 + stabilisation (verrouillage de hauteur et ancre)"
+    config:
+      stabilization:
+        use_bbox_locker: true
+        use_anchor_stabilizer: true
+    cli: ["--use-bbox-locker", "--use-anchor-stabilizer"]
+
+  variant_5:
+    description: "Variante 1 + ReID externe (comparaison d'extracteur d'apparence)"
+    config:
+      reid:
+        external_reid:
+          enabled: true
+    cli: ["--external-reid"]
+
+  variant_6:
+    description: "YOLO11s + BoT-SORT + ReID long terme (justification du choix du modèle)"
+    config:
+      model:
+        path: models/yolo11s.pt
+        expected_sha256: "85a76fe86dd8afe384648546b56a7a78580c7cb7b404fc595f97969322d502d5"
+    cli: []

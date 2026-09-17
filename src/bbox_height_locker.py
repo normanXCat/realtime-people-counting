@@ -1,7 +1,13 @@
-"""Module autonome de verrouillage de la hauteur de bounding box (BBox Height Locking).
+"""Verrouillage de la hauteur de bounding box (BBox Height Locking).
 
-Filtre géométrique pour empêcher le rétrécissement anormal du bas de la bounding box
-(pieds / y_max) lors d'occlusions partielles.
+Filtre géométrique pour empêcher le rétrécissement anormal du bas de la bounding
+box (pieds / y_max) lors d'occlusions partielles.
+
+Statut après audit : **conservé en expérimental**, désactivé par défaut
+(``stabilization.use_bbox_locker: false``). La logique est inchangée ; seul le
+``print()`` non conditionnel a été retiré (spec 5.1) et la purge des profils ne
+repose plus sur un compteur d'âge en frames (règle 0.2). Le déclenchement est
+tracé par l'appelant sous forme d'événement ``STABILIZATION`` (spec 7).
 """
 
 from typing import Union, Tuple
@@ -45,10 +51,12 @@ class BBoxHeightLocker:
         h_stable = profile["h_stable"]
 
         # 2. Si le bas remonte trop vers le haut (occlusion basse)
+        #    Le déclenchement est tracé par l'appelant (événement STABILIZATION),
+        #    pas par une impression console : le mode headless doit rester propre
+        #    (spec 5.1).
         if current_h < (h_stable * self.min_height_ratio):
             # Repousse le bas (y2) pour maintenir la vraie hauteur des pieds
             y2_corrected = y1 + h_stable
-            print(f"[LOCKER] id={track_id} h_stable={profile['h_stable']:.1f} y2_raw={y2:.1f} y2_corrected={y2_corrected:.1f}")
         else:
             # Comportement normal : Mise à jour progressive de la hauteur de référence
             y2_corrected = y2
@@ -61,13 +69,14 @@ class BBoxHeightLocker:
             return np.array([x1, y1, x2, y2_corrected], dtype=bbox.dtype)
         return (x1, y1, x2, y2_corrected)
 
-    def purge_lost_tracks(self, active_ids: set[int], max_age: int = 90) -> None:
-        """Nettoie la mémoire des profils pour les pistes absentes depuis plus de max_age frames."""
-        for tid in active_ids:
-            if tid in self.tracks_profile:
-                self.tracks_profile[tid]["age"] = 0
-        for tid, prof in list(self.tracks_profile.items()):
-            if tid not in active_ids:
-                prof["age"] = prof.get("age", 0) + 1
-                if prof["age"] > max_age:
-                    del self.tracks_profile[tid]
+    def purge_lost_tracks(self, active_ids: set[int]) -> None:
+        """Libère les profils des pistes techniques absentes de la frame courante.
+
+        Les clés sont les ``track_id`` techniques, attribués par BoT-SORT et
+        propres à la frame : un compteur d'âge en frames serait à la fois un
+        doublon de l'état du tracker et une durée métier exprimée en frames
+        (règle 0.2). La purge est donc immédiate dès qu'une piste disparaît.
+        """
+        for track_id in list(self.tracks_profile):
+            if track_id not in active_ids:
+                del self.tracks_profile[track_id]

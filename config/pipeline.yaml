@@ -1,0 +1,112 @@
+# Configuration unique du pipeline de comptage de personnes (spec section 2).
+#
+# Toute valeur métier vit ici : aucun paramètre fonctionnel ne doit être codé en
+# dur dans src/main.py ou ailleurs. Chaque exécution écrit une copie résolue de
+# ce fichier dans results/{session_id}/config_resolved.yaml.
+#
+# Les valeurs marquées « PROVISOIRE » ne sont pas encore calibrées : elles
+# devront être fixées sur l'ensemble de calibration (spec section 9.1) et ne
+# jamais être ajustées sur l'ensemble de test.
+
+schema_version: 1
+
+source:
+  # Source par défaut : "0" (index caméra) ou un chemin de fichier vidéo.
+  # Peut être surchargée par --source. --config peut pointer vers un autre YAML.
+  default: "0"
+  # Nombre de tentatives de reconnexion quand le flux s'ouvre mais ne produit
+  # plus d'images (spec 5.5). 0 = fin de flux considérée comme une erreur.
+  reconnect_attempts: 0
+  # Durée sans aucune détection au-delà de laquelle l'absence est signalée
+  # (SOURCE_NO_DETECTION), distincte d'une fin de flux et d'une erreur.
+  no_detection_seconds: 2.0
+
+model:
+  path: models/yolo11n.pt
+  expected_sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  confidence: 0.25          # PROVISOIRE — à calibrer (9.4)
+  nms_iou: 0.55             # PROVISOIRE — à calibrer
+  image_size: 960           # PROVISOIRE — à calibrer
+  classes: [0]              # classe COCO « person »
+
+tracker:
+  config_path: src/configs/custom_botsort.yaml
+  persist: true
+
+reid:
+  # Niveau 1 : ReID natif BoT-SORT (réassociation intra-buffer), activé par
+  # `with_reid: true` dans la configuration du tracker. Aucune logique
+  # supplémentaire n'est nécessaire (spec 3.2).
+  short_term: native_botsort
+  # Niveau 2 : galerie de personnes pour la réassociation après expiration de
+  # la piste technique (spec 3.3). Désactivable pour la baseline 1 (spec 9.4).
+  long_term:
+    enabled: true
+    similarity_threshold: 0.40   # PROVISOIRE — à calibrer
+    safety_margin: 0.10          # PROVISOIRE — écart minimal au second candidat
+    v_max_ratio: 1.5             # hauteurs de bbox / seconde
+    spatial_margin_ratio: 0.3    # tolérance additionnelle (fraction de hauteur)
+    ambiguous_policy: provisional_person  # provisional_person | defer
+  # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
+  # uniquement : si false, le descripteur léger HSV est utilisé.
+  external_reid:
+    enabled: false
+    model_path: osnet_x0_25_msmt17.pt
+    weights: osnet_x0_25
+    image_size: [256, 128]
+
+# Ligne virtuelle : les deux points ne sont PAS configurables. Ils sont
+# obligatoirement définis par l'opérateur au démarrage (première image affichée,
+# deux clics, « C » pour confirmer, « G » pour recommencer, « Échap » pour
+# annuler, « I » pour inverser intérieur/extérieur). Aucune ligne par défaut
+# n'est utilisée : sans validation explicite, le comptage ne démarre pas.
+line:
+  inside_side: negative     # orientation INITIALE proposée dans la fenêtre (positive|negative)
+  on_line_policy: indeterminate  # jamais « inside » par défaut
+  min_length_ratio: 0.05    # rejet d'une ligne dégénérée ou trop courte (5.7)
+
+geometry:
+  # Toutes les marges sont RELATIVES à l'échelle locale (hauteur médiane des
+  # bbox observées) : jamais de pixels absolus (règle 0.3).
+  dead_zone_ratio: 0.15         # PROVISOIRE — fraction de la hauteur médiane
+  anchor_edge_margin_ratio: 0.02 # PROVISOIRE — marge de rejet au bord image
+  scale_window: 61              # nombre de hauteurs de bbox de l'échelle locale
+
+timing:
+  # Toutes les durées sont en SECONDES ; elles sont converties en frames au
+  # runtime avec le FPS réellement mesuré (règle 0.2).
+  fps_source: measured          # jamais une valeur supposée
+  warmup_seconds: 1.0
+  confirmation_seconds: 0.5
+  grace_period_seconds: 5.0
+  fps_estimate_window: 30       # frames pour la moyenne glissante du FPS
+
+occupancy:
+  in_progress_disappearance_policy: deferred_confirmation
+  snapshot_interval_seconds: 1.0
+  in_progress_policy: [deferred_confirmation, ambiguous_on_expiry]
+
+output:
+  session_root: results         # jamais le répertoire courant (6.4)
+  events_filename: events.jsonl
+  video_filename: annotated.mp4
+  write_mode: append_incremental
+  flush_every_n_events: 1
+  write_video: false
+  annotated_video_codec: mp4v
+
+stabilization:
+  # Activés seulement après l'ablation de la section 9. Quand ils sont actifs,
+  # la boîte brute et la raison de la correction restent journalisées (spec 7).
+  use_bbox_locker: false
+  bbox_locker_min_height_ratio: 0.70
+  use_anchor_stabilizer: false
+  anchor_stabilizer_tolerance_ratio: 0.15  # fraction de la hauteur médiane
+
+display:
+  enabled: true                 # false = mode headless réel
+  window_name: People counting
+
+logging:
+  level: INFO
+  print_state_transitions: false

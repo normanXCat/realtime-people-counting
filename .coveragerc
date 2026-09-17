@@ -1,0 +1,16 @@
+[run]
+source = src
+# `src/main.py` est la boucle d'entrée/sortie (capture, affichage, écriture
+# vidéo) : sa couverture ligne à ligne n'est pas un indicateur de qualité métier
+# et exige une source vidéo. Ses fonctions pures (surcharges CLI, résolution de
+# la source, empreinte des poids, préparation de session) sont testées
+# directement, et son chemin d'erreur « source inouvrable » est testé de bout en
+# bout en sous-processus (tests/test_main_units.py).
+omit =
+    src/main.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError

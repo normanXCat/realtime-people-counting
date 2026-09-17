@@ -1,4 +1,5 @@
-# Model weights & binaries
+# Poids de modèles et binaires (non versionnés : empreinte SHA-256 enregistrée
+# dans config/pipeline.yaml et vérifiée au démarrage par src/main.py)
 src/models/yolov4.weights
 *.weights
 models/
@@ -6,12 +7,14 @@ models/
 *.onnx
 *.engine
 
-# Specific video files requested
-v.avi
-video1.mp4
-v.e_XwW1gO.avi.part
+# Vidéos d'exemple et jeux de données locaux : volumineux et non libres de droits.
+# Les vidéos annotées et les journaux d'événements ne doivent jamais être poussés
+# (voir docs/politique_confidentialite.md).
+test/
+data/videos/
+results/
 
-# Video files & temporary media extensions
+# Médias et fragments temporaires
 *.mp4
 *.avi
 *.mkv
@@ -21,15 +24,11 @@ v.e_XwW1gO.avi.part
 *.webm
 *.part
 
-# Test files, folders & temporary test artifacts
-test/
-tests/
-*test*
-test_*
-*_test.*
-
-# Environment & Cache
+# Environnement, caches et artefacts d'outils
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
 .DS_Store

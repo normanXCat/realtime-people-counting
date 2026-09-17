@@ -1,11 +1,29 @@
-torch>=2.0.0
-torchvision>=0.15.0
-ultralytics>=8.3.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-scipy>=1.10.0
-scikit-learn>=1.2.0
-pillow>=9.5.0
-pyyaml>=6.0.0
-lap>=0.5.12
-torchreid>=0.2.5
+# Dépendances du pipeline unique (spec règle 0.5 : versions figées).
+#
+# Les bornes hautes sont volontairement strictes : une exécution publiée dans le
+# mémoire doit pouvoir être reproduite. Les versions effectivement utilisées lors
+# du run de référence sont enregistrées dans results/<session>/environment.json.
+#
+# Installation :
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#   pip install -r requirements-dev.txt      # pytest (suite de tests)
+
+# --- Détection et tracking ------------------------------------------------
+ultralytics==8.4.126
+torch==2.13.0
+torchvision==0.28.0
+lap==0.5.13
+
+# --- Traitement vidéo et numérique ---------------------------------------
+opencv-python==5.0.0.93
+numpy==2.5.2
+pillow==12.3.0
+
+# --- Configuration et métriques ------------------------------------------
+PyYAML==6.0.3
+
+# --- ReID externe (variante 5, désactivé par défaut) ----------------------
+# L'extracteur profond utilise MobileNetV3 (torchvision) ; torchreid n'est
+# requis que si `reid.external_reid.weights: osnet_*` est explicitement choisi.
+# torchreid==0.2.5

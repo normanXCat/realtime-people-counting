@@ -1,128 +1,235 @@
-# Real-Time People Counting
+# Real-Time People Counting — comptage de personnes par caméra fixe
 
-Ce projet implémente un pipeline de comptage de personnes en temps réel basé sur la détection d'objets (avec YOLO11) et le suivi multi-objets (Multi-Object Tracking). Développé dans le cadre du projet de fin d'études / mémoire de Master STIC en 2026.
+Moteur vidéo d'un mémoire de Master STIC (2026) : comptage des entrées/sorties et
+estimation d'occupation sur une caméra fixe. Le dépôt ne contient **qu'un seul
+pipeline officiel**, déterministe, configurable, journalisé et testé.
 
-## 🚀 Fonctionnalités
+## Pipeline officiel
 
-- **Détection de personnes en temps réel** à l'aide du modèle YOLO11 (`models/yolo11s.pt`).
-- **Suivi d'objets (Tracking)** pour surveiller le mouvement des personnes et éviter le double comptage.
-- **Comptage automatique** avec gestion de franchissement de ligne virtuelle (Entrées / Sorties).
-- **Script de lancement automatisé** assurant l'activation de l'environnement virtuel Python.
-
----
-
-## 📁 Structure du Projet
-
-Le dépôt est structuré comme suit :
-
-* 📁 **`docs/`** : Documents de recherche, étude bibliographique et planification du projet (Gantt).
-  - `Etude_Bibliographique_Comptage_Personnes.pdf` : Rapport d'étude de l'existant.
-  - `Gantt_Comptage_Personnes.xlsx` : Planification temporelle du projet.
-* 📁 **`models/`** : Fichiers de configuration et poids pour les architectures de modèles supportées.
-  - `coco.names` : Liste des classes COCO (dont la classe *person*).
-  - `yolov4.cfg` / `yolov4.weights` : Configuration et poids pour YOLOv4.
-  - `yolo11s.pt` : Poids pré-entraînés pour YOLO11.
-* 📁 **`src/`** : Code source de l'application.
-  - `detection.py` : Script Python principal effectuant la détection et affichant le flux vidéo.
-* 📄 **`run.sh`** : Script Bash utilitaire pour lancer le projet dans l'environnement virtuel local.
-
----
-
-## 🛠️ Installation et Configuration
-
-### Prérequis
-- Python 3.8 ou supérieur
-- Système d'exploitation Linux/macOS (ou Windows avec Git Bash/WSL)
-
-### 1. Cloner le dépôt
-```bash
-git clone https://github.com/normanxcat/realtime-people-counting.git
-cd realtime-people-counting
+```
+Caméra / fichier vidéo
+   ↓
+YOLO11 (modèle configurable, poids + empreinte SHA-256 vérifiés)
+   ↓
+BoT-SORT natif (tracker court terme, persistance + ReID intra-buffer)
+   ↓
+Gestionnaire d'identités à deux niveaux (person_id stable)
+   ↓
+Ancre pieds (bas centre de boîte) avec garde-fou bord d'image
+   ↓
+Ligne virtuelle obligatoirement définie par l'opérateur
+   (première image affichée, deux clics, « C » pour valider)
+   ↓
+Machine à états avec hystérésis relative (zone morte en fraction de hauteur de boîte)
+   ↓
+Comptage IN/OUT + occupation encadrée (confirmée / incertaine)
+   ↓
+Journal d'événements JSON Lines (écriture incrémentale)
 ```
 
-### 2. Configurer l'environnement virtuel
-Si l'environnement virtuel `.venv` n'existe pas encore, créez-le et installez les dépendances requises :
+Point d'entrée unique : **`src/main.py`** (lancé par `run.sh`). Tout composant
+expérimental (stabilisation de boîtes, extracteur d'apparence profond) est
+désactivé par défaut et ne s'active que par configuration explicite, pour les
+expériences d'ablation.
+
+## Installation
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install ultralytics opencv-python
+pip install -r requirements.txt          # + requirements-dev.txt pour les tests
 ```
 
----
+Les poids YOLO (`models/yolo11n.pt`) ne sont pas versionnés : ils sont téléchargés
+au premier lancement par Ultralytics. L'empreinte attendue est déclarée dans
+`config/pipeline.yaml` (`model.expected_sha256`) et vérifiée au démarrage —
+remplacez-la si vous changez de poids.
 
-## 💻 Utilisation
-
-Pour exécuter le projet avec le suivi ByteTrack et le comptage de franchissement de ligne, utilisez le script de démarrage fourni :
+## Utilisation
 
 ```bash
-chmod +x run.sh
-./run.sh
+./run.sh                                   # caméra 0, sélection de ligne puis comptage
+./run.sh --source video.mp4 --write-video  # fichier vidéo + vidéo annotée
+./run.sh --source video.mp4 --inside-side positive
 ```
 
-Le script active automatiquement l'environnement virtuel `.venv` et lance l'application.
+Options principales :
 
-### Options de ligne de commande
+| Option | Rôle |
+|---|---|
+| `--config <yaml>` | Configuration du run (défaut : `config/pipeline.yaml`) |
+| `--mode comptage` | Mode d'exécution — seul mode officiel, explicite et journalisé |
+| `--source <valeur>` | Index caméra ou chemin de fichier vidéo |
+| `--output-root <dossier>` | Racine des résultats (défaut : `results`) |
+| `--session-id <id>` | Identifiant de session (défaut : horodatage) |
+| `--inside-side positive\|negative` | Orientation **initiale** proposée dans la fenêtre de sélection (`I` inverse en direct) |
+| `--no-show` | Aucune prévisualisation pendant le traitement (ne dispense **pas** de la sélection manuelle de la ligne) |
+| `--write-video` | Écrire `results/<session>/annotated.mp4` |
+| `--model`, `--conf`, `--iou`, `--imgsz` | Surcharges de détection |
+| `--max-frames <n>` | Arrêt après N frames (diagnostic) |
 
-Vous pouvez désormais passer des arguments pour configurer le comportement de l'application (qui seront transmis directement par `run.sh`) :
+Drapeaux d'ablation (protocole de la section 9) : `--no-long-term-reid`,
+`--no-safety-margin`, `--no-spatial-constraint`, `--use-bbox-locker`,
+`--use-anchor-stabilizer`, `--external-reid`.
+
+### Sélection de la ligne virtuelle (obligatoire)
+
+Enchaînement exact, sans raccourci possible :
+
+```
+1. lancement du programme
+2. mode comptage (seul mode officiel)
+3. affichage de la PREMIÈRE image de la source
+4. clic du point 1 -> il s'affiche
+5. clic du point 2 -> il s'affiche et la ligne est tracée
+6. « C » confirme la ligne
+7. SEULEMENT ALORS : YOLO11 + BoT-SORT + comptage
+```
+
+La ligne séparant l'intérieur de l'extérieur n'est jamais déduite d'une valeur par
+défaut (aucune ligne horizontale, aucun 60 %) : elle est définie par l'opérateur,
+puis validée. Deux points exactement, pas quatre, et une seule ligne — pas de
+double ligne L1/L2.
+
+| Action | Effet |
+|---|---|
+| Clic gauche | Extrémité 1, puis extrémité 2 de la ligne (la ligne apparaît immédiatement) ; un troisième clic est refusé |
+| `C` | Confirmer la ligne — uniquement si les deux points sont présents et la ligne valide — puis lancer YOLO11 + BoT-SORT + comptage |
+| `G` | Réinitialiser la sélection et recommencer |
+| `I` | Inverser le sens : quel côté de la ligne est l'intérieur (IN/OUT) |
+| `Échap` | Annuler proprement le programme (message clair, aucun comptage lancé) |
+
+- Les points sont convertis en **coordonnées normalisées** (0-1) : la ligne reste
+  identique quelle que soit la résolution de la vidéo ou de la fenêtre.
+- La ligne peut être **horizontale, verticale ou inclinée** ; c'est celle qui est
+  tracée à l'écran qui est utilisée par `OccupancyManager`.
+- Le côté intérieur et le côté extérieur sont **affichés en clair** sur l'image,
+  avec une flèche vers l'intérieur ; `I` inverse les deux.
+- Une ligne incomplète, à points confondus ou trop courte est **refusée** avec un
+  message explicite : la fenêtre reste ouverte, rien n'est validé en silence.
+- Cette ligne validée est la **seule** utilisée pour le dessin, la distance
+  signée, la détection des franchissements et le comptage.
+- Sans affichage disponible, le programme refuse de démarrer (code 4) avec un
+  message expliquant que la calibration manuelle est impossible sans interface
+  graphique : il n'existe aucun moyen de fabriquer une ligne automatiquement.
+  `--no-show` ne change rien à cette règle : il ne supprime que la
+  prévisualisation pendant le traitement.
+
+Codes de sortie : `2` configuration invalide, `3` poids ou tracker introuvables,
+`4` ligne non validée (annulation, affichage indisponible), `5` source inouvrable
+ou erreur de lecture.
+
+> **Noms de fenêtres OpenCV : ASCII uniquement.** Le backend Qt d'OpenCV ne
+> retrouve pas une fenêtre dont le nom contient un caractère non ASCII :
+> `cv2.setMouseCallback` échoue alors en `(-27:Null pointer) NULL window handler`
+> et la sélection de ligne devient impossible. `display.window_name` est donc
+> **refusé au chargement** s'il contient un accent ou un tiret typographique, et
+> `calibration.sanitize_window_name()` translittère tout nom fourni par ailleurs.
+> Un titre purement décoratif ne doit jamais pouvoir bloquer le comptage.
+
+### Sorties d'une session
+
+```
+results/<session_id>/
+├── events.jsonl            # journal JSON Lines (ligne validée, franchissements, occupation, ReID…)
+├── summary.json            # compteurs, FPS mesuré, latences par étape
+├── environment.json        # versions exactes des dépendances
+├── calibration.json        # ligne validée : points normalisés, clics bruts, côté intérieur, résolution
+└── config_resolved.yaml    # configuration effective (dont l'orientation validée)
+```
+
+Aucune écriture dans le répertoire courant. `results/` est exclu du dépôt : les
+vidéos annotées contiennent des personnes (voir `docs/politique_confidentialite.md`).
+
+## Configuration
+
+Tout paramètre métier vit dans `config/pipeline.yaml` : aucun seuil, aucune durée
+et aucune marge géométrique n'est codé en dur.
+
+- les **durées sont en secondes** et converties en frames avec le FPS *mesuré* ;
+- les **marges sont relatives** à la hauteur médiane des boîtes observées, jamais
+  en pixels absolus ;
+- les valeurs marquées « PROVISOIRE » ne sont pas encore calibrées : elles
+  doivent être fixées sur l'ensemble de calibration du protocole d'évaluation.
+
+## Tests
 
 ```bash
-./run.sh [options]
+python -m pytest tests -q                # suite complète (niveaux 1 à 3)
+python -m py_compile src/*.py            # vérification de compilation
+python -m pytest tests -q --cov=src      # avec couverture du cœur métier
 ```
 
-#### Liste des options disponibles :
-- `--source <valeur>` : Source vidéo à analyser. Peut être l'index de votre caméra locale (ex: `0` par défaut) ou le chemin vers un fichier vidéo (ex: `/chemin/vers/video.mp4`).
-- `--model <chemin>` : Chemin vers le fichier de modèle YOLO (par défaut : `models/yolo11s.pt`).
-- `--conf <valeur>` : Seuil de confiance minimal de détection de 0.0 à 1.0 (par défaut : `0.5`).
-- `--line-pos <valeur>` : Position verticale de la ligne de franchissement virtuelle (fraction de la hauteur de l'image de 0.0 à 1.0, par défaut : `0.6` soit 60%).
-- `--no-show` : Désactive l'affichage graphique de la fenêtre OpenCV (utile pour le traitement en arrière-plan ou sans interface graphique).
+Quatre niveaux de tests (section 8 du cahier des charges) :
 
-#### Exemples d'utilisation :
+1. **unitaires** — géométrie (`test_geometry.py`), machine à états
+   (`test_fsm.py`), identités et ReID long terme (`test_identity_manager.py`),
+   configuration (`test_config_validation.py`), sélection de la ligne et de son
+   côté intérieur (`test_calibration.py`, `test_calibration_window.py`),
+   stabilisation (`test_stabilization_flags.py`) ;
+2. **trajectoires synthétiques** — compteurs et occupation attendus, scénarios
+   d'hésitation, de franchissement rapide et de scène initialement peuplée
+   (`test_occupancy_synthetic.py`) ;
+3. **intégration sans caméra** — croisements, occultations, réapparitions,
+   situation ambiguë de ReID (`test_pipeline_integration.py`), et parcours
+   complets du point d'entrée avec détection simulée : ligne validée utilisée
+   partout (horizontale et inclinée), annulation, `--no-show` sans écran
+   (`test_main_e2e.py`) ;
+4. **vidéos réelles annotées** — exécutées par le protocole d'évaluation, avec
+   les métriques de la section 9 (`scripts/run_protocol.py`).
 
-1. **Lancer avec la webcam par défaut (source 0) et configurer la ligne à 50% de la hauteur :**
-   ```bash
-   ./run.sh --source 0 --line-pos 0.5
-   ```
-
-2. **Lancer le traitement sur un fichier vidéo avec un seuil de confiance de 0.4 :**
-   ```bash
-   ./run.sh --source "chemin/ma_video.mp4" --conf 0.4
-   ```
-
-3. **Lancer le traitement en tâche de fond (sans fenêtre OpenCV) :**
-   ```bash
-   ./run.sh --source "chemin/ma_video.mp4" --no-show
-   ```
-
-
-
-## Réglages recommandés sur la branche `dev`
-
-La branche `dev` conserve **ByteTrack comme chemin nominal** afin de limiter le coût d’inférence. Le module `src/hybrid_tracker.py` active une association de type DeepSORT uniquement lorsqu’une ambiguïté est détectée : recouvrement critique entre boîtes, ID ByteTrack dupliqué ou réapparition d’une piste dans la fenêtre de persistance. L’association secondaire combine similarité cosinus d’un embedding MobileNetV3, IoU avec une prédiction cinématique et l’algorithme hongrois.
-
-| Paramètre | Valeur par défaut | Rôle |
-|---|---:|---|
-| `--conf` | `0.35` | Récupère davantage de personnes petites ou partiellement occultées. |
-| `--iou` | `0.55` | Seuil IoU du NMS YOLO, compromis entre doublons et détections proches. |
-| `--imgsz` | `960` | Améliore la détection des personnes éloignées au prix d’une latence supérieure. |
-| `--occlusion-iou` | `0.35` | Déclenche le mode d’association apparence/mouvement. |
-| `--max-age` | `150` frames | Conserve une identité récupérable pendant environ 5 secondes à 30 FPS. |
-| `match_thresh` | `0.75` | Rend l’association ByteTrack moins permissive afin de réduire les fusions. |
-| `track_low_thresh` | `0.08` | Seconde passe ByteTrack pour les détections affaiblies. |
-| `track_buffer` | `150` frames | Évite la création d’un nouvel ID après une occultation courte. |
-
-Le comptage utilise désormais le centre de la boîte, une distance signée lissée, une bande d’hystérésis et la vérification que le segment entre deux centres consécutifs coupe réellement la ligne. Le cooldown par ID empêche les doubles comptages lors d’une hésitation autour de la ligne.
-
-Pour une caméra fixe et une vidéo à 30 FPS, un premier lancement peut être effectué avec :
+## Évaluation et calibration
 
 ```bash
-./run.sh --source video.mp4 --conf 0.35 --iou 0.55 --imgsz 960 --no-show
+python scripts/run_protocol.py --dataset calibration --dry-run   # vérification
+python scripts/run_protocol.py --dataset calibration             # réglages
+python scripts/run_protocol.py --dataset test --variant baseline_1 --variant variant_1
+python evaluate_system.py --events results/.../events.jsonl --ground-truth data/gt/clip01.json
 ```
 
-Les tests unitaires de `tests/test_line_tracker.py` nécessitent `pytest`; la compilation statique et les assertions géométriques peuvent être vérifiées sans caméra avec `python3 -m py_compile src/*.py`.
+Le dispositif (ensembles disjoints, critère d'acceptation chiffré, baselines et
+ablations) est décrit dans `docs/protocole_evaluation.md` et déclaré dans
+`config/protocol.yaml`. Les ensembles de vidéos y sont volontairement vides : les
+métriques ne peuvent être produites qu'après acquisition et annotation des vidéos.
 
-## Correctif occlusion complète
+## Organisation du dépôt
 
-Pour conserver une identité lorsqu’une personne disparaît entièrement puis réapparaît avec un nouvel ID ByteTrack, la branche `dev` utilise désormais les réglages suivants : `track_buffer=180` et `max_age=180`, soit environ 6 secondes à 30 FPS. Les détections faibles sont conservées avec `conf=0.25`, `track_high_thresh=0.25`, `track_low_thresh=0.05` et `new_track_thresh=0.25`.
+```
+config/pipeline.yaml        configuration unique du pipeline
+config/protocol.yaml        protocole d'évaluation (ensembles, seuils, variantes)
+src/main.py                 point d'entrée unique
+src/calibration.py          sélection manuelle obligatoire de la ligne (clics, C/G/I/Échap)
+src/config.py               chargement et validation stricte de la configuration
+src/events.py               schéma versionné + journal JSON Lines incrémental
+src/geometry.py             géométrie canonique (distance signée, zone morte relative, bord)
+src/fsm.py                  machine à états, table de transition explicite
+src/identity_manager.py     identités à deux niveaux (BoT-SORT + galerie long terme)
+src/occupancy_manager.py    orchestration du comptage et de l'occupation
+src/occupancy_types.py      types métier (états, zones, pistes logiques)
+src/metrics.py              FPS mesuré et latences instrumentées
+src/anchor_stabilizer.py    stabilisation d'ancre (expérimental, désactivé par défaut)
+src/bbox_height_locker.py   verrouillage de hauteur de boîte (expérimental, désactivé)
+src/configs/custom_botsort.yaml   configuration BoT-SORT
+scripts/run_protocol.py     exécution des baselines et ablations
+evaluate_system.py          évaluation F1 / occupation / FPS d'une session
+docs/audit_livrable0.md     audit du code existant et décisions
+docs/protocole_evaluation.md    protocole de calibration et d'évaluation
+docs/politique_confidentialite.md  données, conservation, accès
+```
 
-L’association Re-ID accepte maintenant une similarité cosinus minimale de **0.42** au lieu de 0.52 dans le module hybride. Son coût est pondéré à **85 % par l’apparence** et **15 % par le mouvement/IoU**, car la prédiction spatiale peut dériver fortement pendant une occlusion complète. La contrainte spatiale n’est donc plus éliminatoire : elle sert seulement de terme secondaire dans le coût d’association.
+## Limites connues
+
+- Les valeurs de seuils encore marquées « PROVISOIRE » ne sont pas calibrées.
+- La ligne étant obligatoirement définie à la main, **chaque exécution exige un
+  écran et une validation** : le protocole d'évaluation (`run_protocol.py`) doit
+  donc être piloté par un opérateur, une session à la fois.
+- La boucle de la fenêtre de sélection est testée avec une fenêtre OpenCV
+  **simulée** (`tests/test_calibration_window.py`) ; seule une session avec un
+  vrai serveur graphique n'est pas automatisable. Elle est en revanche vérifiée
+  manuellement contre le backend Qt réel (ouverture, `setMouseCallback`,
+  `getWindowProperty`, fermeture), y compris le refus d'un nom non ASCII.
+- Le rapport final de la section 9 n'est pas encore produit : il exige les vidéos
+  annotées (ensemble de calibration et ensemble de test disjoints).
+- La vérité terrain MOT dense (IDF1, ID switches) est à produire et à évaluer
+  séparément avec `py-motmetrics`.

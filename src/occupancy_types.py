@@ -1,10 +1,21 @@
-"""Structures de données pour le gestionnaire d'occupation robuste.
+"""Structures de données du gestionnaire d'occupation.
 
-Ce module définit les types utilisés par OccupancyManager :
-- TrackState : machine à états finis (FSM) de chaque piste logique
-- OriginType : comment la personne a été détectée pour la première fois
-- Zone : classification spatiale par rapport à la ligne virtuelle
-- LogicalTrack : état complet d'une personne suivie
+Ce module a été nettoyé lors de l'audit (§2.3 et §2.2 h) :
+
+- :class:`TrackState` provient désormais de :mod:`fsm` : les états
+  ``EN_ZONE_LIGNE`` (jamais assigné) et ``A_RETOURNE`` (jamais lu) ont disparu
+  au profit des états réellement atteints de la spec 4.1.
+- :class:`Zone` vit dans :mod:`geometry`, seule implémentation de la géométrie.
+- ``LogicalTrack`` est remplacé par :class:`PersonTrack`, réduit aux champs
+  effectivement lus ou écrits. Les onze champs jamais utilisés
+  (``previous_zone``, ``exterior_streak``, ``interior_streak``,
+  ``exit_l1_crossed``, ``entry_l2_crossed``, ``previous_bottom_l1``,
+  ``previous_top_l2``, ``previous_top_l1``, ``previous_bottom_l2``,
+  ``crossing_in_streak``, ``crossing_out_streak``) ainsi que
+  ``trajectory_history`` (écrit mais jamais lu) ont été supprimés.
+
+L'identifiant porteur du comptage est ``person_id`` (spec 3.1). Le
+``technical_track_id`` est conservé à titre de traçabilité uniquement.
 """
 
 from __future__ import annotations
@@ -14,59 +25,117 @@ from enum import Enum, auto
 
 import numpy as np
 
+from fsm import Action, Approach, Decision, FsmContext, TrackState  # noqa: F401 (réexport)
 
-class TrackState(Enum):
-    """État d'une piste logique dans la machine à états."""
-
-    PRESENTE = auto()           # Connue dans la salle
-    OCCULTEE = auto()           # Perdue temporairement (ex: sous une table)
-    EN_ZONE_LIGNE = auto()      # Dans la zone morte autour de la porte
-    SORTIE_CONFIRMEE = auto()   # A franchi OUT et s'est éloignée
-    A_RETOURNE = auto()         # Personne sortie qui réentre dans la salle
-    NOUVELLE_PRESENCE = auto()  # Apparue dans la salle sans franchissement observé
+__all__ = [
+    "TrackState",
+    "Action",
+    "Approach",
+    "FsmContext",
+    "Decision",
+    "OriginType",
+    "PersonTrack",
+    "OccupancySnapshot",
+]
 
 
 class OriginType(Enum):
-    """Comment la personne a été initialement détectée."""
+    """Comment la personne est entrée dans l'effectif."""
 
-    INITIALISATION = auto()          # Détectée pendant le warm-up
-    ENTREE_LIGNE = auto()            # Entrée par franchissement de la ligne
-    APPARITION_INTERIEURE = auto()   # Apparue directement dans la salle
-
-
-class Zone(Enum):
-    """Classification spatiale d'un point par rapport à la ligne virtuelle."""
-
-    INTERIEURE = auto()   # Côté salle
-    MORTE = auto()        # Bande tampon autour de la ligne
-    EXTERIEURE = auto()   # Côté sortie
+    INITIALISATION = auto()          # présente au démarrage (warm-up)
+    ENTREE_LIGNE = auto()            # entrée par franchissement confirmé
+    APPARITION_INTERIEURE = auto()   # apparue directement dans la salle (NEW)
+    REASSOCIATION = auto()           # récupérée par la galerie long terme
 
 
 @dataclass
-class LogicalTrack:
-    """État complet d'une personne suivie par le système d'occupation."""
+class PersonTrack:
+    """État complet d'une personne suivie par le système d'occupation.
 
-    logical_id: int
-    technical_track_id: int
-    state: TrackState
-    origin: OriginType
-    last_position: tuple[float, float]              # (x, y) en pixels
-    last_seen_frame: int
-    feature_vector: np.ndarray | None = None        # ReID embedding
-    consecutive_interior_frames: int = 0
-    counted_in_occupancy: bool = False
-    is_counted_out: bool = False
+    Attributes:
+        person_id: identifiant logique stable, **seul** porteur du comptage.
+        state: état courant de la machine à états (:mod:`fsm`).
+        inside_occupancy: la personne est-elle comptée comme présente ?
+            Passe à vrai sur ``COMPTE_ENTREE`` / ``NOUVELLE_PRESENCE`` /
+            ``EMPLACE_INITIAL``, à faux sur ``COMPTE_SORTIE``.
+
+    Le statut « purgée sans sortie observée » (borne haute de l'occupation,
+    spec 4.4) n'est pas dupliqué ici : il est détenu par
+    ``OccupancyManager``, car il doit survivre à la disparition de cette
+    structure (libération de la galerie).
+    """
+
+    person_id: int
+    state: TrackState = TrackState.INITIALISATION
+    origin: OriginType = OriginType.APPARITION_INTERIEURE
+    technical_track_id: int = -1
+    anchor: tuple[float, float] = (0.0, 0.0)
+    previous_anchor: tuple[float, float] | None = None
+    bbox: np.ndarray | None = None
+    bbox_height: float = 0.0
+    last_seen_frame: int = 0
+    last_seen_s: float = 0.0
+    feature_vector: np.ndarray | None = None
     confidence: float = 0.0
-    trajectory_history: list[tuple[float, float]] = field(default_factory=list)
-    previous_zone: Zone = Zone.INTERIEURE
-    pending_direction: str | None = None
-    exterior_streak: int = 0
+    inside_occupancy: bool = False
+    provisional: bool = False
+    approach: Approach = Approach.INTERIEUR
+    pending_crossing: str | None = None
     interior_streak: int = 0
-    exit_l1_crossed: bool = False
-    entry_l2_crossed: bool = False
-    previous_bottom_l1: float | None = None
-    previous_top_l2: float | None = None
-    previous_top_l1: float | None = None
-    previous_bottom_l2: float | None = None
-    crossing_in_streak: int = 0
-    crossing_out_streak: int = 0
+    crossed: int = 0
+    occlusion_events: int = 0
+    anchor_suspend_streak: int = 0
+    last_rule: str = ""
+    last_zone: str = ""
+    last_distance: float = 0.0
+    #: Diagnostic : ensemble des track_id techniques ayant porté ce person_id.
+    aliases: set[int] = field(default_factory=set)
+
+    @property
+    def is_active(self) -> bool:
+        """La personne est-elle encore susceptible de produire un comptage ?"""
+        return self.state is not TrackState.ABSENTE
+
+    @property
+    def is_visible(self) -> bool:
+        return self.state in (
+            TrackState.INITIALISATION,
+            TrackState.EXTERIEUR,
+            TrackState.PRESENTE,
+            TrackState.EN_ZONE_MORTE,
+            TrackState.ENTREE_EN_COURS,
+            TrackState.SORTIE_EN_COURS,
+        )
+
+    @property
+    def lifetime_s(self) -> float:
+        return self.last_seen_s
+
+
+@dataclass(frozen=True)
+class OccupancySnapshot:
+    """Occupation publiée à intervalle régulier (spec 4.4)."""
+
+    confirmed: int
+    uncertain: int
+    range_low: int
+    range_high: int
+    visible: int
+    occluded: int
+    initial: int
+    total_in: int
+    total_out: int
+    total_new: int
+
+    def to_fields(self) -> dict[str, object]:
+        return {
+            "occupancy_confirmed": self.confirmed,
+            "occupancy_uncertain": self.uncertain,
+            "occupancy_range": [self.range_low, self.range_high],
+            "visible_count": self.visible,
+            "occluded_count": self.occluded,
+            "total_in": self.total_in,
+            "total_out": self.total_out,
+            "total_new": self.total_new,
+            "identities_live": self.confirmed + self.uncertain,
+        }

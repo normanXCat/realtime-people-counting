@@ -1,589 +1,840 @@
-"""Comptage de personnes YOLO11 + BoT-SORT avec gestion d'occupation robuste.
+"""Point d'entrée **unique** du système de comptage de personnes par caméra fixe.
 
-Pipeline :
-1. IDManager convertit les track_id BoT-SORT en display_id séquentiels (ReID).
-2. OccupancyManager applique la machine à états FSM avec :
-   - Intersection vectorielle CCW pour détecter les franchissements
-   - Zone morte (hystérésis) autour de la ligne virtuelle
-   - Phase de warm-up pour calibrer l'effectif initial
-   - Gestion des occultations (disparition ≠ sortie)
-3. Le rendu visuel affiche les bounding boxes colorées par état et le HUD d'occupation.
+Pipeline officiel (spec section 1) :
+
+    source vidéo
+      -> YOLO11 (poids + hash vérifiés, modèle configurable)
+      -> BoT-SORT natif (persistance + ReID court terme)
+      -> gestionnaire d'identités à deux niveaux (person_id stable)
+      -> ancre pieds (bas centre de boîte) + garde-fou bord d'image
+      -> ligne virtuelle unique calibrée (côté intérieur explicite)
+      -> machine à états avec hystérésis relative
+      -> comptage IN/OUT + occupation encadrée
+      -> journal d'événements JSON Lines incrémental
+
+Corrections apportées par rapport à l'audit (§2.1) :
+
+- plus de ``input()`` bloquant : le mode sans affichage est réellement headless
+  (spec 5.1) ;
+- la ligne virtuelle est **obligatoirement définie manuellement** par
+  l'opérateur au démarrage (première image affichée, deux clics, « C » pour
+  valider, « G » pour recommencer, « I » pour inverser IN/OUT, « Échap » pour
+  annuler). Aucune ligne par défaut ne peut servir au comptage et le pipeline
+  refuse de démarrer tant que la ligne n'est pas validée ;
+- une seule résolution de source (spec 5.2), jamais de chaîne ``"0"`` ambiguë ;
+- le FPS de sortie provient d'une **mesure** glissante, jamais d'une réouverture
+  de la source (spec 5.3) ;
+- distinction explicite fin de flux / absence de détection / erreur de source
+  (spec 5.5) ;
+- latence instrumentée par étape (spec 6.5) avec moyenne, médiane, minimum, P95 ;
+- les événements sont écrits en JSON Lines dans ``results/{session_id}/``, jamais
+  dans le répertoire courant (spec 6.1, 6.4).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import sys
 import time
+from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
-from typing import Optional
+from typing import Any, Sequence
 
 import cv2
-import numpy as np
 import yaml
-from ultralytics import YOLO
 
 from anchor_stabilizer import AnchorStabilizer
 from bbox_height_locker import BBoxHeightLocker
-from occupancy_manager import OccupancyManager, compute_anchor
+from calibration import (
+    CalibrationCancelled,
+    CalibrationUnavailable,
+    SourceUnreadable,
+    ValidatedLine,
+    display_available,
+    sanitize_window_name,
+    select_line,
+)
+from config import (
+    ALLOWED_INSIDE_SIDES,
+    ConfigError,
+    FrameBudget,
+    PipelineConfig,
+    load_config,
+    override_config,
+)
+from events import EventLogger
+from geometry import LineError, VirtualLine
+from metrics import FpsEstimator, LatencyProfiler, Timer
+from occupancy_manager import Detection, OccupancyManager
+
+#: Modes d'exécution du point d'entrée. Le comptage est le **seul** mode
+#: officiel : il commence obligatoirement par la définition manuelle de la ligne
+#: virtuelle, puis enchaîne YOLO11 + BoT-SORT + comptage. Le paramètre existe pour
+#: rendre ce choix explicite (et journalisé) plutôt qu'implicite.
+ALLOWED_MODES = ("comptage",)
+
+#: Dépendances dont la version est enregistrée dans le dossier de session (spec 6.3).
+TRACKED_DEPENDENCIES = (
+    "ultralytics", "torch", "torchvision", "opencv-python", "numpy", "PyYAML", "lap",
+)
 
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_MODEL = ROOT.parent / "models" / "yolo11n.pt"
-DEFAULT_TRACKER = ROOT / "configs" / "custom_botsort.yaml"
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Comptage de personnes YOLO11 + BoT-SORT (pipeline unique)"
+    )
+    parser.add_argument("--config", default=None, help="YAML de configuration (défaut : config/pipeline.yaml)")
+    parser.add_argument(
+        "--mode",
+        default=ALLOWED_MODES[0],
+        choices=list(ALLOWED_MODES),
+        help="Mode d'exécution (seul mode officiel : « comptage »)",
+    )
+    parser.add_argument("--source", default=None, help="Index caméra ou chemin vidéo (défaut : configuration)")
+    parser.add_argument("--output-root", default=None, help="Racine des résultats (défaut : configuration)")
+    parser.add_argument("--session-id", default=None, help="Identifiant de session (défaut : horodatage)")
+    parser.add_argument(
+        "--inside-side",
+        default=None,
+        choices=list(ALLOWED_INSIDE_SIDES),
+        help="Orientation INITIALE proposée dans la fenêtre de sélection "
+             "(inversible en direct avec la touche « I »)",
+    )
+    parser.add_argument(
+        "--no-show", action="store_true",
+        help="Mode headless : aucune prévisualisation pendant le traitement "
+             "(la sélection manuelle de la ligne reste obligatoire)",
+    )
+    parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
+    parser.add_argument("--max-frames", type=int, default=None, help="Arrêt après N frames (diagnostic)")
+    parser.add_argument("--model", default=None, help="Surcharge du chemin des poids YOLO")
+    parser.add_argument("--conf", type=float, default=None, help="Surcharge du seuil de confiance")
+    parser.add_argument("--iou", type=float, default=None, help="Surcharge du seuil NMS IoU")
+    parser.add_argument("--imgsz", type=int, default=None, help="Surcharge de la résolution d'inférence")
+    parser.add_argument("--no-long-term-reid", action="store_true", help="Baseline 1 : ReID long terme désactivé")
+    parser.add_argument("--external-reid", action="store_true", help="Variante 5 : extracteur d'apparence profond")
+    parser.add_argument("--no-safety-margin", action="store_true", help="Variante 2 : marge de sécurité désactivée")
+    parser.add_argument("--no-spatial-constraint", action="store_true", help="Variante 3 : contrainte spatio-temporelle désactivée")
+    parser.add_argument("--use-bbox-locker", action="store_true", help="Variante 4 : verrouillage de hauteur de bbox")
+    parser.add_argument("--use-anchor-stabilizer", action="store_true", help="Variante 4 : stabilisation d'ancre")
+    return parser
 
 
-def verify_reid_weights(tracker_path: str) -> None:
-    """Vérifie que le poids ReID demandé existe avant l'inférence."""
-    config = yaml.safe_load(Path(tracker_path).read_text())
-    if not config.get("with_reid", False):
-        raise RuntimeError("[REID CHECK] with_reid n'est pas activé dans la configuration")
-    model_name = str(config.get("model", "auto"))
-    if model_name == "auto":
-        print("[REID CHECK] ReID activée en mode auto (poids gérés par Ultralytics)")
-        return
-    candidates = [Path(model_name), Path(tracker_path).parent / model_name, Path.cwd() / model_name]
-    weight = next((path for path in candidates if path.exists()), None)
-    if weight is None:
-        # Les poids YOLO de classification standards sont téléchargés par
-        # YOLO(...) au premier lancement; ils ne doivent pas être bloqués par
-        # ce contrôle local.
-        standard_ultralytics_weights = {
-            "yolo11n-cls.pt", "yolo11s-cls.pt", "yolo11m-cls.pt",
-            "yolo11l-cls.pt", "yolo11x-cls.pt",
+def apply_cli_overrides(config: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
+    """Applique les surcharges CLI en repassant par la validation de configuration."""
+    overrides: dict[str, dict[str, Any]] = {}
+    if args.model:
+        overrides["model"] = {"path": args.model}
+    model_overrides: dict[str, Any] = dict(overrides.get("model", {}))
+    if args.conf is not None:
+        model_overrides["confidence"] = args.conf
+    if args.iou is not None:
+        model_overrides["nms_iou"] = args.iou
+    if args.imgsz is not None:
+        model_overrides["image_size"] = args.imgsz
+    if model_overrides:
+        overrides["model"] = model_overrides
+
+    if args.source is not None:
+        overrides["source"] = {"default": args.source}
+    if args.output_root is not None:
+        overrides["output"] = {"session_root": args.output_root}
+    if args.write_video:
+        overrides["output"] = {**overrides.get("output", {}), "write_video": True}
+    if args.no_show or not display_available():
+        overrides["display"] = {"enabled": False}
+
+    long_term: dict[str, Any] = {}
+    if args.no_long_term_reid:
+        long_term["enabled"] = False
+    if args.no_safety_margin:
+        long_term["safety_margin"] = 0.0
+    if args.no_spatial_constraint:
+        long_term["v_max_ratio"] = 1e6
+        long_term["spatial_margin_ratio"] = 1e6
+    if long_term:
+        overrides["reid"] = {"long_term": {**long_term}}
+    if args.external_reid:
+        overrides["reid"] = {
+            **overrides.get("reid", {}),
+            "external_reid": {"enabled": True},
         }
-        if model_name in standard_ultralytics_weights:
-            print(f"[REID CHECK] Poids ReID Ultralytics absents localement : {model_name}")
-            print(f"[REID CHECK] Téléchargement automatique attendu par Ultralytics : {model_name}")
-            return
+
+    stabilization: dict[str, Any] = {}
+    if args.use_bbox_locker:
+        stabilization["use_bbox_locker"] = True
+    if args.use_anchor_stabilizer:
+        stabilization["use_anchor_stabilizer"] = True
+    if stabilization:
+        overrides["stabilization"] = stabilization
+
+    if args.inside_side is not None:
+        # Orientation initiale seulement : les points proviennent des clics de
+        # l'opérateur, la valeur peut être inversée en direct dans la fenêtre.
+        overrides["line"] = {"inside_side": args.inside_side}
+
+    # Revalidation complète après surcharge : une CLI ne peut pas produire une
+    # configuration invalide silencieusement (spec 5.6).
+    return override_config(config, overrides)
+
+
+# ---------------------------------------------------------------------------
+# Session, poids, environnement
+# ---------------------------------------------------------------------------
+def resolve_source(raw: str) -> int | str:
+    """Résout la source **une seule fois** : index entier ou chemin (spec 5.2)."""
+    candidate = raw.strip()
+    if candidate.isdigit():
+        return int(candidate)
+    return candidate
+
+
+def new_session_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_weights(path: Path, expected_sha256: str) -> str:
+    """Vérifie l'existence et le hash des poids (spec 0.5, règle de déterminisme)."""
+    if not path.exists():
         raise FileNotFoundError(
-            f"[REID CHECK] Poids ReID absents : {model_name}. "
-            f"Placez ce fichier dans le dépôt ou dans le dossier courant."
+            f"Poids introuvables : {path}. Aucun téléchargement automatique n'est "
+            "effectué : le chemin doit être explicite et vérifiable."
         )
-    print(f"[REID CHECK] Poids ReID trouvés : {weight.resolve()}")
+    digest = sha256_of(path)
+    if expected_sha256 and digest != expected_sha256:
+        raise ConfigError(
+            f"Hash des poids incorrect pour {path}\n  attendu : {expected_sha256}\n"
+            f"  obtenu  : {digest}\nLes résultats ne seraient pas reproductibles."
+        )
+    return digest
 
 
-class IDManager:
-    """Convertit les IDs BoT-SORT confirmés en IDs séquentiels persistants."""
-
-    def __init__(self, confirmation_confidence: float = 0.75) -> None:
-        self.mapping_dict: dict[int, int] = {}
-        self.next_id = 1
-        self.confirmation_confidence = confirmation_confidence
-        self.last_centers: dict[int, tuple[float, float]] = {}
-        self.features: dict[int, np.ndarray] = {}
-        self.last_seen: dict[int, int] = {}
-        self.gallery_ttl = 300
-
-    @staticmethod
-    def appearance(frame: np.ndarray, box: np.ndarray) -> Optional[np.ndarray]:
-        """Signature légère de couleur/texture, calculée sur le crop personne."""
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = map(int, box[:4])
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 - x1 < 8 or y2 - y1 < 16:
-            return None
-        crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [24, 8], [0, 180, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        return hist
-
-    @staticmethod
-    def similarity(a: np.ndarray, b: np.ndarray) -> float:
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
-
-    def assign_frame(
-        self,
-        candidates: list[tuple[int, np.ndarray, float]],
-        frame: np.ndarray,
-        frame_index: int,
-        frame_diagonal: float,
-    ) -> list[tuple[int, int, tuple[float, float], np.ndarray, float]]:
-        """Attribue les display IDs par apparence, avec mémoire des absents."""
-        descriptors = [(tid, box, float(conf), self.appearance(frame, box)) for tid, box, conf in candidates]
-
-        # Détecter un échange de deux pistes connues : si les apparences
-        # correspondent nettement mieux en croisé qu'en direct, corriger le
-        # mapping avant le rendu et le comptage.
-        known = [
-            (tid, int(self.mapping_dict[tid]), feature)
-            for tid, _box, _conf, feature in descriptors
-            if tid in self.mapping_dict and feature is not None and self.mapping_dict[tid] in self.features
-        ]
-        if len(known) >= 2:
-            for i in range(len(known)):
-                tid_a, did_a, feat_a = known[i]
-                for j in range(i + 1, len(known)):
-                    tid_b, did_b, feat_b = known[j]
-                    direct = self.similarity(feat_a, self.features[did_a]) + self.similarity(feat_b, self.features[did_b])
-                    crossed = self.similarity(feat_a, self.features[did_b]) + self.similarity(feat_b, self.features[did_a])
-                    if crossed > direct + 0.12:
-                        self.mapping_dict[tid_a], self.mapping_dict[tid_b] = did_b, did_a
-                        print(f"[RE-ID-LOCK] Switch corrigé : track_id {tid_a}/{tid_b} -> IDs {did_b}/{did_a}")
-        current_displays: set[int] = set()
-        output = []
-        for track_id, box, conf, feature in descriptors:
-            display_id = self.mapping_dict.get(int(track_id))
-            best_id, best_score = None, -1.0
-            # Un track_id déjà connu est verrouillé sur son display_id. La
-            # ReID ne doit jamais le remapper vers une autre personne active;
-            # elle ne sert qu'à récupérer l'ID d'un nouveau track_id après
-            # disparition de la piste précédente.
-            if display_id is None and feature is not None:
-                for candidate_id, candidate_feature in self.features.items():
-                    if candidate_id in current_displays:
-                        continue
-                    # Ne jamais voler l'ID d'une personne vue récemment : la
-                    # galerie sert aux pistes réellement disparues.
-                    if frame_index - self.last_seen.get(candidate_id, frame_index) < 3:
-                        continue
-                    score = self.similarity(feature, candidate_feature)
-                    if score > best_score:
-                        best_id, best_score = candidate_id, score
-            # Une nouvelle piste peut récupérer un ID ancien seulement avec
-            # une vraie ressemblance; sinon elle reçoit un nouvel ID confirmé.
-            if best_id is not None and best_score >= 0.78:
-                if display_id is None or best_id != display_id:
-                    display_id = best_id
-                    self.mapping_dict[int(track_id)] = display_id
-                    print(f"[RE-ID] track_id={track_id} récupère l'ID mémorisé {display_id} (similarité={best_score:.2f})")
-            if display_id is None:
-                if conf <= self.confirmation_confidence:
-                    continue
-                display_id = self.next_id
-                self.next_id += 1
-                self.mapping_dict[int(track_id)] = display_id
-                print(f"[REID SUCCESS] Nouvelle entité confirmée : YOLO_ID {track_id} -> Affiche ID {display_id} (conf={conf:.2f})")
-            center = compute_anchor(box)
-            if feature is not None:
-                old = self.features.get(display_id)
-                self.features[display_id] = feature if old is None else (0.85 * old + 0.15 * feature)
-                norm = np.linalg.norm(self.features[display_id])
-                if norm > 1e-8:
-                    self.features[display_id] /= norm
-            self.last_centers[display_id] = center
-            self.last_seen[display_id] = frame_index
-            current_displays.add(display_id)
-            output.append((int(track_id), display_id, center, box, conf))
-        # Conserver la mémoire, mais purger les identités très anciennes.
-        expired = [did for did, seen in self.last_seen.items() if frame_index - seen > self.gallery_ttl]
-        for did in expired:
-            self.features.pop(did, None)
-            self.last_centers.pop(did, None)
-            self.last_seen.pop(did, None)
-        return output
-
-    def stabilize_assignments(
-        self,
-        assignments: list[tuple[int, int, tuple[float, float]]],
-        frame_diagonal: float,
-    ) -> list[tuple[int, int, tuple[float, float]]]:
-        """Corrige un échange évident entre deux pistes déjà connues.
-
-        BoT-SORT peut conserver deux track_id tout en les inversant après un
-        croisement. Lorsque l'affectation croisée est nettement plus proche
-        des dernières positions connues, on échange uniquement les display_id
-        pour cette frame et on met à jour le mapping interne.
-        """
-        if len(assignments) < 2:
-            return assignments
-        result = list(assignments)
-        max_switch_cost = frame_diagonal * 0.35
-        for i in range(len(result)):
-            track_a, display_a, center_a = result[i]
-            prev_a = self.last_centers.get(display_a)
-            if prev_a is None:
-                continue
-            for j in range(i + 1, len(result)):
-                track_b, display_b, center_b = result[j]
-                prev_b = self.last_centers.get(display_b)
-                if prev_b is None or display_a == display_b:
-                    continue
-                direct = self._distance(center_a, prev_a) + self._distance(center_b, prev_b)
-                crossed = self._distance(center_a, prev_b) + self._distance(center_b, prev_a)
-                if crossed + max_switch_cost < direct:
-                    result[i] = (track_a, display_b, center_a)
-                    result[j] = (track_b, display_a, center_b)
-                    self.mapping_dict[track_a] = display_b
-                    self.mapping_dict[track_b] = display_a
-                    print(f"[ID-LOCK] Échange corrigé entre IDs {display_a} et {display_b}")
-        for _track_id, display_id, center in result:
-            self.last_centers[display_id] = center
-        return result
-
-    @staticmethod
-    def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
-        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
-
-    def get_display_id(self, track_id: int, confidence: float) -> Optional[int]:
-        track_id = int(track_id)
-        if track_id not in self.mapping_dict:
-            if float(confidence) <= self.confirmation_confidence:
-                return None
-            display_id = self.next_id
-            self.mapping_dict[track_id] = display_id
-            self.next_id += 1
-            print(
-                f"[INFO] Nouvelle personne confirmée : ID {display_id} "
-                f"(track_id={track_id}, conf={float(confidence):.2f})"
-            )
-        return self.mapping_dict[track_id]
+def dependency_versions() -> dict[str, str]:
+    versions: dict[str, str] = {"python": sys.version.split()[0]}
+    for name in TRACKED_DEPENDENCIES:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = "absent"
+    return versions
 
 
-def parse_point(value: str) -> tuple[float, float]:
-    x, y = (float(v.strip()) for v in value.split(","))
-    if not (0 <= x <= 1 and 0 <= y <= 1):
-        raise ValueError("Les coordonnées de ligne doivent être normalisées entre 0 et 1")
-    return x, y
+def prepare_session(config: PipelineConfig, session_id: str) -> Path:
+    """Crée le dossier de session (spec 6.3) et retourne sa racine."""
+    root = config.resolve_path(config.output.session_root) / session_id
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
-def ask_counting_mode() -> bool:
-    """Demande à l'utilisateur si les passages doivent être comptabilisés."""
-    while True:
-        answer = input(
-            "Souhaitez-vous compter les personnes qui entrent et sortent ? (o/n) : "
-        ).strip().lower()
-        if answer in {"o", "oui", "y", "yes"}:
-            return True
-        if answer in {"n", "non", "no"}:
-            print("Mode suivi uniquement activé : aucun comptage de passages.")
-            return False
-        print("Réponse invalide. Répondez par o pour oui ou n pour non.")
+def write_resolved_config(
+    config: PipelineConfig, session_root: Path, session_id: str
+) -> Path:
+    """Écrit la configuration **effectivement appliquée** dans la session (spec 6.3).
+
+    Appelé après la validation de la ligne : le fichier contient l'orientation
+    intérieur/extérieur réellement retenue par l'opérateur. Il est rechargeable
+    tel quel (``--config results/<session>/config_resolved.yaml``) : il ne
+    contient que les sections du schéma, le chemin de la configuration source
+    restant en commentaire d'en-tête.
+    """
+    resolved_path = session_root / "config_resolved.yaml"
+    header = (
+        "# Configuration résolue — copie exacte de la configuration exécutée.\n"
+        f"# config_path: {config.config_path}\n"
+        f"# session_id : {session_id}\n"
+        f"# source     : {config.source.default}\n"
+        "# Rejouable : python src/main.py --config <ce fichier>\n"
+    )
+    resolved_path.write_text(
+        header + yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=True),
+        encoding="utf-8",
+    )
+    return resolved_path
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Ligne virtuelle : sélection manuelle obligatoire
+# ---------------------------------------------------------------------------
 def calibrate(
-    source: str,
-    no_show: bool,
-    p1: Optional[str],
-    p2: Optional[str],
-    max_dim: int = 960,
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    if p1 and p2:
-        return parse_point(p1), parse_point(p2)
-    if no_show:
-        return (0.0, 0.6), (1.0, 0.6)
-    capture = cv2.VideoCapture(int(source) if source.isdigit() else source)
-    ok, frame = capture.read()
-    capture.release()
-    if not ok:
-        raise RuntimeError(f"Impossible de lire la première frame : {source}")
-    h, w = frame.shape[:2]
-    # Réduction de résolution pour un affichage confortable et stable lors du tracé de la ligne
-    scale = min(1.0, max_dim / max(w, h))
-    disp_w, disp_h = max(1, int(w * scale)), max(1, int(h * scale))
-    canvas = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
+    source_or_config: Any = 0,
+    source: int | str | None = None,
+    *,
+    headless_requested: bool = False,
+    no_show: bool = False,
+    window_name: str | None = None,
+    inside_side: str | None = None,
+    min_length_ratio: float | None = None,
+) -> ValidatedLine:
+    """Affiche la première image et attend que l'utilisateur définisse manuellement la ligne.
 
-    points: list[tuple[int, int]] = []
+    Comportement strict :
+    1. Affiche la première image de la source dans une fenêtre OpenCV.
+    2. Attend exactement deux clics (point 1 puis point 2) ; aucun troisième clic n'est accepté.
+    3. Affiche les deux points et trace immédiatement la ligne entre eux.
+    4. C valide la ligne uniquement si deux points distincts de longueur valide sont présents.
+    5. G réinitialise les points et recommence la sélection.
+    6. Échap annule proprement sans lancer le comptage.
 
-    def on_click(event, x, y, _flags, _param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
-            points.append((x, y))
-
-    window = "Calibration - cliquez 2 points, c=valider, g=reinitialiser"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, disp_w, disp_h)
-    cv2.setMouseCallback(window, on_click)
-    while True:
-        display = canvas.copy()
-        for point in points:
-            cv2.circle(display, point, 6, (0, 0, 255), -1)
-        if len(points) == 2:
-            cv2.line(display, points[0], points[1], (0, 255, 0), 3)
-        cv2.imshow(window, display)
-        key = cv2.waitKey(30) & 0xFF
-        if key == ord("c") and len(points) == 2:
-            cv2.destroyWindow(window)
-            return (points[0][0] / disp_w, points[0][1] / disp_h), (points[1][0] / disp_w, points[1][1] / disp_h)
-        if key == ord("g"):
-            points.clear()
-            print("[Calibration] Ligne réinitialisée. Cliquez à nouveau sur deux points.")
-        if key == 27:
-            cv2.destroyWindow(window)
-            raise KeyboardInterrupt
-
-
-def calibrate_two_lines(
-    source: str,
-    no_show: bool,
-    line1_p1: Optional[str],
-    line1_p2: Optional[str],
-    line2_p1: Optional[str],
-    line2_p2: Optional[str],
-    max_dim: int = 960,
-) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
-    """Calibre L1 et L2 manuellement, ou lit quatre points CLI normalisés."""
-    if line1_p1 and line1_p2 and line2_p1 and line2_p2:
-        return (
-            parse_point(line1_p1), parse_point(line1_p2),
-            parse_point(line2_p1), parse_point(line2_p2),
-        )
-    if any((line1_p1, line1_p2, line2_p1, line2_p2)):
-        raise ValueError("Les quatre points L1/L2 doivent être fournis ensemble")
-    if no_show:
-        raise ValueError("Le mode --no-show exige --line-p1, --line-p2, --line2-p1 et --line2-p2")
-
-    capture = cv2.VideoCapture(int(source) if source.isdigit() else source)
-    ok, frame = capture.read()
-    capture.release()
-    if not ok:
-        raise RuntimeError(f"Impossible de lire la première frame : {source}")
-    h, w = frame.shape[:2]
-    # Réduction de résolution pour un affichage confortable et stable lors du tracé de la ligne
-    scale = min(1.0, max_dim / max(w, h))
-    disp_w, disp_h = max(1, int(w * scale)), max(1, int(h * scale))
-    canvas = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
-
-    points: list[tuple[int, int]] = []
-
-    def on_click(event, x, y, _flags, _param):
-        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
-            points.append((x, y))
-
-    window = "Calibration - L1 puis L2 | 4 points, c=valider, g=reinitialiser"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window, disp_w, disp_h)
-    cv2.setMouseCallback(window, on_click)
-    while True:
-        display = canvas.copy()
-        for i, point in enumerate(points):
-            cv2.circle(display, point, 6, (0, 0, 255), -1)
-            cv2.putText(display, str(i + 1), (point[0] + 8, point[1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-        if len(points) >= 2:
-            cv2.line(display, points[0], points[1], (0, 255, 0), 3, cv2.LINE_AA)
-            cv2.putText(display, "L1", points[0], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-        if len(points) == 4:
-            cv2.line(display, points[2], points[3], (255, 0, 255), 3, cv2.LINE_AA)
-            cv2.putText(display, "L2", points[2], cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
-        cv2.putText(display, "Cliquez L1 gauche/droite, puis L2 gauche/droite | c=valider | g=reset",
-                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.imshow(window, display)
-        key = cv2.waitKey(30) & 0xFF
-        if key == ord("c") and len(points) == 4:
-            cv2.destroyWindow(window)
-            return tuple((x / disp_w, y / disp_h) for x, y in points)  # type: ignore[return-value]
-        if key == ord("g"):
-            points.clear()
-            print("[Calibration] L1 et L2 réinitialisées.")
-        if key == 27:
-            cv2.destroyWindow(window)
-            raise KeyboardInterrupt
-
-
-def arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="YOLO11 + BoT-SORT people counting (FSM)")
-    parser.add_argument("--source", default="0")
-    parser.add_argument("--model", default=str(DEFAULT_MODEL))
-    parser.add_argument("--tracker", default=str(DEFAULT_TRACKER))
-    parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--iou", type=float, default=0.55)
-    parser.add_argument("--imgsz", type=int, default=960)
-    parser.add_argument("--line-p1", default=None)
-    parser.add_argument("--line-p2", default=None)
-    parser.add_argument("--line2-p1", default=None, help="Première extrémité de L2, coordonnées x,y normalisées")
-    parser.add_argument("--line2-p2", default=None, help="Deuxième extrémité de L2, coordonnées x,y normalisées")
-    parser.add_argument("--output", default=None)
-    parser.add_argument("--no-show", action="store_true")
-    # Paramètres OccupancyManager
-    parser.add_argument("--dead-zone", type=float, default=20.0,
-                        help="Épaisseur de la zone morte en pixels (hystérésis)")
-    parser.add_argument("--dead-zone-inside", type=float, default=None,
-                        help="Épaisseur de la zone morte intérieure en pixels (par défaut identique à --dead-zone)")
-    parser.add_argument("--gate-width", type=float, default=0.0,
-                        help="Ancien décalage automatique de L2 (0 = désactivé)")
-    parser.add_argument("--warmup-frames", type=int, default=15,
-                        help="Nombre de frames de warm-up (~500ms à 30fps)")
-    parser.add_argument("--confirm-frames", type=int, default=15,
-                        help="Frames consécutives pour confirmer une nouvelle présence")
-    parser.add_argument("--grace-frames", type=int, default=300,
-                        help="Frames de délai de grâce pour les pistes occultées")
-    parser.add_argument("--zenithal", action="store_true",
-                        help="Vue zénithale : utiliser le centre de boîte au lieu du bas")
-    parser.add_argument("--stabilizer-tolerance", type=float, default=20.0,
-                        help="Tolérance en pixels pour la stabilisation de l'ancrage par la tête")
-    parser.add_argument("--no-stabilizer", action="store_true",
-                        help="Désactiver la stabilisation cinématique de l'ancrage")
-    parser.add_argument("--calib-max-dim", type=int, default=960,
-                        help="Dimension maximale (largeur ou hauteur) pour l'affichage de la fenêtre de calibration (défaut: 960)")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = arguments()
-    model_path = Path(args.model)
-    verify_reid_weights(args.tracker)
-    model = YOLO(str(model_path))
-    counting_enabled = ask_counting_mode()
-
-    if counting_enabled:
-        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2, max_dim=args.calib_max_dim)
-        # L2 est abandonnée : le comptage utilise uniquement L1 et le point des pieds.
-        line2_p1 = line2_p2 = None
+    Règles strictes :
+    - Ne jamais utiliser automatiquement une ligne horizontale par défaut à 60 % :
+      l'ancien repli (`if no_show: return (0.0, 0.6), (1.0, 0.6)`) a été supprimé.
+    - Si --no-show est demandé sans interface graphique disponible, affiche une erreur claire
+      indiquant qu'une calibration manuelle est impossible sans affichage.
+    - Retourne les deux points en coordonnées normalisées entre 0 et 1.
+    """
+    is_headless = bool(headless_requested or no_show)
+    if isinstance(source_or_config, PipelineConfig):
+        cfg = source_or_config
+        src = source if source is not None else cfg.source.default
+        w_name = window_name or f"{cfg.display.window_name} - ligne de comptage"
+        side = inside_side or cfg.line.inside_side
+        min_ratio = min_length_ratio if min_length_ratio is not None else cfg.line.min_length_ratio
     else:
-        line_p1, line_p2 = (0.0, 0.0), (0.0, 0.0)
-        line2_p1 = line2_p2 = None
+        src = source_or_config if source is None else source
+        w_name = window_name or "People counting - ligne de comptage"
+        side = inside_side or "negative"
+        min_ratio = min_length_ratio if min_length_ratio is not None else 0.05
 
-    dead_inside = args.dead_zone_inside if args.dead_zone_inside is not None else args.dead_zone
-    id_manager = IDManager(confirmation_confidence=0.75)
-    stabilizer = None if args.no_stabilizer else AnchorStabilizer(tolerance_px=args.stabilizer_tolerance)
-    locker = BBoxHeightLocker(min_height_ratio=0.70)
-    occupancy = OccupancyManager(
-        line_p1=line_p1,
-        line_p2=line_p2,
-        line2_p1=line2_p1,
-        line2_p2=line2_p2,
-        gate_width_px=args.gate_width,
-        dead_zone_margin=args.dead_zone,
-        dead_zone_inside=dead_inside,
-        init_duration_frames=args.warmup_frames,
-        confirmation_threshold=args.confirm_frames,
-        grace_period_frames=args.grace_frames,
-        is_zenithal=args.zenithal,
+    if is_headless and not display_available():
+        raise CalibrationUnavailable(
+            "Calibration manuelle impossible : --no-show a été demandé et aucune "
+            "interface graphique n'est disponible, la première image ne peut donc "
+            "pas être affichée. La ligne virtuelle doit être définie à la main "
+            "(deux clics puis « C ») : le comptage n'est pas lancé."
+        )
+
+    return select_line(
+        src,
+        inside_side=side,
+        min_length_ratio=min_ratio,
+        window_name=w_name,
     )
 
-    writer = None
-    window_initialized = False
-    frame_index = 0
-    pred_events: list[dict] = []
 
-    results = model.track(
-        source=int(args.source) if args.source.isdigit() else args.source,
-        tracker=args.tracker,
-        persist=True,
-        classes=[0],
-        conf=args.conf,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        show=False,
-        stream=True,
+def perform_line_selection(
+    config: PipelineConfig,
+    source: int | str,
+    *,
+    headless_requested: bool = False,
+    **kwargs: Any,
+) -> ValidatedLine:
+    """Point d'entrée du pipeline pour la calibration manuelle obligatoire."""
+    return calibrate(
+        config,
+        source,
+        headless_requested=headless_requested,
+        **kwargs,
+    )
+
+
+#: Type d'événement et code de sortie par cause d'échec de sélection.
+_LINE_FAILURES: tuple[tuple[type[BaseException], str, int], ...] = (
+    (SourceUnreadable, "SOURCE_ERROR", 5),
+    (CalibrationUnavailable, "LINE_CALIBRATION_UNAVAILABLE", 4),
+    (CalibrationCancelled, "LINE_CALIBRATION_CANCELLED", 4),
+)
+
+
+def abort_line_selection(
+    *,
+    logger: EventLogger,
+    session_root: Path,
+    session_id: str,
+    error: BaseException,
+    start_s: float,
+) -> int:
+    """Journalise explicitement un échec de sélection et arrête sans compter.
+
+    Aucun comptage n'a lieu : ni occupation, ni IN/OUT, ni vidéo annotée. Le
+    motif est écrit dans le journal de session et sur la sortie d'erreur.
+    """
+    event_type, exit_code = "LINE_CALIBRATION_CANCELLED", 4
+    for failure_type, failure_event, failure_code in _LINE_FAILURES:
+        if isinstance(error, failure_type):
+            event_type, exit_code = failure_event, failure_code
+            break
+
+    elapsed = time.perf_counter() - start_s
+    details: dict[str, Any] = {"frames_processed": 0}
+    if event_type == "SOURCE_ERROR":
+        details["error"] = f"{type(error).__name__}: {error}"
+    else:
+        details["reason"] = str(error)
+    logger.emit(event_type, elapsed, 0, **details)
+    logger.emit(
+        "SESSION_END", elapsed, 0, frames_processed=0, duration_s=round(elapsed, 3),
+        fps_mean=0.0,
+    )
+    write_json(
+        session_root / "summary.json",
+        {
+            "session_id": session_id,
+            "aborted": event_type,
+            "reason": str(error),
+            "frames_processed": 0,
+            "counters": None,
+            "message": "Ligne virtuelle non validée : aucun comptage n'a été lancé.",
+        },
+    )
+    print(f"[LIGNE] {error}", file=sys.stderr)
+    print(
+        "[LIGNE] Aucun comptage lancé : la ligne virtuelle doit être définie et "
+        "validée par l'opérateur (« C »).",
+        file=sys.stderr,
+    )
+    logger.close()
+    return exit_code
+
+
+# ---------------------------------------------------------------------------
+# Boucle principale
+# ---------------------------------------------------------------------------
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    try:
+        config = load_config(args.config)
+        config = apply_cli_overrides(config, args)
+    except ConfigError as error:
+        print(f"[CONFIG] {error}", file=sys.stderr)
+        return 2
+
+    source = resolve_source(config.source.default)
+    model_path = config.resolve_path(config.model.path)
+    tracker_path = config.resolve_path(config.tracker.config_path)
+    session_id = args.session_id or new_session_id()
+    session_root = prepare_session(config, session_id)
+
+    display_enabled = config.display.enabled
+    write_video = config.output.write_video
+    no_detection_seconds = config.source.no_detection_seconds
+
+    writer: cv2.VideoWriter | None = None
+    video_path = session_root / config.output.video_filename
+    buffered_rendered: list[Any] = []
+    profiler = LatencyProfiler()
+    fps_estimator = FpsEstimator(window=config.timing.fps_estimate_window)
+    logger = EventLogger(
+        session_root / config.output.events_filename,
+        session_id=session_id,
+        flush_every_n_events=config.output.flush_every_n_events,
+    )
+    budget: FrameBudget | None = None
+    start_s = time.perf_counter()
+
+    try:
+        model_sha256 = verify_weights(model_path, config.model.expected_sha256)
+    except (FileNotFoundError, ConfigError) as error:
+        print(f"[MODEL] {error}", file=sys.stderr)
+        logger.close()
+        return 3
+    if not tracker_path.exists():
+        print(f"[TRACKER] Configuration introuvable : {tracker_path}", file=sys.stderr)
+        logger.close()
+        return 3
+
+    logger.emit(
+        "SESSION_START",
+        0.0,
+        0,
+        config_path=str(config.config_path),
+        source=str(source),
+        model_path=str(model_path),
+        model_sha256=model_sha256,
+        fps_source=config.timing.fps_source,
+        line_policy="manual_required",
+        mode=args.mode,
+    )
+    print(
+        f"[MODE] {args.mode} | source={source} | étape 1/2 : définition manuelle "
+        "de la ligne virtuelle (la première image va s'afficher)"
+    )
+
+    # -- Ligne virtuelle : sélection manuelle obligatoire --------------------
+    # Aucun repli n'est possible : sans ligne validée par l'opérateur, le
+    # comptage ne démarre pas (et le refus est journalisé, jamais silencieux).
+    try:
+        validated = perform_line_selection(
+            config, source, headless_requested=args.no_show
+        )
+    except (SourceUnreadable, CalibrationUnavailable, CalibrationCancelled) as error:
+        return abort_line_selection(
+            logger=logger,
+            session_root=session_root,
+            session_id=session_id,
+            error=error,
+            start_s=start_s,
+        )
+
+    # L'orientation effectivement retenue dans la fenêtre est celle appliquée à
+    # tout le reste du pipeline: dessin, distance signée, franchissements,
+    # comptage. Elle est figée dans la configuration résolue de la session.
+    config = override_config(config, {"line": {"inside_side": validated.inside_side}})
+    resolved_config_path = write_resolved_config(config, session_root, session_id)
+    calibration_path = session_root / "calibration.json"
+    write_json(
+        calibration_path,
+        {"session_id": session_id, "source": str(source), "line": validated.to_dict()},
+    )
+    logger.emit(
+        "LINE_VALIDATED",
+        0.0,
+        0,
+        p1=list(validated.p1),
+        p2=list(validated.p2),
+        inside_side=validated.inside_side,
+        frame_resolution=[validated.frame_width, validated.frame_height],
+        length_normalized=round(validated.length_ratio, 6),
+        display_scale=round(validated.display_scale, 6),
+        confirmed_at=validated.confirmed_at,
+        calibration_path=str(calibration_path),
     )
 
     try:
-        for result in results:
-            t_start = time.perf_counter()
+        line = VirtualLine(
+            p1=validated.p1,
+            p2=validated.p2,
+            inside_side=validated.inside_side,
+            on_line_policy=config.line.on_line_policy,
+            min_length_ratio=config.line.min_length_ratio,
+        )
+    except (LineError, KeyError) as error:  # défense en profondeur : ligne déjà validée
+        print(f"[LINE] {error}", file=sys.stderr)
+        logger.close()
+        return 4
+
+    locker = (
+        BBoxHeightLocker(min_height_ratio=config.stabilization.bbox_locker_min_height_ratio)
+        if config.stabilization.use_bbox_locker
+        else None
+    )
+    stabilizer = (
+        AnchorStabilizer(tolerance_px=1.0) if config.stabilization.use_anchor_stabilizer else None
+    )
+    occupancy = OccupancyManager(
+        config,
+        event_sink=logger,
+        line=line,
+        bbox_locker=locker,
+        anchor_stabilizer=stabilizer,
+        profiler=profiler,
+    )
+
+    frame_index = 0
+    last_detection_s = 0.0
+    no_detection_announced = False
+
+    print(
+        f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
+        f"| ligne(manuelle)={line.p1}->{line.p2} | intérieur={line.inside_side} "
+        f"| headless={not display_enabled}"
+    )
+
+    try:
+        from ultralytics import YOLO  # import tardif : évite de charger torch pour --help
+
+        model = YOLO(str(model_path))
+        generator = model.track(
+            source=source,
+            tracker=str(tracker_path),
+            persist=config.tracker.persist,
+            classes=list(config.model.classes),
+            conf=config.model.confidence,
+            iou=config.model.nms_iou,
+            imgsz=config.model.image_size,
+            show=False,
+            stream=True,
+            verbose=False,
+        )
+    except Exception as error:
+        # Source inouvrable : cas distinct d'une fin de flux (spec 5.5).
+        logger.emit(
+            "SOURCE_ERROR",
+            0.0,
+            0,
+            error=f"{type(error).__name__}: {error}",
+            frames_processed=0,
+        )
+        print(f"[SOURCE] Ouverture impossible : {error}", file=sys.stderr)
+        _finalize(
+            logger=logger, occupancy=occupancy, profiler=profiler,
+            fps_estimator=fps_estimator, session_root=session_root,
+            session_id=session_id, config=config,
+            resolved_config_path=resolved_config_path, model_path=model_path,
+            model_sha256=model_sha256, frames_processed=0,
+            duration_s=time.perf_counter() - start_s, budget=None,
+        )
+        logger.close()
+        return 5
+
+    # Nom de fenêtre assaini : un titre non ASCII fait échouer le backend Qt
+    # d'OpenCV (« NULL window handler ») dès qu'un callback souris est installé.
+    display_window_name = sanitize_window_name(config.display.window_name)
+    window_ready = False
+    exit_code = 0
+    try:
+        while True:
+            with Timer() as capture_timer:
+                try:
+                    result = next(generator)
+                except StopIteration:
+                    elapsed = time.perf_counter() - start_s
+                    logger.emit(
+                        "SOURCE_END_OF_STREAM", elapsed, frame_index,
+                        frames_processed=frame_index, duration_s=round(elapsed, 3),
+                    )
+                    print(f"\n[MEDIA] Fin de flux après {frame_index} frames")
+                    break
+                except Exception as error:  # source illisible, décodage cassé…
+                    elapsed = time.perf_counter() - start_s
+                    logger.emit(
+                        "SOURCE_ERROR", elapsed, frame_index,
+                        error=f"{type(error).__name__}: {error}",
+                        frames_processed=frame_index,
+                    )
+                    print(f"\n[SOURCE] Erreur de lecture : {error}", file=sys.stderr)
+                    exit_code = 5
+                    break
+            profiler.record("capture", capture_timer.ms)
+
             frame_index += 1
-            frame = result.orig_img
+            frame = getattr(result, "orig_img", None)
             if frame is None:
                 continue
-            h, w = frame.shape[:2]
-            rendered = frame.copy()
-            visible_count = 0
+            height, width = frame.shape[:2]
 
-            if result.boxes is not None and result.boxes.id is not None:
-                boxes = result.boxes.xyxy.cpu().numpy()
-                ids = result.boxes.id.int().cpu().tolist()
-                confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(ids))
-                raw_candidates: list[tuple[int, np.ndarray, float]] = []
-                for box, track_id, conf in zip(boxes, ids, confs):
-                    bbox_corrigee = locker.process_bbox(track_id, box)
-                    raw_candidates.append((track_id, bbox_corrigee, float(conf)))
+            speed = getattr(result, "speed", None) or {}
+            profiler.record("detection", float(speed.get("inference", 0.0)))
+            profiler.record("tracking", float(speed.get("postprocess", 0.0)))
 
-                # IDManager : attribution des display_id séquentiels
-                candidates = id_manager.assign_frame(
-                    raw_candidates,
-                    frame,
-                    frame_index,
-                    float(np.hypot(w, h)),
+            detections: list[Detection] = []
+            boxes = getattr(result, "boxes", None)
+            if boxes is not None and boxes.id is not None:
+                xyxy = boxes.xyxy.cpu().numpy()
+                ids = boxes.id.int().cpu().tolist()
+                confidences = (
+                    boxes.conf.cpu().numpy() if boxes.conf is not None else [1.0] * len(ids)
                 )
-                visible_count = len(candidates)
-
-                # Stabilisation cinématique du point d'ancrage guidée par la tête
-                if stabilizer is not None and not args.zenithal:
-                    stabilized_candidates = []
-                    for track_id, display_id, anchor, box, conf in candidates:
-                        stab_anchor = stabilizer.get_stabilized_anchor(track_id, box)
-                        stabilized_candidates.append((track_id, display_id, stab_anchor, box, conf))
-                    candidates = stabilized_candidates
-                    stabilizer.purge_lost_tracks(set(ids))
-                locker.purge_lost_tracks(set(ids))
-
-                if counting_enabled:
-                    # OccupancyManager : FSM + comptage
-                    events = occupancy.process_frame(
-                        candidates=candidates,
-                        frame=frame,
-                        frame_index=frame_index,
-                        features=id_manager.features,
+                for box, track_id, confidence in zip(xyxy, ids, confidences):
+                    detections.append(
+                        Detection(
+                            technical_track_id=int(track_id),
+                            bbox=box,
+                            confidence=float(confidence),
+                        )
                     )
-                    for evt in events:
-                        evt["latency_ms"] = round((time.perf_counter() - t_start) * 1000, 2)
-                        pred_events.append(evt)
 
-                    # Rendu avec bounding boxes colorées par état + HUD
-                    occupancy.draw_overlay(rendered, candidates, visible_count)
-                else:
-                    # Mode suivi uniquement : bounding boxes simples
-                    for track_id, display_id, point, box, conf in candidates:
-                        x1, y1, x2, y2 = map(int, box[:4])
-                        cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 80, 0), 2)
-                        cv2.circle(rendered, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
-                        label = f"ID: {display_id} person {conf:.2f}"
-                        cv2.putText(rendered, label, (x1, max(25, y1 - 8)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 80, 0), 2, cv2.LINE_AA)
-                    # HUD minimal
-                    cv2.putText(rendered, f"Present: {visible_count}", (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            timestamp_s = time.perf_counter() - start_s
+            fps_estimator.tick(timestamp_s)
+            if fps_estimator.is_ready:
+                budget = config.timing.frame_budget(fps_estimator.require_fps())
+                occupancy.set_frame_budget(budget)
+
+            occupancy.process_frame(detections, frame, timestamp_s, frame_index)
+
+            with Timer() as render_timer:
+                rendered = frame.copy()
+                occupancy.draw_overlay(rendered)
+            profiler.record("render", render_timer.ms)
+
+            if not detections:
+                if timestamp_s - last_detection_s >= no_detection_seconds:
+                    if not no_detection_announced:
+                        logger.emit(
+                            "SOURCE_NO_DETECTION", timestamp_s, frame_index,
+                            consecutive_frames=frame_index,
+                            elapsed_s=round(timestamp_s - last_detection_s, 3),
+                        )
+                        no_detection_announced = True
             else:
-                if counting_enabled:
-                    # Aucune détection : gérer les occultations
-                    occupancy.process_frame([], frame, frame_index)
-                    occupancy.draw_overlay(rendered, [], 0)
+                last_detection_s = timestamp_s
+                no_detection_announced = False
 
-            # -- Écriture vidéo --
-            if args.output and writer is None:
-                out = Path(args.output)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                capture = cv2.VideoCapture(args.source)
-                fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
-                capture.release()
-                writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-                if not writer.isOpened():
-                    raise RuntimeError(f"Impossible de créer {out}")
-                print(f"[OUTPUT] {out}")
-            if writer is not None:
-                writer.write(rendered)
+            if locker is not None or stabilizer is not None:
+                _purge_stabilizers(locker, stabilizer, detections)
 
-            # -- Affichage --
-            if not args.no_show:
-                if not window_initialized:
-                    cv2.namedWindow("People counting", cv2.WINDOW_NORMAL)
-                    window_initialized = True
-                cv2.imshow("People counting", rendered)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+            if write_video:
+                if writer is None and fps_estimator.is_ready:
+                    writer = _open_writer(video_path, config, fps_estimator.require_fps(), width, height)
+                    for buffered in buffered_rendered:
+                        writer.write(buffered)
+                    buffered_rendered.clear()
+                with Timer() as write_timer:
+                    if writer is not None:
+                        writer.write(rendered)
+                    else:
+                        buffered_rendered.append(rendered)
+                profiler.record("write", write_timer.ms)
+
+            if display_enabled:
+                try:
+                    if not window_ready:
+                        cv2.namedWindow(display_window_name, cv2.WINDOW_NORMAL)
+                        window_ready = True
+                    cv2.imshow(display_window_name, rendered)
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
+                        print("\n[CONTROL] Arrêt demandé par l'opérateur")
+                        break
+                except cv2.error as error:
+                    print(f"[DISPLAY] Affichage indisponible, passage en headless : {error}")
+                    display_enabled = False
             else:
-                if counting_enabled:
-                    print(
-                        f"\r[LIVE] OCCUPANCY={occupancy.occupancy_count} "
-                        f"IN={occupancy.total_in} OUT={occupancy.total_out} "
-                        f"NEW={occupancy.total_new_presences} "
-                        f"VISIBLE={visible_count} PHASE={occupancy.phase}",
-                        end="",
-                    )
-                else:
-                    print(f"\r[LIVE] PRESENT={visible_count}", end="")
+                print(
+                    f"\r[LIVE] CONFIRMEE={occupancy.occupancy_confirmed} "
+                    f"INCERTAINE={occupancy.occupancy_uncertain} "
+                    f"IN={occupancy.total_in} OUT={occupancy.total_out} "
+                    f"NEW={occupancy.total_new} PHASE={occupancy.phase}",
+                    end="",
+                    flush=True,
+                )
 
+            if args.max_frames is not None and frame_index >= args.max_frames:
+                print(f"\n[CONTROL] Arrêt après {frame_index} frames (--max-frames)")
+                break
+
+    except KeyboardInterrupt:
+        print("\n[CONTROL] Interruption clavier : arrêt propre")
     finally:
         if writer is not None:
             writer.release()
-        if not args.no_show:
+        if display_enabled:
             cv2.destroyAllWindows()
-        if counting_enabled:
-            print(
-                f"\n[FINAL] OCCUPANCY={occupancy.occupancy_count} "
-                f"IN={occupancy.total_in} OUT={occupancy.total_out} "
-                f"NEW={occupancy.total_new_presences}"
-            )
-        else:
-            print(f"\n[FINAL] Session terminée.")
+        _finalize(
+            logger=logger,
+            occupancy=occupancy,
+            profiler=profiler,
+            fps_estimator=fps_estimator,
+            session_root=session_root,
+            session_id=session_id,
+            config=config,
+            resolved_config_path=resolved_config_path,
+            model_path=model_path,
+            model_sha256=model_sha256,
+            frames_processed=frame_index,
+            duration_s=time.perf_counter() - start_s,
+            budget=budget,
+        )
+        logger.close()
 
-    if pred_events:
-        with open("predictions_systeme.json", "w", encoding="utf-8") as f:
-            json.dump(pred_events, f, indent=4)
+    return exit_code
+
+
+def _purge_stabilizers(locker, stabilizer, detections: Sequence[Detection]) -> None:
+    active = {int(detection.technical_track_id) for detection in detections}
+    if locker is not None:
+        locker.purge_lost_tracks(active)
+    if stabilizer is not None:
+        stabilizer.purge_lost_tracks(active)
+
+
+def _open_writer(
+    path: Path, config: PipelineConfig, fps: float, width: int, height: int
+) -> cv2.VideoWriter:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    codec = config.output.annotated_video_codec
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*codec), fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Impossible de créer la vidéo de sortie : {path}")
+    return writer
+
+
+def _finalize(
+    *,
+    logger: EventLogger,
+    occupancy: OccupancyManager,
+    profiler: LatencyProfiler,
+    fps_estimator: FpsEstimator,
+    session_root: Path,
+    session_id: str,
+    config: PipelineConfig,
+    resolved_config_path: Path,
+    model_path: Path,
+    model_sha256: str,
+    frames_processed: int,
+    duration_s: float,
+    budget: FrameBudget | None,
+) -> None:
+    """Écrit le bilan de session : événement final, résumé, environnement (spec 6.5)."""
+    latency = profiler.summary()
+    snapshot = occupancy.snapshot()
+    fps_mean = fps_estimator.fps
+    logger.emit(
+        "SESSION_END",
+        duration_s,
+        frames_processed,
+        frames_processed=frames_processed,
+        duration_s=round(duration_s, 3),
+        fps_mean=round(fps_mean, 3) if fps_mean else 0.0,
+        fps_median=round(fps_estimator.fps_median or 0.0, 3),
+        fps_min=round(fps_estimator.fps_min or 0.0, 3),
+        occupancy_confirmed=snapshot.confirmed,
+        occupancy_uncertain=snapshot.uncertain,
+        total_in=snapshot.total_in,
+        total_out=snapshot.total_out,
+        total_new=snapshot.total_new,
+        latency_ms=latency,
+    )
+    summary = {
+        "session_id": session_id,
+        "config_path": str(config.config_path),
+        "resolved_config_path": str(resolved_config_path),
+        "model_path": str(model_path),
+        "model_sha256": model_sha256,
+        "dependencies": dependency_versions(),
+        "frames_processed": frames_processed,
+        "duration_s": round(duration_s, 3),
+        "fps": {
+            "mean": round(fps_mean, 3) if fps_mean else None,
+            "median": round(fps_estimator.fps_median, 3) if fps_estimator.fps_median else None,
+            "min": round(fps_estimator.fps_min, 3) if fps_estimator.fps_min else None,
+            "source": config.timing.fps_source,
+            "measured_samples": fps_estimator.samples,
+        },
+        "frame_budget": None if budget is None else budget.to_dict(),
+        "bootstrap_frames": occupancy.bootstrap_frames,
+        "counters": {
+            "initial_occupancy": snapshot.initial,
+            "occupancy_confirmed": snapshot.confirmed,
+            "occupancy_uncertain": snapshot.uncertain,
+            "occupancy_range": [snapshot.range_low, snapshot.range_high],
+            "total_in": snapshot.total_in,
+            "total_out": snapshot.total_out,
+            "total_new": snapshot.total_new,
+        },
+        "latency_ms": latency,
+        "events_written": logger.event_count,
+    }
+    write_json(session_root / "summary.json", summary)
+    write_json(session_root / "environment.json", dependency_versions())
+
+    print(
+        f"\n[BILAN] OCCUPATION_CONFIRMEE={snapshot.confirmed} "
+        f"INCERTAINE={snapshot.uncertain} RANGE=[{snapshot.range_low}, {snapshot.range_high}] "
+        f"IN={snapshot.total_in} OUT={snapshot.total_out} NEW={snapshot.total_new}"
+    )
+    if latency:
+        worst = sorted(latency.items(), key=lambda item: -item[1]["p95_ms"])
+        print("[LATENCE P95] " + ", ".join(f"{stage}={data['p95_ms']:.1f}ms" for stage, data in worst))
+    print(f"[RESULTATS] {session_root}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

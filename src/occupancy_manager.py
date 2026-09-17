@@ -1,634 +1,929 @@
-"""Gestionnaire d'occupation robuste avec machine à états, hystérésis et warm-up.
+"""Gestionnaire d'occupation : cœur métier du pipeline (spec 4, 5.4, 5.8).
 
-Ce module implémente OccupancyManager, le cœur du système de comptage :
-- Intersection vectorielle stricte CCW pour détecter les franchissements de ligne
-- Machine à états (TrackState) pour chaque personne avec anti-rebond par hystérésis
-- Zone morte (hystérésis) autour de la ligne virtuelle
-- Phase de warm-up pour calibrer l'effectif initial
-- Gestion des occultations (disparition ≠ sortie)
-- Réassociation ReID des pistes perdues
+Ce module a été **corrigé** et non dupliqué : il garde son nom, son rôle et sa
+place sur le chemin unique. La logique de transition a migré dans la table
+explicite de :mod:`fsm`, la géométrie dans :mod:`geometry`, l'identité dans
+:mod:`identity_manager`. Il ne reste ici que l'orchestration et la comptabilité.
 
-Formule : occupancy = initial_occupancy + total_in + total_new_presences - total_out
+Corrections apportées par rapport à l'audit (§2.2) :
+
+- **plus de pixels absolus** : la zone morte vaut
+  ``geometry.dead_zone_ratio × hauteur médiane des bbox`` ;
+- **plus de durées en frames** : les fenêtres proviennent de
+  :class:`config.FrameBudget`, dérivé du FPS **mesuré** ;
+- **occupation encadrée** (spec 4.4) : ``occupancy_confirmed``,
+  ``occupancy_uncertain`` et ``occupancy_range`` sont publiés à intervalle
+  régulier, au lieu d'un entier unique qui ne pouvait que croître ;
+- **garde-fous explicites** (spec 4.5) : OUT sans IN, double réassociation,
+  occupation négative → événement ``INCONSISTENT_STATE``, jamais un
+  ``max(0, ...)`` muet ;
+- **purge jamais silencieuse** (spec 3.4) : chaque ``person_id`` purgé produit un
+  événement ``PURGE`` avant sa suppression ;
+- **disparition en cours de franchissement** (spec 4.3) : traitée par la
+  politique ``deferred_confirmation`` avec ``AMBIGUOUS_CROSSING`` à
+  l'expiration — jamais de IN/OUT confirmé sur simple disparition ;
+- **ancre au bord** (spec 5.4) : décision de franchissement suspendue, avec
+  événement ``ANCHOR_UNRELIABLE``.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Sequence
 
 import cv2
 import numpy as np
 
-from occupancy_types import LogicalTrack, OriginType, TrackState, Zone
+from anchor_stabilizer import AnchorStabilizer
+from bbox_height_locker import BBoxHeightLocker
+from config import FrameBudget, PipelineConfig
+from events import EventSink
+from fsm import Action, Approach, Decision, FsmContext, StateMachine, TrackState
+from geometry import (
+    AnchorReliability,
+    LocalScale,
+    Side,
+    VirtualLine,
+    Zone,
+    anchor_reliability,
+    compute_anchor,
+    side_of,
+    zone_of,
+)
+from identity_manager import IdentityManager, Observation
+from metrics import LatencyProfiler, Timer
+from occupancy_types import OccupancySnapshot, OriginType, PersonTrack
 
 
-# ---------------------------------------------------------------------------
-# Paramètres par défaut (surchargeables via config YAML ou CLI)
-# ---------------------------------------------------------------------------
-DEFAULT_DEAD_ZONE_MARGIN = 20.0      # Pixels d'hystérésis extérieur
-DEFAULT_DEAD_ZONE_INSIDE = 10.0      # Pixels d'hystérésis intérieur (réduit pour valider IN plus facilement)
-DEFAULT_INIT_DURATION_FRAMES = 15    # Frames de warm-up (~500ms à 30fps)
-DEFAULT_CONFIRMATION_THRESHOLD = 6   # Frames pour confirmer une présence (~200ms à 30fps)
-DEFAULT_GRACE_PERIOD_FRAMES = 300    # Frames avant purge d'une piste occultée
-DEFAULT_REID_THRESHOLD = 0.78        # Seuil de similarité ReID
-DEFAULT_TRAJECTORY_MAXLEN = 60       # Taille max de l'historique de trajectoire
+@dataclass(frozen=True)
+class Detection:
+    """Détection brute d'une frame, avant toute identité logique."""
+
+    technical_track_id: int
+    bbox: np.ndarray | tuple[float, float, float, float]
+    confidence: float = 1.0
 
 
-# ---------------------------------------------------------------------------
-# Géométrie vectorielle
-# ---------------------------------------------------------------------------
-def _ccw(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> bool:
-    """Orientation CCW stricte (counter-clockwise)."""
-    return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+@dataclass
+class _View:
+    """Vue minimale utilisée par le rendu."""
+
+    person_id: int
+    technical_track_id: int
+    bbox: np.ndarray | tuple[float, float, float, float]
+    anchor: tuple[float, float]
+    state: TrackState
+    provisional: bool
 
 
-def check_line_crossing(
-    p1: tuple[float, float],
-    p2: tuple[float, float],
-    line_start: tuple[float, float],
-    line_end: tuple[float, float],
-) -> bool:
-    """Intersection stricte entre le segment [p1→p2] et [line_start→line_end] via CCW."""
-    return (
-        _ccw(p1, line_start, line_end) != _ccw(p2, line_start, line_end)
-        and _ccw(p1, p2, line_start) != _ccw(p1, p2, line_end)
-    )
-
-
-def signed_perpendicular_distance(
-    pt: tuple[float, float],
-    line_start: tuple[float, float],
-    line_end: tuple[float, float],
-) -> float:
-    """Distance orthogonale signée d'un point par rapport à la ligne.
-
-    Par produit vectoriel 2D normalisé avec le vecteur directeur (line_start -> line_end).
-    Signe positif (> 0) : côté A
-    Signe négatif (< 0) : côté B
-    """
-    dx = line_end[0] - line_start[0]
-    dy = line_end[1] - line_start[1]
-    norm = float(np.hypot(dx, dy))
-    if norm < 1e-6:
-        return 0.0
-    return float(((pt[0] - line_start[0]) * dy - (pt[1] - line_start[1]) * dx) / norm)
-
-
-def classify_zone(
-    dist: float,
-    dead_zone_margin: float,
-    dead_zone_inside: float | None = None,
-) -> Zone:
-    """Classifie un point selon sa distance signée à la ligne."""
-    m_out = dead_zone_margin
-    m_in = dead_zone_inside if dead_zone_inside is not None else dead_zone_margin
-    if dist > m_out:
-        return Zone.EXTERIEURE
-    elif dist < -m_in:
-        return Zone.INTERIEURE
-    return Zone.MORTE
-
-
-def compute_anchor(
-    box: np.ndarray,
-    is_zenithal: bool = False,
-) -> tuple[float, float]:
-    """Calcule le point d'ancrage d'une bounding box.
-
-    Perspective standard : centre bas [x_center, y_max] (pieds).
-    Vue zénithale : centre de la boîte [x_center, y_center].
-    """
-    x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
-    x_center = (x1 + x2) / 2.0
-    if is_zenithal:
-        return (x_center, (y1 + y2) / 2.0)
-    return (x_center, y2)
-
-
-# ---------------------------------------------------------------------------
-# Couleurs par état
-# ---------------------------------------------------------------------------
 STATE_COLORS: dict[TrackState, tuple[int, int, int]] = {
-    TrackState.PRESENTE: (0, 255, 0),           # Vert
-    TrackState.NOUVELLE_PRESENCE: (0, 255, 0),   # Vert
-    TrackState.OCCULTEE: (0, 165, 255),          # Orange
-    TrackState.EN_ZONE_LIGNE: (0, 255, 255),     # Jaune
-    TrackState.SORTIE_CONFIRMEE: (0, 0, 255),    # Rouge
-    TrackState.A_RETOURNE: (0, 255, 0),          # Vert
+    TrackState.INITIALISATION: (200, 200, 200),
+    TrackState.PRESENTE: (0, 255, 0),
+    TrackState.EXTERIEUR: (255, 128, 0),
+    TrackState.EN_ZONE_MORTE: (0, 255, 255),
+    TrackState.ENTREE_EN_COURS: (0, 255, 160),
+    TrackState.SORTIE_EN_COURS: (255, 255, 0),
+    TrackState.OCCULTEE: (0, 165, 255),
+    TrackState.ABSENTE: (0, 0, 255),
 }
 
 
 class OccupancyManager:
-    """Gestionnaire d'occupation par machine à états finis et intersection vectorielle.
-
-    Args:
-        line_p1: Premier point de la ligne (coordonnées normalisées 0–1).
-        line_p2: Second point de la ligne (coordonnées normalisées 0–1).
-        dead_zone_margin: Épaisseur de la zone morte (hystérésis) en pixels.
-        init_duration_frames: Nombre de frames de warm-up.
-        confirmation_threshold: Frames consécutives pour confirmer une nouvelle présence.
-        grace_period_frames: Délai avant purge d'une piste occultée.
-        reid_threshold: Seuil minimal de similarité ReID.
-        is_zenithal: Utiliser le centre de boîte au lieu du bas.
-    """
+    """Assemble machine à états, identités, comptage et occupation encadrée."""
 
     def __init__(
         self,
-        line_p1: tuple[float, float],
-        line_p2: tuple[float, float],
-        line2_p1: tuple[float, float] | None = None,
-        line2_p2: tuple[float, float] | None = None,
-        gate_width_px: float = 0.0,
-        dead_zone_margin: float = DEFAULT_DEAD_ZONE_MARGIN,
-        dead_zone_inside: float | None = None,
-        init_duration_frames: int = DEFAULT_INIT_DURATION_FRAMES,
-        confirmation_threshold: int = DEFAULT_CONFIRMATION_THRESHOLD,
-        grace_period_frames: int = DEFAULT_GRACE_PERIOD_FRAMES,
-        reid_threshold: float = DEFAULT_REID_THRESHOLD,
-        is_zenithal: bool = False,
+        config: PipelineConfig,
+        event_sink: EventSink | None = None,
+        line: VirtualLine | None = None,
+        identity_manager: IdentityManager | None = None,
+        budget: FrameBudget | None = None,
+        machine: StateMachine | None = None,
+        bbox_locker: BBoxHeightLocker | None = None,
+        anchor_stabilizer: AnchorStabilizer | None = None,
+        profiler: LatencyProfiler | None = None,
     ) -> None:
-        # Ligne virtuelle (normalisée)
-        self.line_p1 = line_p1
-        self.line_p2 = line_p2
-        self.line2_p1 = line2_p1
-        self.line2_p2 = line2_p2
-        self.gate_width_px = gate_width_px
+        self.config = config
+        self.event_sink = event_sink
+        self.budget = budget
+        self.machine = machine or StateMachine()
+        self.profiler = profiler
 
-        # Paramètres
-        self.dead_zone_margin = dead_zone_margin
-        self.dead_zone_inside = dead_zone_inside if dead_zone_inside is not None else dead_zone_margin
-        self.init_duration_frames = init_duration_frames
-        self.confirmation_threshold = confirmation_threshold
-        self.grace_period_frames = grace_period_frames
-        self.reid_threshold = reid_threshold
-        self.is_zenithal = is_zenithal
+        self.line = line
+        if self.line is None:
+            # Aucune ligne par défaut : la ligne est obligatoirement celle validée
+            # par l'opérateur au démarrage (voir :mod:`calibration`). Refuser ici
+            # rend impossible toute divergence entre la ligne affichée et celle
+            # utilisée pour la distance signée, les franchissements et le comptage.
+            raise ValueError(
+                "OccupancyManager exige la ligne validée par l'opérateur "
+                "(paramètre `line`) : aucune ligne par défaut n'est admise."
+            )
+        self.scale = LocalScale(window=config.geometry.scale_window)
+        self.identities = identity_manager or IdentityManager(
+            long_term=config.reid.long_term,
+            external_reid=config.reid.external_reid,
+            grace_period_seconds=config.timing.grace_period_seconds,
+            event_sink=event_sink,
+        )
+        self.bbox_locker = bbox_locker
+        self.anchor_stabilizer = anchor_stabilizer
 
-        # Registre des pistes logiques (clé = logical_id)
-        self.tracks: dict[int, LogicalTrack] = {}
-        # Mapping track_id technique → logical_id
-        self.tech_to_logical: dict[int, int] = {}
-        self.next_logical_id: int = 1
+        self.tracks: dict[int, PersonTrack] = {}
+        self.initial_occupancy = 0
+        self.total_in = 0
+        self.total_out = 0
+        self.total_new = 0
 
-        # Compteurs
-        self.initial_occupancy: int = 0
-        self.total_in: int = 0
-        self.total_out: int = 0
-        self.total_new_presences: int = 0
+        #: Identités purgées sans sortie observée (borne haute de l'occupation).
+        self._uncertain: set[int] = set()
+        self._warmup_done = False
+        self._frames = 0
+        self._bootstrapping_frames = 0
+        self._last_snapshot_s: float | None = None
+        self._frame_size: tuple[int, int] = (0, 0)
+        self._views: list[_View] = []
 
-        # Phase
-        self._warmup_candidates: dict[int, int] = {}  # logical_id → frames consécutives intérieures
-        self._warmup_done: bool = False
-
-    # -----------------------------------------------------------------------
-    # Propriétés
-    # -----------------------------------------------------------------------
-    @property
-    def occupancy_count(self) -> int:
-        """Effectif logique courant."""
-        return max(0, self.initial_occupancy + self.total_in + self.total_new_presences - self.total_out)
-
+    # ------------------------------------------------------------------
+    # Propriétés d'état
+    # ------------------------------------------------------------------
     @property
     def phase(self) -> str:
-        return "WARMUP" if not self._warmup_done else "RUNNING"
+        if self.budget is None:
+            return "BOOTSTRAP"
+        return "RUNNING" if self._warmup_done else "WARMUP"
+
+    @property
+    def occupancy_confirmed(self) -> int:
+        """Entrées confirmées sans sortie confirmée (spec 4.4)."""
+        return sum(
+            1
+            for track in self.tracks.values()
+            if track.inside_occupancy and track.state is not TrackState.ABSENTE
+        )
+
+    @property
+    def occupancy_uncertain(self) -> int:
+        """Personnes purgées sans sortie observée, cumulées sur la session (spec 4.4).
+
+        Le compte survit à la libération de la mémoire de galerie : sans cela,
+        la borne haute de l'occupation s'effondrerait dès qu'une identité est
+        oubliée, ce qui masquerait précisément les sorties non observées que
+        l'encadrement doit rendre visibles.
+        """
+        return len(self._uncertain)
+
+    @property
+    def occupancy_range(self) -> tuple[int, int]:
+        confirmed = self.occupancy_confirmed
+        return (confirmed, confirmed + self.occupancy_uncertain)
+
+    @property
+    def occupancy_count(self) -> int:
+        """Effectif confirmé (nom conservé pour le HUD et l'évaluation)."""
+        return self.occupancy_confirmed
 
     @property
     def visible_count(self) -> int:
-        """Nombre de pistes actuellement visibles (non occultées, non sorties)."""
-        return sum(
-            1 for t in self.tracks.values()
-            if t.state not in (TrackState.OCCULTEE, TrackState.SORTIE_CONFIRMEE)
-        )
+        return sum(1 for track in self.tracks.values() if track.is_visible)
 
     @property
     def occluded_count(self) -> int:
-        """Nombre de pistes actuellement occultées."""
-        return sum(1 for t in self.tracks.values() if t.state == TrackState.OCCULTEE)
+        return sum(1 for track in self.tracks.values() if track.state is TrackState.OCCULTEE)
 
-    # -----------------------------------------------------------------------
-    # Ligne en pixels
-    # -----------------------------------------------------------------------
-    def line_px(self, width: int, height: int) -> tuple[tuple[float, float], tuple[float, float]]:
-        """Convertit la ligne normalisée en coordonnées pixels."""
-        return (
-            (self.line_p1[0] * width, self.line_p1[1] * height),
-            (self.line_p2[0] * width, self.line_p2[1] * height),
+    @property
+    def bootstrap_frames(self) -> int:
+        return self._bootstrapping_frames
+
+    def snapshot(self) -> OccupancySnapshot:
+        confirmed = self.occupancy_confirmed
+        uncertain = self.occupancy_uncertain
+        return OccupancySnapshot(
+            confirmed=confirmed,
+            uncertain=uncertain,
+            range_low=confirmed,
+            range_high=confirmed + uncertain,
+            visible=self.visible_count,
+            occluded=self.occluded_count,
+            initial=self.initial_occupancy,
+            total_in=self.total_in,
+            total_out=self.total_out,
+            total_new=self.total_new,
         )
 
-    def line2_px(self, width: int, height: int):
-        if self.line2_p1 is None or self.line2_p2 is None:
-            if self.gate_width_px <= 0:
-                return None
-            (ax, ay), (bx, by) = self.line_px(width, height)
-            dx, dy = bx - ax, by - ay
-            length = max(float(np.hypot(dx, dy)), 1.0)
-            nx, ny = dy / length, -dx / length
-            ox, oy = nx * self.gate_width_px, ny * self.gate_width_px
-            return ((ax + ox, ay + oy), (bx + ox, by + oy))
-        return (
-            (self.line2_p1[0] * width, self.line2_p1[1] * height),
-            (self.line2_p2[0] * width, self.line2_p2[1] * height),
-        )
+    # ------------------------------------------------------------------
+    # Budget temporel
+    # ------------------------------------------------------------------
+    def set_frame_budget(self, budget: FrameBudget) -> None:
+        """Fixe les fenêtres en frames à partir du FPS **mesuré** (règle 0.2)."""
+        self.budget = budget
 
-    def classify_point(self, point: tuple[float, float], width: int, height: int) -> Zone:
-        l1 = self.line_px(width, height)
-        dist = signed_perpendicular_distance(point, *l1)
-        return classify_zone(dist, self.dead_zone_margin, self.dead_zone_inside)
-
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Traitement d'une frame
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def process_frame(
         self,
-        candidates: list[tuple[int, int, tuple[float, float], np.ndarray, float]],
+        detections: Sequence[Detection],
         frame: np.ndarray,
+        timestamp_s: float,
         frame_index: int,
-        features: dict[int, np.ndarray] | None = None,
-    ) -> list[dict]:
-        """Traite les détections d'une frame et met à jour l'état d'occupation.
+    ) -> None:
+        """Traite une frame complète : identités, FSM, comptage, occupation."""
+        self._frames += 1
+        height, width = frame.shape[:2]
+        self._frame_size = (width, height)
+        self.scale.observe_many([detection.bbox for detection in detections])
 
-        Args:
-            candidates: Liste de (track_id, display_id, anchor_point, box, confidence).
-            frame: Image brute de la frame courante.
-            frame_index: Indice de la frame.
-            features: Dictionnaire optionnel display_id → vecteur d'apparence ReID.
+        if self.budget is None:
+            # Aucun FPS mesuré : les durées ne peuvent pas être converties en
+            # frames, donc aucune décision n'est prise (règle 0.2). Seule
+            # l'échelle locale est accumulée.
+            self._bootstrapping_frames += 1
+            self._views = []
+            return
 
-        Returns:
-            Liste d'événements générés (dicts avec type, id, direction, etc.).
-        """
-        h, w = frame.shape[:2]
-        l_start, l_end = self.line_px(w, h)
-        events: list[dict] = []
-        seen_logical_ids: set[int] = set()
+        budget = self.budget
+        self._update_warmup(frame_index, timestamp_s)
+        dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
+        margin_ratio = self.config.geometry.anchor_edge_margin_ratio
 
-        for track_id, display_id, anchor, box, conf in candidates:
-            dist = signed_perpendicular_distance(anchor, l_start, l_end)
-            side = "inside" if dist <= 0 else "outside"
-            zone = classify_zone(dist, self.dead_zone_margin, self.dead_zone_inside)
+        # Stabilisation optionnelle (spec 7) : la boîte brute reste disponible et
+        # la correction est journalisée avec sa raison et son seuil.
+        raw_boxes: dict[int, np.ndarray] = {}
+        corrected: dict[int, tuple[np.ndarray, tuple[float, float]]] = {}
+        for detection in detections:
+            technical_id = int(detection.technical_track_id)
+            raw = np.asarray(detection.bbox, dtype=float)
+            bbox = raw
+            if self.bbox_locker is not None:
+                bbox = np.asarray(self.bbox_locker.process_bbox(technical_id, raw), dtype=float)
+            anchor = compute_anchor(bbox)
+            if self.anchor_stabilizer is not None:
+                anchor = tuple(self.anchor_stabilizer.get_stabilized_anchor(technical_id, bbox))
+            raw_boxes[technical_id] = raw
+            corrected[technical_id] = (bbox, anchor)
 
-            # -- Association technique → logique --
-            logical_id = self._get_or_create_logical(
-                track_id, display_id, anchor, frame_index, conf, features, initial_side=side,
+        observations = [
+            Observation(
+                technical_track_id=int(detection.technical_track_id),
+                bbox=corrected[int(detection.technical_track_id)][0],
+                confidence=float(detection.confidence),
+                anchor=corrected[int(detection.technical_track_id)][1],
+                bbox_height=float(
+                    corrected[int(detection.technical_track_id)][0][3]
+                    - corrected[int(detection.technical_track_id)][0][1]
+                ),
+                anchor_reliable=(
+                    anchor_reliability(detection.bbox, width, height, margin_ratio)
+                    is AnchorReliability.FIABLE
+                ),
             )
-            seen_logical_ids.add(logical_id)
-            track = self.tracks[logical_id]
-
-            prev_pos = track.last_position
-            track.last_position = anchor
-            track.last_seen_frame = frame_index
-            track.confidence = conf
-            track.trajectory_history.append(anchor)
-            if len(track.trajectory_history) > DEFAULT_TRAJECTORY_MAXLEN:
-                track.trajectory_history = track.trajectory_history[-DEFAULT_TRAJECTORY_MAXLEN:]
-
-            feat = features.get(display_id) if features else None
-            if feat is not None:
-                track.feature_vector = feat
-
-            # -- Phase warm-up --
-            if not self._warmup_done:
-                if frame_index <= self.init_duration_frames:
-                    self._handle_warmup(logical_id, zone, frame_index)
-                    continue
-                else:
-                    self._finalize_warmup()
-
-            # -- Réactivation d'une piste occultée --
-            if track.state == TrackState.OCCULTEE:
-                if side == "inside":
-                    track.state = TrackState.PRESENTE
-                    if track.counted_in_occupancy:
-                        track.is_counted_out = False
-                    print(f"[REAPPEAR] ID {logical_id} réapparu côté intérieur → PRESENTE (déjà compté={track.counted_in_occupancy})")
-                else:
-                    # Reste dehors
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                # Ne pas faire continue : permet la détection de franchissement
-                # pendant l'occultation ou la confirmation de présence.
-
-            # -- Détection d'intersection vectorielle stricte CCW --
-            crossed = False
-            if prev_pos is not None and prev_pos != anchor:
-                crossed = check_line_crossing(prev_pos, anchor, l_start, l_end)
-
-            # -- Détection de l'intention de franchissement --
-            current_target = "outside" if side == "outside" else "inside"
-            if crossed:
-                # La trajectoire vectorielle a traversé la ligne
-                if track.counted_in_occupancy and current_target == "outside":
-                    track.pending_direction = "OUT"
-                elif not track.counted_in_occupancy and current_target == "inside":
-                    # Une personne ne peut être comptée en IN QUE SI elle n'est pas déjà dans la salle
-                    track.pending_direction = "IN"
-            elif (
-                not track.counted_in_occupancy
-                and track.pending_direction is None
-                and prev_pos is not None
-            ):
-                # Cas d'une personne masquée à l'extérieur par une autre personne :
-                # elle apparaît pour la première fois près du seuil de la porte et avance vers l'intérieur.
-                prev_dist = signed_perpendicular_distance(prev_pos, l_start, l_end)
-                door_zone = max(35.0, self.dead_zone_inside + 15.0)
-                if abs(prev_dist) <= door_zone and side == "inside" and (dist < prev_dist - 1.5):
-                    track.pending_direction = "IN"
-
-            # -- Validation par marge d'hystérésis --
-            target = track.pending_direction
-            if target == "IN" and side == "inside" and abs(dist) > self.dead_zone_inside:
-                # Entrée confirmée : valide dès que le pied sort totalement de la zone morte intérieure
-                if not track.counted_in_occupancy:
-                    is_return = track.is_counted_out
-                    track.state = TrackState.A_RETOURNE if is_return else TrackState.PRESENTE
-                    track.counted_in_occupancy = True
-                    track.is_counted_out = False
-                    track.pending_direction = None
-                    self.total_in += 1
-                    label = "retour" if is_return else "entrée"
-                    print(f"[COUNT] ID {logical_id} → IN ({label}, Total IN: {self.total_in})")
-                    events.append({"type": "IN", "id": logical_id, "frame": frame_index, "reason": label})
-                else:
-                    track.pending_direction = None
-
-            elif target == "OUT" and side == "outside" and dist > self.dead_zone_margin:
-                # Sortie confirmée : exige que le pied soit totalement et strictement hors de la zone morte extérieure
-                if track.counted_in_occupancy:
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                    track.counted_in_occupancy = False
-                    track.is_counted_out = True
-                    track.pending_direction = None
-                    self.total_out += 1
-                    print(f"[COUNT] ID {logical_id} → OUT (Total OUT: {self.total_out})")
-                    events.append({"type": "OUT", "id": logical_id, "frame": frame_index, "reason": "crossed_out"})
-                else:
-                    track.state = TrackState.SORTIE_CONFIRMEE
-                    track.pending_direction = None
-
-            elif target == "IN" and side == "outside" and dist > self.dead_zone_margin:
-                # Demi-tour vers l'extérieur : annuler la tentative d'entrée
-                track.pending_direction = None
-            elif target == "OUT" and side == "inside" and abs(dist) > self.dead_zone_inside:
-                # Demi-tour vers l'intérieur : annuler la tentative de sortie
-                track.pending_direction = None
-
-            # -- Confirmation d'une nouvelle présence apparue directement à l'intérieur --
-            if (
-                not track.counted_in_occupancy
-                and track.origin == OriginType.APPARITION_INTERIEURE
-                and side == "inside"
-                and abs(dist) > self.dead_zone_inside
-                and track.pending_direction != "IN"
-            ):
-                track.consecutive_interior_frames += 1
-                if track.consecutive_interior_frames >= self.confirmation_threshold:
-                    track.state = TrackState.NOUVELLE_PRESENCE
-                    track.counted_in_occupancy = True
-                    self.total_new_presences += 1
-                    print(f"[NEW] ID {logical_id} → NOUVELLE PRESENCE confirmée (Total NEW: {self.total_new_presences})")
-                    events.append({"type": "NEW", "id": logical_id, "frame": frame_index})
-
-        # -- Gestion des pistes disparues (occultation) --
-        self._handle_missing_tracks(seen_logical_ids, frame_index)
-
-        return events
-
-    # -----------------------------------------------------------------------
-    # Warm-up
-    # -----------------------------------------------------------------------
-    def _handle_warmup(self, logical_id: int, zone: Zone, frame_index: int) -> None:
-        """Accumule les détections stables pendant le warm-up."""
-        if zone == Zone.INTERIEURE:
-            self._warmup_candidates[logical_id] = self._warmup_candidates.get(logical_id, 0) + 1
-        else:
-            self._warmup_candidates.pop(logical_id, None)
-
-    def _finalize_warmup(self) -> None:
-        """Finalise le warm-up : compter les personnes stables comme effectif initial."""
-        stable_threshold = max(1, min(5, self.init_duration_frames // 3))
-        for logical_id, count in self._warmup_candidates.items():
-            if count >= stable_threshold and logical_id in self.tracks:
-                self.tracks[logical_id].state = TrackState.PRESENTE
-                self.tracks[logical_id].origin = OriginType.INITIALISATION
-                self.tracks[logical_id].counted_in_occupancy = True
-                self.initial_occupancy += 1
-        self._warmup_done = True
-        self._warmup_candidates.clear()
-        print(f"[WARMUP] Phase terminée. Effectif initial : {self.initial_occupancy}")
-
-    # -----------------------------------------------------------------------
-    # Association et création de pistes
-    # -----------------------------------------------------------------------
-    def _get_or_create_logical(
-        self,
-        track_id: int,
-        display_id: int,
-        anchor: tuple[float, float],
-        frame_index: int,
-        conf: float,
-        features: dict[int, np.ndarray] | None,
-        initial_side: str = "inside",
-    ) -> int:
-        """Retourne le logical_id associé au track_id, ou en crée un nouveau."""
-        if track_id in self.tech_to_logical:
-            return self.tech_to_logical[track_id]
-
-        # Tentative de réassociation ReID avec une piste occultée
-        if features and display_id in features:
-            new_feat = features[display_id]
-            if new_feat is not None:
-                match_id = self._try_reid_match(new_feat, frame_index)
-                if match_id is not None:
-                    self.tech_to_logical[track_id] = match_id
-                    self.tracks[match_id].technical_track_id = track_id
-                    print(f"[RE-ID OCCUPANCY] track_id={track_id} réassocié → logical_id={match_id}")
-                    return match_id
-
-        logical_id = self.next_logical_id
-        self.next_logical_id += 1
-        self.tech_to_logical[track_id] = logical_id
-
-        feat = features.get(display_id) if features else None
-        if initial_side == "outside":
-            init_state = TrackState.SORTIE_CONFIRMEE
-            init_origin = OriginType.ENTREE_LIGNE
-            counted = False
-        else:
-            init_state = TrackState.PRESENTE
-            init_origin = OriginType.APPARITION_INTERIEURE
-            counted = False
-
-        track = LogicalTrack(
-            logical_id=logical_id,
-            technical_track_id=track_id,
-            state=init_state,
-            origin=init_origin,
-            last_position=anchor,
-            last_seen_frame=frame_index,
-            feature_vector=feat,
-            confidence=conf,
-            counted_in_occupancy=counted,
-        )
-        self.tracks[logical_id] = track
-        return logical_id
-
-    def _try_reid_match(self, feature: np.ndarray, frame_index: int) -> Optional[int]:
-        """Cherche une correspondance ReID parmi les pistes occultées."""
-        best_id: Optional[int] = None
-        best_score = -1.0
-        for lid, track in self.tracks.items():
-            if track.state not in (TrackState.OCCULTEE, TrackState.SORTIE_CONFIRMEE):
-                continue
-            if frame_index - track.last_seen_frame > self.grace_period_frames:
-                continue
-            if track.feature_vector is None:
-                continue
-            score = self._cosine_similarity(feature, track.feature_vector)
-            if score > best_score:
-                best_id, best_score = lid, score
-
-        if best_id is not None and best_score >= self.reid_threshold:
-            return best_id
-        return None
-
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
-
-    # -----------------------------------------------------------------------
-    # Gestion des pistes disparues
-    # -----------------------------------------------------------------------
-    def _handle_missing_tracks(self, seen_ids: set[int], frame_index: int) -> None:
-        """Marque comme occultées les pistes non vues, purge les expirées."""
-        to_purge: list[int] = []
-        for lid, track in self.tracks.items():
-            if lid in seen_ids:
-                continue
-            if track.state == TrackState.SORTIE_CONFIRMEE:
-                # Personne déjà sortie : ne pas toucher au compteur
-                if frame_index - track.last_seen_frame > self.grace_period_frames:
-                    to_purge.append(lid)
-                continue
-            if track.state != TrackState.OCCULTEE:
-                track.state = TrackState.OCCULTEE
-            if frame_index - track.last_seen_frame > self.grace_period_frames:
-                to_purge.append(lid)
-
-        for lid in to_purge:
-            track = self.tracks.pop(lid, None)
-            if track:
-                # Retirer le mapping technique
-                keys_to_remove = [k for k, v in self.tech_to_logical.items() if v == lid]
-                for k in keys_to_remove:
-                    del self.tech_to_logical[k]
-
-    # -----------------------------------------------------------------------
-    # Rendu visuel
-    # -----------------------------------------------------------------------
-    def draw_overlay(
-        self,
-        frame: np.ndarray,
-        candidates: list[tuple[int, int, tuple[float, float], np.ndarray, float]],
-        visible_count: int,
-    ) -> None:
-        """Dessine la ligne, les bounding boxes colorées par état, et le HUD."""
-        h, w = frame.shape[:2]
-        l_start, l_end = self.line_px(w, h)
-
-        # -- Ligne virtuelle --
-        cv2.line(frame, _to_int(l_start), _to_int(l_end), (0, 255, 0), 3, cv2.LINE_AA)
-
-        # -- Zone morte semi-transparente --
-        self._draw_dead_zone(frame, l_start, l_end)
-
-        # -- Bounding boxes colorées par état --
-        for track_id, display_id, anchor, box, conf in candidates:
-            logical_id = self.tech_to_logical.get(track_id)
-            if logical_id and logical_id in self.tracks:
-                state = self.tracks[logical_id].state
-            else:
-                state = TrackState.PRESENTE
-            color = STATE_COLORS.get(state, (255, 255, 255))
-
-            x1, y1, x2, y2 = map(int, box[:4])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.circle(frame, (int(anchor[0]), int(anchor[1])), 5, (0, 0, 255), -1)
-
-            label = f"ID:{display_id} {conf:.2f}"
-            cv2.putText(frame, label, (x1, max(25, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
-        # -- Bounding boxes des pistes occultées (dernière position connue) --
-        for lid, track in self.tracks.items():
-            if track.state == TrackState.OCCULTEE:
-                pos = track.last_position
-                color = STATE_COLORS[TrackState.OCCULTEE]
-                r = 15
-                cx, cy = int(pos[0]), int(pos[1])
-                cv2.circle(frame, (cx, cy), r, color, 2)
-                cv2.putText(frame, f"?{lid}", (cx - 10, cy - r - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-
-        # -- HUD --
-        self._draw_hud(frame, visible_count)
-
-    def _draw_dead_zone(
-        self,
-        frame: np.ndarray,
-        l_start: tuple[float, float],
-        l_end: tuple[float, float],
-    ) -> None:
-        """Dessine une zone morte semi-transparente autour de la ligne."""
-        dx = l_end[0] - l_start[0]
-        dy = l_end[1] - l_start[1]
-        length = max(float(np.hypot(dx, dy)), 1.0)
-        # Normale unitaire vers le côté extérieur (dist > 0)
-        nx_out, ny_out = dy / length, -dx / length
-        # Normale unitaire vers le côté intérieur (dist < 0)
-        nx_in, ny_in = -dy / length, dx / length
-        m_out = self.dead_zone_margin
-        m_in = self.dead_zone_inside
-
-        pts = np.array([
-            [l_start[0] + nx_out * m_out, l_start[1] + ny_out * m_out],
-            [l_end[0] + nx_out * m_out, l_end[1] + ny_out * m_out],
-            [l_end[0] + nx_in * m_in, l_end[1] + ny_in * m_in],
-            [l_start[0] + nx_in * m_in, l_start[1] + ny_in * m_in],
-        ], dtype=np.int32)
-
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [pts], (0, 255, 255))
-        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-
-    def _draw_hud(self, frame: np.ndarray, visible_count: int) -> None:
-        """Dessine le panneau de contrôle d'occupation."""
-        h, w = frame.shape[:2]
-        scale = max(0.5, min(1.0, w / 1280.0))
-
-        lines = [
-            f"OCCUPANCY: {self.occupancy_count}",
-            f"IN: {self.total_in}  |  OUT: {self.total_out}  |  NEW: {self.total_new_presences}",
-            f"Visible: {visible_count}  |  Occluded: {self.occluded_count}",
-            f"Phase: {self.phase}",
+            for detection in detections
         ]
 
+        with Timer() as reid_timer:
+            assignments = self.identities.assign(
+                observations, frame, timestamp_s, frame_index
+            )
+        if self.profiler is not None:
+            self.profiler.record("reid", reid_timer.ms)
+
+        with Timer() as fsm_timer:
+            views: list[_View] = []
+            seen: set[int] = set()
+            for assignment in assignments:
+                if not assignment.person_id:
+                    # Politique « defer » : décision différée, aucun comptage,
+                    # aucune création d'identité (spec 3.3 étape 5).
+                    continue
+                self._report_stabilization(assignment, raw_boxes, corrected, timestamp_s, frame_index)
+                track = self._get_or_create_track(assignment, timestamp_s)
+                seen.add(track.person_id)
+                self._update_track(
+                    track, assignment, width, height, dead_zone_px, budget,
+                    timestamp_s, frame_index,
+                )
+                if track.is_visible:
+                    views.append(
+                        _View(
+                            person_id=track.person_id,
+                            technical_track_id=track.technical_track_id,
+                            bbox=assignment.bbox,
+                            anchor=track.anchor,
+                            state=track.state,
+                            provisional=track.provisional,
+                        )
+                    )
+            self._views = views
+            for person_id, track in list(self.tracks.items()):
+                if person_id in seen:
+                    continue
+                self._handle_missing(track, budget, timestamp_s, frame_index)
+        if self.profiler is not None:
+            self.profiler.record("fsm", fsm_timer.ms)
+
+        self._publish_snapshot_if_due(timestamp_s, frame_index)
+        for person_id in self.identities.release_expired(timestamp_s):
+            # La purge a déjà été journalisée lors du passage à ABSENTE : la
+            # libération de mémoire n'est donc jamais silencieuse (spec 3.4).
+            self.tracks.pop(person_id, None)
+
+    def _report_stabilization(
+        self,
+        assignment,
+        raw_boxes: dict[int, np.ndarray],
+        corrected: dict[int, tuple[np.ndarray, tuple[float, float]]],
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        """Journalise une correction de stabilisation (spec 7)."""
+        if self.bbox_locker is None and self.anchor_stabilizer is None:
+            return
+        technical_id = int(assignment.technical_track_id)
+        raw = raw_boxes.get(technical_id)
+        entry = corrected.get(technical_id)
+        if raw is None or entry is None:
+            return
+        bbox, anchor = entry
+        if not np.allclose(raw, bbox):
+            self._emit(
+                "STABILIZATION",
+                timestamp_s,
+                frame_index,
+                person_id=assignment.person_id,
+                raw_bbox=[round(float(v), 2) for v in raw],
+                corrected_bbox=[round(float(v), 2) for v in bbox],
+                reason="hauteur_corrigee_sous_seuil",
+                threshold=float(self.bbox_locker.min_height_ratio),
+                component="bbox_locker",
+            )
+            return
+        if self.anchor_stabilizer is not None and anchor != compute_anchor(bbox):
+            self._emit(
+                "STABILIZATION",
+                timestamp_s,
+                frame_index,
+                person_id=assignment.person_id,
+                raw_bbox=[round(float(v), 2) for v in raw],
+                corrected_bbox=[round(float(v), 2) for v in bbox],
+                reason="ancrage_recalibre_sur_vitesse_tete",
+                threshold=float(self.anchor_stabilizer.tolerance_px),
+                component="anchor_stabilizer",
+            )
+
+    # ------------------------------------------------------------------
+    # Warm-up
+    # ------------------------------------------------------------------
+    def _update_warmup(self, frame_index: int, timestamp_s: float) -> None:
+        if self._warmup_done or self.budget is None:
+            return
+        if frame_index >= self.budget.warmup_frames:
+            self._warmup_done = True
+            self._emit(
+                "WARMUP_END",
+                timestamp_s,
+                frame_index,
+                initial_occupancy=self.initial_occupancy,
+                budget_frames=self.budget.warmup_frames,
+                fps=round(self.budget.fps, 3),
+            )
+
+    # ------------------------------------------------------------------
+    # Suivi d'une personne observée
+    # ------------------------------------------------------------------
+    def _get_or_create_track(self, assignment, timestamp_s: float) -> PersonTrack:
+        track = self.tracks.get(assignment.person_id)
+        if track is not None:
+            return track
+        track = PersonTrack(
+            person_id=assignment.person_id,
+            state=TrackState.INITIALISATION if not self._warmup_done else TrackState.EXTERIEUR,
+            origin=(
+                OriginType.REASSOCIATION if assignment.matched
+                else OriginType.APPARITION_INTERIEURE
+            ),
+            technical_track_id=assignment.technical_track_id,
+            anchor=assignment.anchor,
+            bbox=np.asarray(assignment.bbox, dtype=float),
+            bbox_height=assignment.bbox_height,
+            last_seen_s=timestamp_s,
+            provisional=assignment.provisional,
+            aliases={assignment.technical_track_id},
+        )
+        self.tracks[assignment.person_id] = track
+        return track
+
+    def _update_track(
+        self,
+        track: PersonTrack,
+        assignment,
+        width: int,
+        height: int,
+        dead_zone_px: float | None,
+        budget: FrameBudget,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        previous_state = track.state
+        reliable = bool(assignment.anchor_reliable)
+        distance = self.line.distance(assignment.anchor, width, height)
+        side = side_of(distance, self.line.inside_side, self.line.on_line_policy)
+        zone = zone_of(distance, dead_zone_px, self.line.inside_side)
+
+        crossed: str | None = None
+        if reliable and track.previous_anchor is not None:
+            crossed = self.line.crossing(
+                track.previous_anchor, assignment.anchor, width, height
+            )
+        if reliable:
+            # Seule une ancre fiable alimente la référence de franchissement
+            # (spec 5.4) : pendant une suspension, la référence est gelée.
+            track.previous_anchor = assignment.anchor
+        if crossed is not None and not self._warmup_done:
+            track.crossed += 1
+
+        track.interior_streak = track.interior_streak + 1 if zone is Zone.INTERIEURE else 0
+
+        # Frames écoulées depuis la dernière observation : non nul dès qu'une
+        # piste réapparaît, ce qui est la condition d'une récupération (spec 3.3).
+        lost_frames = max(0, frame_index - track.last_seen_frame)
+
+        context = FsmContext(
+            observed=True,
+            zone=zone,
+            side=side,
+            crossed=crossed,
+            anchor_reliable=reliable,
+            scale_available=dead_zone_px is not None,
+            lost_frames=lost_frames,
+            grace_period_frames=budget.grace_period_frames,
+            interior_streak=track.interior_streak,
+            confirmation_frames=budget.confirmation_frames,
+            warmup_done=self._warmup_done,
+            warmup_stable=(
+                track.interior_streak >= budget.confirmation_frames and track.crossed == 0
+            ),
+            approach=track.approach,
+            pending_crossing=track.pending_crossing,
+            in_progress_policy=self.config.occupancy.in_progress_disappearance_policy,
+        )
+        decision = self.machine.resolve(track.state, context)
+        self._apply_decision(
+            track, decision, context, assignment, width, height, timestamp_s, frame_index
+        )
+
+        track.anchor = assignment.anchor
+        track.bbox = np.asarray(assignment.bbox, dtype=float)
+        track.bbox_height = assignment.bbox_height
+        track.technical_track_id = assignment.technical_track_id
+        track.confidence = assignment.confidence
+        track.last_seen_frame = frame_index
+        track.last_seen_s = timestamp_s
+        track.last_zone = zone.name if zone is not None else "INDISPONIBLE"
+        track.last_distance = distance
+        track.aliases.add(assignment.technical_track_id)
+        self._emit_transition_if_changed(
+            track, previous_state, decision, zone, distance, timestamp_s, frame_index
+        )
+
+    # ------------------------------------------------------------------
+    # Personne non observée
+    # ------------------------------------------------------------------
+    def _handle_missing(
+        self,
+        track: PersonTrack,
+        budget: FrameBudget,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        if track.state is TrackState.ABSENTE:
+            return
+        previous_state = track.state
+        context = FsmContext(
+            observed=False,
+            zone=None,
+            side=Side.INDETERMINEE,
+            crossed=None,
+            anchor_reliable=True,
+            scale_available=True,
+            lost_frames=frame_index - track.last_seen_frame,
+            grace_period_frames=budget.grace_period_frames,
+            interior_streak=0,
+            confirmation_frames=budget.confirmation_frames,
+            warmup_done=self._warmup_done,
+            warmup_stable=False,
+            approach=track.approach,
+            pending_crossing=track.pending_crossing,
+            in_progress_policy=self.config.occupancy.in_progress_disappearance_policy,
+        )
+        decision = self.machine.resolve(track.state, context)
+        self._apply_decision(
+            track, decision, context, None, self._frame_size[0], self._frame_size[1],
+            timestamp_s, frame_index,
+        )
+        self._emit_transition_if_changed(
+            track, previous_state, decision, None, None, timestamp_s, frame_index
+        )
+
+    # ------------------------------------------------------------------
+    # Application des actions de la table
+    # ------------------------------------------------------------------
+    def _apply_decision(
+        self,
+        track: PersonTrack,
+        decision: Decision,
+        context: FsmContext,
+        assignment,
+        width: int,
+        height: int,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        action = decision.action
+        track.last_rule = decision.rule
+        technical_id = (
+            track.technical_track_id if assignment is None else assignment.technical_track_id
+        )
+
+        if action is Action.SUSPEND_DECISION:
+            track.anchor_suspend_streak += 1
+            if track.anchor_suspend_streak == 1:
+                reason = "edge_margin" if not context.anchor_reliable else "scale_unavailable"
+                self._emit(
+                    "ANCHOR_UNRELIABLE",
+                    timestamp_s,
+                    frame_index,
+                    person_id=track.person_id,
+                    reason=reason,
+                    margin_px=round(
+                        self.config.geometry.anchor_edge_margin_ratio * min(width, height), 2
+                    ),
+                    bbox=None if track.bbox is None else [round(float(v), 2) for v in track.bbox],
+                    consecutive_frames=1,
+                )
+            return
+        track.anchor_suspend_streak = 0
+
+        if action is Action.EMPLACE_INITIAL:
+            if not track.inside_occupancy:
+                track.inside_occupancy = True
+                self._uncertain.discard(track.person_id)
+                self.initial_occupancy += 1
+            track.origin = OriginType.INITIALISATION
+
+        elif action in (Action.COMPTE_ENTREE, Action.CONFIRME_ENTREE_DIFFEREE):
+            self._count_in(track, technical_id, action, timestamp_s, frame_index)
+
+        elif action in (Action.COMPTE_SORTIE, Action.CONFIRME_SORTIE_DIFFEREE):
+            self._count_out(track, technical_id, action, timestamp_s, frame_index)
+
+        elif action is Action.NOUVELLE_PRESENCE:
+            self._count_new(track, technical_id, timestamp_s, frame_index)
+
+        elif action is Action.RECUPERE_INTERIEUR:
+            self._uncertain.discard(track.person_id)
+            track.origin = OriginType.REASSOCIATION
+            track.pending_crossing = None
+
+        elif action is Action.RECUPERE_EXTERIEUR:
+            # Réapparition cohérente côté extérieur d'une personne qui était
+            # comptée présente : la trajectoire se poursuit hors de la salle, la
+            # sortie est donc confirmée à ce moment-là (spec 4.3, réapparition
+            # cohérente). La raison est journalisée pour un audit séparé.
+            if track.inside_occupancy:
+                self._count_out(
+                    track, technical_id, Action.RECUPERE_EXTERIEUR, timestamp_s, frame_index
+                )
+            else:
+                self._uncertain.discard(track.person_id)
+            track.pending_crossing = None
+
+        elif action is Action.AMORCE_ENTREE:
+            track.pending_crossing = "in"
+
+        elif action is Action.AMORCE_SORTIE:
+            track.pending_crossing = "out"
+
+        elif action is Action.ANNULE_FRANCHISSEMENT:
+            track.pending_crossing = None
+
+        elif action is Action.SIGNALE_DERIVE:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="side_change_without_crossing",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details=(
+                    "Demi-plan modifié sans intersection de la ligne capturée "
+                    "(ligne non couvrante ou saut de suivi)"
+                ),
+                resolution="franchissement soumis à confirmation par la zone morte",
+            )
+
+        elif action is Action.MARQUE_OCCULTEE:
+            self._mark_occluded(track, timestamp_s, frame_index)
+
+        elif action is Action.EXPIRE_HORS_CHAMP:
+            self._expire(track, timestamp_s, frame_index, ambiguous=False)
+
+        elif action is Action.EXPIRE_AMBIGU:
+            self._expire(track, timestamp_s, frame_index, ambiguous=True)
+
+        elif action is Action.MARCHE_ZONE_MORTE_DEPUIS_INTERIEUR:
+            track.approach = Approach.INTERIEUR
+
+        elif action is Action.MARCHE_ZONE_MORTE_DEPUIS_EXTERIEUR:
+            track.approach = Approach.EXTERIEUR
+
+        track.state = decision.state_to
+
+    # ------------------------------------------------------------------
+    # Comptage avec garde-fous (spec 4.5)
+    # ------------------------------------------------------------------
+    def _count_in(
+        self, track: PersonTrack, technical_id: int, action: Action,
+        timestamp_s: float, frame_index: int,
+    ) -> None:
+        track.pending_crossing = None
+        self._uncertain.discard(track.person_id)
+        if track.inside_occupancy:
+            return
+        track.inside_occupancy = True
+        if track.origin is not OriginType.INITIALISATION:
+            track.origin = OriginType.ENTREE_LIGNE
+        self.total_in += 1
+        self._emit(
+            "IN",
+            timestamp_s,
+            frame_index,
+            person_id=track.person_id,
+            technical_track_id=int(technical_id),
+            direction="in",
+            reason=(
+                "deferred_confirmation"
+                if action is Action.CONFIRME_ENTREE_DIFFEREE
+                else "crossing_confirmed"
+            ),
+            occupancy_after=self.occupancy_confirmed,
+        )
+
+    def _count_out(
+        self, track: PersonTrack, technical_id: int, action: Action,
+        timestamp_s: float, frame_index: int,
+    ) -> None:
+        if not track.inside_occupancy:
+            track.pending_crossing = None
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="out_without_in",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details="Sortie confirmée alors que la personne n'était pas comptée présente",
+                resolution="OUT non comptabilisé, état aligné sur la sortie",
+            )
+            return
+        track.inside_occupancy = False
+        self._uncertain.discard(track.person_id)
+        track.pending_crossing = None
+        self.total_out += 1
+        if action is Action.CONFIRME_SORTIE_DIFFEREE:
+            reason = "deferred_confirmation"
+        elif action is Action.RECUPERE_EXTERIEUR:
+            reason = "recovery_outside_coherent"
+        else:
+            reason = "crossing_confirmed"
+        self._emit(
+            "OUT",
+            timestamp_s,
+            frame_index,
+            person_id=track.person_id,
+            technical_track_id=int(technical_id),
+            direction="out",
+            reason=reason,
+            occupancy_after=self.occupancy_confirmed,
+        )
+
+    def _count_new(
+        self, track: PersonTrack, technical_id: int, timestamp_s: float, frame_index: int
+    ) -> None:
+        if track.inside_occupancy:
+            return
+        track.inside_occupancy = True
+        self._uncertain.discard(track.person_id)
+        track.origin = OriginType.APPARITION_INTERIEURE
+        self.total_new += 1
+        self._emit(
+            "NEW",
+            timestamp_s,
+            frame_index,
+            person_id=track.person_id,
+            technical_track_id=int(technical_id),
+            direction="in",
+            reason="apparition_interieure_confirmee",
+            origin=track.origin.name,
+            occupancy_after=self.occupancy_confirmed,
+            stable_frames=track.interior_streak,
+        )
+
+    def _mark_occluded(self, track: PersonTrack, timestamp_s: float, frame_index: int) -> None:
+        track.occlusion_events += 1
+        self._emit(
+            "OCCLUDED",
+            timestamp_s,
+            frame_index,
+            person_id=track.person_id,
+            technical_track_id=track.technical_track_id,
+            last_position=[round(track.anchor[0], 2), round(track.anchor[1], 2)],
+            state_before=track.state.name,
+        )
+
+    def _expire(
+        self, track: PersonTrack, timestamp_s: float, frame_index: int, ambiguous: bool
+    ) -> None:
+        if ambiguous:
+            self._emit(
+                "AMBIGUOUS_CROSSING",
+                timestamp_s,
+                frame_index,
+                person_id=track.person_id,
+                technical_track_id=track.technical_track_id,
+                direction=track.pending_crossing or "indeterminate",
+                pending_direction=track.pending_crossing,
+                reason="franchissement_amorce_non_resolu",
+                policy=self.config.occupancy.in_progress_disappearance_policy,
+                last_position=[round(track.anchor[0], 2), round(track.anchor[1], 2)],
+            )
+            track.pending_crossing = None
+        impact = "none"
+        if track.inside_occupancy:
+            # Purge sans sortie observée : la personne reste dans la borne haute
+            # de l'occupation (spec 4.4), elle n'est jamais retirée en silence.
+            self._uncertain.add(track.person_id)
+            impact = "uncertain"
+        self.identities.mark_purged(
+            track.person_id,
+            timestamp_s,
+            frame_index,
+            reason="grace_expired_in_progress" if ambiguous else "grace_expired",
+            last_state=track.state.name,
+            occupancy_impact=impact,
+            grace_period_frames=None if self.budget is None else self.budget.grace_period_frames,
+        )
+
+    # ------------------------------------------------------------------
+    # Occupation encadrée et cohérence (spec 4.4, 4.5)
+    # ------------------------------------------------------------------
+    def _publish_snapshot_if_due(self, timestamp_s: float, frame_index: int) -> None:
+        interval = self.config.occupancy.snapshot_interval_seconds
+        if (
+            self._last_snapshot_s is not None
+            # Tolérance de 1 µs : les horodatages mesurés ne sont jamais
+            # exactement espacés, l'intervalle ne doit pas être manqué pour
+            # un écart d'arrondi flottant.
+            and timestamp_s - self._last_snapshot_s < interval - 1e-6
+        ):
+            return
+        self._last_snapshot_s = timestamp_s
+        self._check_consistency(timestamp_s, frame_index)
+        self._emit("OCCUPANCY_SNAPSHOT", timestamp_s, frame_index, **self.snapshot().to_fields())
+
+    def _check_consistency(self, timestamp_s: float, frame_index: int) -> None:
+        ledger = self.initial_occupancy + self.total_in + self.total_new - self.total_out
+        if ledger < 0:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="negative_occupancy_before_clamp",
+                details=f"Bilan d'occupation négatif : {ledger}",
+                resolution="valeur publiée bornée, incohérence journalisée (jamais silencieuse)",
+            )
+
+    # ------------------------------------------------------------------
+    # Émission
+    # ------------------------------------------------------------------
+    def _emit_transition_if_changed(
+        self,
+        track: PersonTrack,
+        previous_state: TrackState,
+        decision: Decision,
+        zone: Zone | None,
+        distance: float | None,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        if previous_state is track.state:
+            return
+        self._emit(
+            "STATE_TRANSITION",
+            timestamp_s,
+            frame_index,
+            person_id=track.person_id,
+            from_state=previous_state.name,
+            to_state=track.state.name,
+            rule=decision.rule,
+            action=decision.action.name,
+            zone=None if zone is None else zone.name,
+            distance_signed=None if distance is None else round(distance, 2),
+        )
+
+    def _emit(self, event_type: str, timestamp_s: float, frame_index: int, **fields: Any) -> None:
+        if self.event_sink is None:
+            return
+        self.event_sink.emit(event_type, timestamp_s, frame_index, **fields)
+
+    # ------------------------------------------------------------------
+    # Rendu
+    # ------------------------------------------------------------------
+    def draw_overlay(self, frame: np.ndarray) -> None:
+        """Dessine la ligne, la zone morte relative, les boîtes et le HUD."""
+        height, width = frame.shape[:2]
+        start, end = self.line.to_pixels(width, height)
+        cv2.line(
+            frame,
+            (int(start[0]), int(start[1])),
+            (int(end[0]), int(end[1])),
+            (0, 255, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        self._draw_dead_zone(frame, start, end)
+
+        for view in self._views:
+            color = STATE_COLORS.get(view.state, (255, 255, 255))
+            x1, y1, x2, y2 = (int(v) for v in view.bbox[:4])
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.circle(frame, (int(view.anchor[0]), int(view.anchor[1])), 4, (0, 0, 255), -1)
+            label = f"P{view.person_id}"
+            if view.provisional:
+                label += " incertain"
+            cv2.putText(
+                frame, label, (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
+            )
+
+        occluded_color = STATE_COLORS[TrackState.OCCULTEE]
+        for track in self.tracks.values():
+            if track.state is not TrackState.OCCULTEE:
+                continue
+            center = (int(track.anchor[0]), int(track.anchor[1]))
+            cv2.circle(frame, center, 14, occluded_color, 2)
+            cv2.putText(
+                frame, f"?P{track.person_id}", (center[0] - 14, center[1] - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, occluded_color, 1, cv2.LINE_AA,
+            )
+
+        self._draw_hud(frame)
+
+    def _draw_dead_zone(
+        self, frame: np.ndarray, start: tuple[float, float], end: tuple[float, float]
+    ) -> None:
+        dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
+        if not dead_zone_px:
+            return
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = max(float(np.hypot(dx, dy)), 1.0)
+        nx, ny = dy / length, -dx / length
+        points = np.array(
+            [
+                [start[0] + nx * dead_zone_px, start[1] + ny * dead_zone_px],
+                [end[0] + nx * dead_zone_px, end[1] + ny * dead_zone_px],
+                [end[0] - nx * dead_zone_px, end[1] - ny * dead_zone_px],
+                [start[0] - nx * dead_zone_px, start[1] - ny * dead_zone_px],
+            ],
+            dtype=np.int32,
+        )
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [points], (0, 255, 255))
+        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+
+    def _draw_hud(self, frame: np.ndarray) -> None:
+        _height, width = frame.shape[:2]
+        scale = max(0.5, min(1.0, width / 1280.0))
+        snapshot = self.snapshot()
+        lines = [
+            f"OCCUPATION CONFIRMEE: {snapshot.confirmed}",
+            f"INCERTAINE: {snapshot.uncertain}  RANGE: [{snapshot.range_low}, {snapshot.range_high}]",
+            f"IN: {snapshot.total_in}  OUT: {snapshot.total_out}  NEW: {snapshot.total_new}",
+            f"Visibles: {snapshot.visible}  Occultees: {snapshot.occluded}  Phase: {self.phase}",
+        ]
         font = cv2.FONT_HERSHEY_SIMPLEX
         f_scale = 0.5 * scale
-        th = max(1, int(1.5 * scale))
-        line_h = int(22 * scale)
+        thickness = max(1, int(1.5 * scale))
+        line_height = int(22 * scale)
         pad = int(10 * scale)
-
-        max_text_w = max(cv2.getTextSize(l, font, f_scale, th)[0][0] for l in lines)
-        box_w = max_text_w + 2 * pad
-        box_h = len(lines) * line_h + 2 * pad
-
+        text_width = max(cv2.getTextSize(line, font, f_scale, thickness)[0][0] for line in lines)
+        box_w = text_width + 2 * pad
+        box_h = len(lines) * line_height + 2 * pad
         overlay = frame.copy()
         cv2.rectangle(overlay, (10, 10), (10 + box_w, 10 + box_h), (15, 15, 15), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         cv2.rectangle(frame, (10, 10), (10 + box_w, 10 + box_h), (120, 120, 120), 1)
-
-        colors = [(0, 255, 255), (0, 255, 0), (255, 255, 255), (180, 180, 180)]
-        for i, (text, color) in enumerate(zip(lines, colors)):
-            y = 10 + pad + (i + 1) * line_h - int(4 * scale)
-            cv2.putText(frame, text, (10 + pad, y), font, f_scale, color, th, cv2.LINE_AA)
-
-
-def _to_int(pt: tuple[float, float]) -> tuple[int, int]:
-    return (int(pt[0]), int(pt[1]))
+        colors = [(0, 255, 255), (0, 200, 255), (0, 255, 0), (200, 200, 200)]
+        for index, (text, color) in enumerate(zip(lines, colors)):
+            y = 10 + pad + (index + 1) * line_height - int(4 * scale)
+            cv2.putText(frame, text, (10 + pad, y), font, f_scale, color, thickness, cv2.LINE_AA)
