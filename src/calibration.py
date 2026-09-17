@@ -45,7 +45,11 @@ def calibrate_line(source) -> Tuple[Tuple[float, float], Tuple[float, float]]:
 
     height, width = frame.shape[:2]
     points: List[Tuple[int, int]] = []
-    clone = frame.copy()
+    # Redimensionnement ergonomique pour éviter une fenêtre trop grande et instable
+    max_w, max_h = 960, 540
+    scale = min(max_w / width, max_h / height, 1.0)
+    disp_w, disp_h = max(1, int(width * scale)), max(1, int(height * scale))
+    clone = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
 
     # ---- Callback souris ----
     def _mouse_callback(event: int, x: int, y: int, flags: int, param) -> None:
@@ -64,10 +68,6 @@ def calibrate_line(source) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     win_name = "Calibration - Cliquez 2 points | g: reset | c: valider"
     try:
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        # Redimensionner la fenêtre si la vidéo dépasse 1280x720 tout en conservant le ratio
-        max_w, max_h = 1280, 720
-        scale = min(max_w / width, max_h / height, 1.0)
-        disp_w, disp_h = int(width * scale), int(height * scale)
         cv2.resizeWindow(win_name, disp_w, disp_h)
 
         cv2.imshow(win_name, clone)
@@ -98,7 +98,7 @@ def calibrate_line(source) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         elif key == ord("g"):
             # Réinitialiser la sélection
             points.clear()
-            clone = frame.copy()
+            clone = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
             print("[Calibration] Points réinitialisés.")
 
         elif key == 27:  # ESC - quitter avec ligne par défaut
@@ -106,14 +106,14 @@ def calibrate_line(source) -> Tuple[Tuple[float, float], Tuple[float, float]]:
                 "[Calibration] Annulé (ESC). "
                 "Utilisation de la ligne par défaut (horizontale à 60 % de la hauteur)."
             )
-            points = [(0, int(height * 0.6)), (width, int(height * 0.6))]
+            points = [(0, int(disp_h * 0.6)), (disp_w, int(disp_h * 0.6))]
             break
 
     cv2.destroyWindow(win_name)
 
     # Normalisation des coordonnées
-    p1_norm = (points[0][0] / width, points[0][1] / height)
-    p2_norm = (points[1][0] / width, points[1][1] / height)
+    p1_norm = (points[0][0] / disp_w, points[0][1] / disp_h)
+    p2_norm = (points[1][0] / disp_w, points[1][1] / disp_h)
 
     print(
         f"[Calibration] Ligne validée : P1=({p1_norm[0]:.4f}, {p1_norm[1]:.4f}) "

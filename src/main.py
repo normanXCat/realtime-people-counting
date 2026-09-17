@@ -254,7 +254,13 @@ def ask_counting_mode() -> bool:
         print("Réponse invalide. Répondez par o pour oui ou n pour non.")
 
 
-def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) -> tuple[tuple[float, float], tuple[float, float]]:
+def calibrate(
+    source: str,
+    no_show: bool,
+    p1: Optional[str],
+    p2: Optional[str],
+    max_dim: int = 960,
+) -> tuple[tuple[float, float], tuple[float, float]]:
     if p1 and p2:
         return parse_point(p1), parse_point(p2)
     if no_show:
@@ -264,15 +270,21 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
     capture.release()
     if not ok:
         raise RuntimeError(f"Impossible de lire la première frame : {source}")
+    h, w = frame.shape[:2]
+    # Réduction de résolution pour un affichage confortable et stable lors du tracé de la ligne
+    scale = min(1.0, max_dim / max(w, h))
+    disp_w, disp_h = max(1, int(w * scale)), max(1, int(h * scale))
+    canvas = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
+
     points: list[tuple[int, int]] = []
-    canvas = frame.copy()
 
     def on_click(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
             points.append((x, y))
 
     window = "Calibration - cliquez 2 points, c=valider, g=reinitialiser"
-    cv2.namedWindow(window)
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, disp_w, disp_h)
     cv2.setMouseCallback(window, on_click)
     while True:
         display = canvas.copy()
@@ -284,8 +296,7 @@ def calibrate(source: str, no_show: bool, p1: Optional[str], p2: Optional[str]) 
         key = cv2.waitKey(30) & 0xFF
         if key == ord("c") and len(points) == 2:
             cv2.destroyWindow(window)
-            h, w = frame.shape[:2]
-            return (points[0][0] / w, points[0][1] / h), (points[1][0] / w, points[1][1] / h)
+            return (points[0][0] / disp_w, points[0][1] / disp_h), (points[1][0] / disp_w, points[1][1] / disp_h)
         if key == ord("g"):
             points.clear()
             print("[Calibration] Ligne réinitialisée. Cliquez à nouveau sur deux points.")
@@ -301,6 +312,7 @@ def calibrate_two_lines(
     line1_p2: Optional[str],
     line2_p1: Optional[str],
     line2_p2: Optional[str],
+    max_dim: int = 960,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
     """Calibre L1 et L2 manuellement, ou lit quatre points CLI normalisés."""
     if line1_p1 and line1_p2 and line2_p1 and line2_p2:
@@ -319,15 +331,20 @@ def calibrate_two_lines(
     if not ok:
         raise RuntimeError(f"Impossible de lire la première frame : {source}")
     h, w = frame.shape[:2]
+    # Réduction de résolution pour un affichage confortable et stable lors du tracé de la ligne
+    scale = min(1.0, max_dim / max(w, h))
+    disp_w, disp_h = max(1, int(w * scale)), max(1, int(h * scale))
+    canvas = cv2.resize(frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame.copy()
+
     points: list[tuple[int, int]] = []
-    canvas = frame.copy()
 
     def on_click(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
             points.append((x, y))
 
     window = "Calibration - L1 puis L2 | 4 points, c=valider, g=reinitialiser"
-    cv2.namedWindow(window)
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, disp_w, disp_h)
     cv2.setMouseCallback(window, on_click)
     while True:
         display = canvas.copy()
@@ -347,7 +364,7 @@ def calibrate_two_lines(
         key = cv2.waitKey(30) & 0xFF
         if key == ord("c") and len(points) == 4:
             cv2.destroyWindow(window)
-            return tuple((x / w, y / h) for x, y in points)  # type: ignore[return-value]
+            return tuple((x / disp_w, y / disp_h) for x, y in points)  # type: ignore[return-value]
         if key == ord("g"):
             points.clear()
             print("[Calibration] L1 et L2 réinitialisées.")
@@ -389,6 +406,8 @@ def arguments() -> argparse.Namespace:
                         help="Tolérance en pixels pour la stabilisation de l'ancrage par la tête")
     parser.add_argument("--no-stabilizer", action="store_true",
                         help="Désactiver la stabilisation cinématique de l'ancrage")
+    parser.add_argument("--calib-max-dim", type=int, default=960,
+                        help="Dimension maximale (largeur ou hauteur) pour l'affichage de la fenêtre de calibration (défaut: 960)")
     return parser.parse_args()
 
 
@@ -400,7 +419,7 @@ def main() -> None:
     counting_enabled = ask_counting_mode()
 
     if counting_enabled:
-        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2)
+        line_p1, line_p2 = calibrate(args.source, args.no_show, args.line_p1, args.line_p2, max_dim=args.calib_max_dim)
         # L2 est abandonnée : le comptage utilise uniquement L1 et le point des pieds.
         line2_p1 = line2_p2 = None
     else:
