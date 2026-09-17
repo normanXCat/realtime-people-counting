@@ -75,13 +75,18 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
     # -- Cycle de vie de la session ---------------------------------------
     "SESSION_START": EventSpec(
         required=("config_path", "source", "model_path", "model_sha256"),
-        optional=("fps_source", "resolved_config_path", "line_policy", "mode"),
+        optional=(
+            "fps_source", "resolved_config_path", "line_policy", "mode",
+            "tracker_high_thresh", "tracker_low_thresh", "tracker_new_thresh",
+            "warmup_min_frames", "warmup_seconds",
+        ),
     ),
     "SESSION_END": EventSpec(
         required=("frames_processed", "duration_s", "fps_mean"),
         optional=(
-            "fps_median", "fps_min", "occupancy_confirmed", "occupancy_uncertain",
-            "total_in", "total_out", "total_new", "latency_ms",
+            "fps_median", "fps_min", "occupancy_confirmed", "occupancy_observed",
+            "occupancy_uncertain", "occupancy_operational", "total_in", "total_out",
+            "total_new", "latency_ms",
         ),
     ),
     "SOURCE_END_OF_STREAM": EventSpec(
@@ -92,7 +97,14 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
     ),
     "SOURCE_ERROR": EventSpec(required=("error",), optional=("frames_processed",)),
     "WARMUP_END": EventSpec(
-        required=("initial_occupancy",), optional=("budget_frames", "fps")
+        required=("initial_occupancy",),
+        optional=(
+            "budget_frames", "fps", "warmup_frames_observed", "warmup_elapsed_seconds",
+            "warmup_min_frames",
+        ),
+    ),
+    "CONFIG_WARNING": EventSpec(
+        required=("code", "details"), optional=("source",)
     ),
     # -- Ligne virtuelle (définie manuellement, jamais par défaut) --------
     "LINE_VALIDATED": EventSpec(
@@ -123,11 +135,14 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
     "OCCLUDED": EventSpec(
         required=("person_id",), optional=("technical_track_id", "last_position", "state_before")
     ),
+    # PURGE est **toujours** une purge technique : elle ne vaut jamais sortie.
+    # `purge_kind` = "technical" et `is_exit` = false le rendent explicite pour
+    # l'audit, la borne haute de l'occupation restant détenue par ailleurs.
     "PURGE": EventSpec(
         required=("person_id", "reason"),
         optional=(
             "last_position", "last_state", "occupancy_impact", "grace_period_frames",
-            "lifetime_s",
+            "lifetime_s", "purge_kind", "is_exit",
         ),
     ),
     "REID_MATCH": EventSpec(
@@ -145,6 +160,41 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
         required=("technical_track_id", "best_similarity", "runner_up_similarity", "safety_margin"),
         optional=(
             "person_id", "candidates", "resolution", "distance", "allowed_distance",
+            "reason", "descriptor_reliable",
+        ),
+    ),
+    # Un nouvel identifiant technique est rattaché à une identité connue :
+    # c'est la trace explicite d'une perte/reprise de piste (spec 3 du prompt).
+    "TECHNICAL_ID_CHANGED": EventSpec(
+        required=("person_id", "technical_track_id", "decision"),
+        optional=(
+            "previous_technical_track_id", "similarity", "distance", "allowed_distance",
+            "reason", "descriptor_reliable",
+        ),
+    ),
+    # Apparence refusée pour la galerie (jamais remplacée en silence).
+    "REID_DESCRIPTOR_REJECTED": EventSpec(
+        required=("person_id", "reason"),
+        optional=("technical_track_id", "confidence", "bbox_height", "bbox_width", "sharpness", "threshold"),
+    ),
+    # -- Diagnostics de détection / association (perte de piste) ----------
+    "DETECTION_ABSENT": EventSpec(
+        required=("reason",),
+        optional=("consecutive_frames", "detections", "frames_observed"),
+    ),
+    "TRACK_ID_ABSENT": EventSpec(
+        required=("detections", "reason"),
+        optional=("consecutive_frames", "frames_observed"),
+    ),
+    "DETECTION_LOW_CONFIDENCE": EventSpec(
+        required=("detections", "reason"),
+        optional=("max_confidence", "track_high_thresh", "consecutive_frames", "frames_observed"),
+    ),
+    "DETECTION_REJECTED_GEOMETRY": EventSpec(
+        required=("reason",),
+        optional=(
+            "bbox_wh_ratio", "confidence", "frame", "bbox", "min_ratio", "max_ratio",
+            "technical_track_id",
         ),
     ),
     # -- Cohérence ---------------------------------------------------------
@@ -153,11 +203,16 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
         optional=("person_id", "technical_track_id", "details", "resolution"),
     ),
     # -- Occupation --------------------------------------------------------
+    # ``occupancy_confirmed`` est l'effectif **opérationnel** (bilan
+    # initial + IN + NEW - OUT) : il ne diminue que sur une sortie confirmée.
+    # ``occupancy_operational`` le répète sous son nom explicite et
+    # ``occupancy_observed`` donne la part actuellement observable, de sorte que
+    # ``occupancy_observed + occupancy_uncertain == occupancy_confirmed``.
     "OCCUPANCY_SNAPSHOT": EventSpec(
         required=("occupancy_confirmed", "occupancy_uncertain", "occupancy_range"),
         optional=(
             "visible_count", "occluded_count", "total_in", "total_out", "total_new",
-            "identities_live",
+            "identities_live", "occupancy_operational", "occupancy_observed",
         ),
     ),
     # -- Traçabilité machine à états et stabilisation ----------------------
@@ -167,7 +222,10 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
     ),
     "ANCHOR_UNRELIABLE": EventSpec(
         required=("person_id", "reason"),
-        optional=("margin_px", "bbox", "consecutive_frames"),
+        optional=(
+            "margin_px", "bbox", "consecutive_frames",
+            "previous_height", "current_height", "drop_ratio", "frame",
+        ),
     ),
     "STABILIZATION": EventSpec(
         required=("person_id", "raw_bbox", "corrected_bbox", "reason", "threshold"),

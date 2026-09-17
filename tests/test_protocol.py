@@ -133,4 +133,5 @@ def test_config_resolue_ne_contient_que_des_sections_du_schema(tmp_path: Path):
     assert set(payload) == {
         "schema_version", "source", "model", "tracker", "reid", "line", "geometry",
         "timing", "occupancy", "output", "stabilization", "display", "logging",
+        "diagnostics", "anchor",
     }

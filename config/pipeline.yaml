@@ -24,7 +24,12 @@ source:
 model:
   path: models/yolo11n.pt
   expected_sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
-  confidence: 0.25          # PROVISOIRE — à calibrer (9.4)
+  # Seuil d'inférence YOLO. Volontairement BAS : une personne légèrement floue
+  # produit des scores faibles mais des boîtes encore exploitables par
+  # l'association BoT-SORT. Filtrer ces détections ici les supprime avant même
+  # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
+  # Le garde-fou contre les faux positifs est porté par new_track_thresh.
+  confidence: 0.10          # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
   nms_iou: 0.55             # PROVISOIRE — à calibrer
   image_size: 960           # PROVISOIRE — à calibrer
   classes: [0]              # classe COCO « person »
@@ -32,6 +37,12 @@ model:
 tracker:
   config_path: src/configs/custom_botsort.yaml
   persist: true
+  # Seuils BoT-SORT, DISTINCTS du seuil YOLO et synchronisés avec le YAML lu par
+  # Ultralytics (un test vérifie la synchronisation, sinon la divergence serait
+  # silencieuse).
+  track_high_thresh: 0.4    # plancher de l'association principale
+  track_low_thresh: 0.1     # plancher du second étage (détections faibles)
+  new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
 
 reid:
   # Niveau 1 : ReID natif BoT-SORT (réassociation intra-buffer), activé par
@@ -47,6 +58,14 @@ reid:
     v_max_ratio: 1.5             # hauteurs de bbox / seconde
     spatial_margin_ratio: 0.3    # tolérance additionnelle (fraction de hauteur)
     ambiguous_policy: provisional_person  # provisional_person | defer
+    # Qualité exigée pour qu'une apparence soit écrite dans la galerie. Une
+    # détection faible, un crop minuscule, une boîte tronquée ou une image floue
+    # produisent un descripteur qui ne doit JAMAIS remplacer une apparence
+    # connue : le rejet est journalisé (REID_DESCRIPTOR_REJECTED).
+    gallery_min_confidence: 0.70
+    gallery_min_crop_height_px: 32
+    gallery_min_crop_width_px: 16
+    gallery_min_sharpness: 0.0   # variance du Laplacien ; 0 = contrôle désactivé
   # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
   # uniquement : si false, le descripteur léger HSV est utilisé.
   external_reid:
@@ -71,12 +90,32 @@ geometry:
   dead_zone_ratio: 0.15         # PROVISOIRE — fraction de la hauteur médiane
   anchor_edge_margin_ratio: 0.02 # PROVISOIRE — marge de rejet au bord image
   scale_window: 61              # nombre de hauteurs de bbox de l'échelle locale
+  # Rayon (fraction de la hauteur médiane) dans lequel une apparition intérieure
+  # peut être confondue avec une personne déjà comptée dont l'observation est
+  # perdue : NEW est alors différé, jamais confirmé.
+  occlusion_ambiguity_ratio: 0.5
+  # Filtre géométrique : élimine les faux positifs tout en acceptant les personnes assises
+  min_aspect_ratio_wh: 0.1       # ratio W/H minimum (rejet des artefacts verticaux)
+  max_aspect_ratio_wh: 2.5       # ratio W/H maximum plausible (personne assise tolérée)
+  min_box_height_px: 10.0        # hauteur minimale de bounding box
+  min_box_width_px: 10.0         # largeur minimale de bounding box
+
+anchor:
+  height_history_window_frames: 30      # fenêtre pour estimer la hauteur "normale" de la piste
+  max_height_drop_ratio: 0.35           # chute relative de hauteur considérée comme anormale
+  height_drop_confirm_frames: 3         # nombre de frames pour confirmer une chute réelle vs bruit
+
 
 timing:
   # Toutes les durées sont en SECONDES ; elles sont converties en frames au
   # runtime avec le FPS réellement mesuré (règle 0.2).
   fps_source: measured          # jamais une valeur supposée
-  warmup_seconds: 1.0
+  # Warm-up : terminé quand warmup_min_frames frames ONT été observées ET que
+  # warmup_seconds se sont écoulées. Exiger les deux bornes évite une fin
+  # prématurée à faible FPS (temps écoulé mais 3 frames vues) comme à haut FPS
+  # (15 frames vues en 0,15 s).
+  warmup_seconds: 0.5
+  warmup_min_frames: 15
   confirmation_seconds: 0.5
   grace_period_seconds: 5.0
   fps_estimate_window: 30       # frames pour la moyenne glissante du FPS
@@ -110,3 +149,11 @@ display:
 logging:
   level: INFO
   print_state_transitions: false
+
+diagnostics:
+  # Diagnostics de détection / d'association (perte de piste, identifiant
+  # technique absent, détections faibles). Journalisés dans events.jsonl, avec
+  # limitation de débit pour ne pas noyer les événements métier : le front
+  # montant est toujours écrit, puis au plus un événement par intervalle.
+  enabled: true
+  min_interval_seconds: 1.0

@@ -23,11 +23,31 @@ Corrections apportées par rapport à l'audit (§2.2) :
   politique ``deferred_confirmation`` avec ``AMBIGUOUS_CROSSING`` à
   l'expiration — jamais de IN/OUT confirmé sur simple disparition ;
 - **ancre au bord** (spec 5.4) : décision de franchissement suspendue, avec
-  événement ``ANCHOR_UNRELIABLE``.
+  événement ``ANCHOR_UNRELIABLE`` ;
+- **warm-up robuste** (spec 1 du prompt) : clôturé sur **deux** bornes
+  (``warmup_min_frames`` frames observées **et** ``warmup_seconds`` écoulées),
+  avec une frontière explicite (la frame qui atteint les deux bornes appartient
+  au warm-up) et un ``WARMUP_END`` qui publie ``warmup_frames_observed``,
+  ``warmup_elapsed_seconds`` et l'``initial_occupancy`` réellement retenu ;
+- **``NEW`` strictement encadré** (spec 4 du prompt) : une apparition intérieure
+  stable ne devient une nouvelle présence que si la personne n'a jamais été vue
+  à l'extérieur et qu'aucune personne déjà comptée n'est occultée à proximité —
+  sinon la décision est signalée et **différée**, jamais devinée ;
+- **occupation opérationnelle / incertaine** (spec 6 du prompt) :
+  ``occupancy_confirmed`` **est** l'effectif opérationnel
+  (``initial + IN + NEW - OUT``) et il **ne diminue que sur une sortie
+  confirmée par la FSM** — jamais sur une occultation, une expiration de grâce,
+  une absence de détection, une purge technique ou un changement d'ID
+  technique. ``occupancy_observed`` est la part actuellement observable, et
+  ``occupancy_uncertain`` celle dont l'observation est perdue :
+  ``observée + incertaine == opérationnelle`` est un invariant vérifié à chaque
+  frame. Une purge est toujours ``purge_kind="technical"`` et ``is_exit=false`` :
+  elle ne peut pas produire de sortie.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -46,6 +66,8 @@ from geometry import (
     VirtualLine,
     Zone,
     anchor_reliability,
+    check_anchor_height_drop,
+    check_detection_geometry,
     compute_anchor,
     side_of,
     zone_of,
@@ -53,6 +75,8 @@ from geometry import (
 from identity_manager import IdentityManager, Observation
 from metrics import LatencyProfiler, Timer
 from occupancy_types import OccupancySnapshot, OriginType, PersonTrack
+
+_log = logging.getLogger("occupancy_manager")
 
 
 @dataclass(frozen=True)
@@ -135,11 +159,18 @@ class OccupancyManager:
         self.total_out = 0
         self.total_new = 0
 
-        #: Identités purgées sans sortie observée (borne haute de l'occupation).
+        #: Identités purgées sans sortie observée (part incertaine de
+        #: l'effectif opérationnel : la personne reste comptée).
         self._uncertain: set[int] = set()
         self._warmup_done = False
         self._frames = 0
         self._bootstrapping_frames = 0
+        #: Warm-up : compteur de frames observées, horodatage de la première et
+        #: durée écoulée constatée sur la dernière frame de warm-up.
+        self._warmup_frames_observed = 0
+        self._warmup_first_timestamp_s: float | None = None
+        self._warmup_elapsed_seconds = 0.0
+        self._warmup_report_pending = False
         self._last_snapshot_s: float | None = None
         self._frame_size: tuple[int, int] = (0, 0)
         self._views: list[_View] = []
@@ -154,8 +185,44 @@ class OccupancyManager:
         return "RUNNING" if self._warmup_done else "WARMUP"
 
     @property
+    def occupancy_operational(self) -> int:
+        """Effectif **opérationnel** : ``initial + IN + NEW - OUT``.
+
+        C'est le bilan du pipeline, et il n'est **jamais** borné par un
+        ``max(0, ...)`` : une valeur négative est une incohérence à journaliser
+        (``INCONSISTENT_STATE``), pas à masquer.
+
+        Il ne diminue que sur une **sortie confirmée** par la machine à états
+        (ou une réapparition cohérente côté extérieur, qui vaut confirmation de
+        sortie). Aucun autre chemin ne le touche : ni le passage
+        ``PRESENTE -> OCCULTEE``, ni l'expiration de la grâce, ni une absence de
+        détection, ni une purge technique, ni un changement d'identifiant
+        technique, ni la libération de la mémoire de galerie.
+        """
+        return self.initial_occupancy + self.total_in + self.total_new - self.total_out
+
+    @property
     def occupancy_confirmed(self) -> int:
-        """Entrées confirmées sans sortie confirmée (spec 4.4)."""
+        """Occupation **confirmée** = effectif opérationnel (figure publiée).
+
+        Alias explicite de :attr:`occupancy_operational` : c'est la valeur
+        affichée dans le HUD, publiée dans ``SESSION_END`` et utilisée par
+        l'évaluation. Elle ne baisse donc **que** sur une sortie confirmée par
+        la FSM — jamais sur une occultation ou une purge.
+        """
+        return self.occupancy_operational
+
+    @property
+    def occupancy_observed(self) -> int:
+        """Part de l'effectif opérationnel **actuellement observable**.
+
+        Une personne comptée mais occultée (ou purgée en attendant une
+        réapparition) n'y figure pas : elle reste dans
+        :attr:`occupancy_operational` et alimente :attr:`occupancy_uncertain`.
+        ``occupancy_observed + occupancy_uncertain == occupancy_operational``
+        est vérifié à chaque frame (invariant journalisé, jamais corrigé en
+        silence).
+        """
         return sum(
             1
             for track in self.tracks.values()
@@ -164,24 +231,24 @@ class OccupancyManager:
 
     @property
     def occupancy_uncertain(self) -> int:
-        """Personnes purgées sans sortie observée, cumulées sur la session (spec 4.4).
+        """Personnes comptées dont l'observation est perdue (spec 4.4, 6).
 
         Le compte survit à la libération de la mémoire de galerie : sans cela,
-        la borne haute de l'occupation s'effondrerait dès qu'une identité est
-        oubliée, ce qui masquerait précisément les sorties non observées que
-        l'encadrement doit rendre visibles.
+        l'information « quelqu'un est peut-être encore là » disparaîtrait dès
+        qu'une identité est oubliée. ``occupancy_uncertain`` est un **sous-ensemble**
+        de :attr:`occupancy_operational`, jamais une diminution de celui-ci.
         """
         return len(self._uncertain)
 
     @property
     def occupancy_range(self) -> tuple[int, int]:
-        confirmed = self.occupancy_confirmed
-        return (confirmed, confirmed + self.occupancy_uncertain)
+        """Encadrement publié : ``[observée, opérationnelle]``."""
+        return (self.occupancy_observed, self.occupancy_operational)
 
     @property
     def occupancy_count(self) -> int:
-        """Effectif confirmé (nom conservé pour le HUD et l'évaluation)."""
-        return self.occupancy_confirmed
+        """Effectif opérationnel confirmé (nom conservé pour le HUD et l'évaluation)."""
+        return self.occupancy_operational
 
     @property
     def visible_count(self) -> int:
@@ -196,19 +263,22 @@ class OccupancyManager:
         return self._bootstrapping_frames
 
     def snapshot(self) -> OccupancySnapshot:
-        confirmed = self.occupancy_confirmed
+        operational = self.occupancy_operational
+        observed = self.occupancy_observed
         uncertain = self.occupancy_uncertain
         return OccupancySnapshot(
-            confirmed=confirmed,
+            confirmed=operational,
             uncertain=uncertain,
-            range_low=confirmed,
-            range_high=confirmed + uncertain,
+            range_low=observed,
+            range_high=operational,
             visible=self.visible_count,
             occluded=self.occluded_count,
             initial=self.initial_occupancy,
             total_in=self.total_in,
             total_out=self.total_out,
             total_new=self.total_new,
+            observed=observed,
+            operational=operational,
         )
 
     # ------------------------------------------------------------------
@@ -232,6 +302,45 @@ class OccupancyManager:
         self._frames += 1
         height, width = frame.shape[:2]
         self._frame_size = (width, height)
+
+        # Filtrage géométrique (spec correction 1) : écarter les artefacts extrêmes
+        # tout en acceptant les postures assises (ratio W/H jusqu'à max_aspect_ratio_wh).
+        valid_detections: list[Detection] = []
+        for det in detections:
+            valid, reason, ratio = check_detection_geometry(
+                det.bbox,
+                confidence=det.confidence,
+                min_aspect_ratio=self.config.geometry.min_aspect_ratio_wh,
+                max_aspect_ratio=self.config.geometry.max_aspect_ratio_wh,
+                min_height_px=self.config.geometry.min_box_height_px,
+                min_width_px=self.config.geometry.min_box_width_px,
+            )
+            if not valid:
+                _log.debug(
+                    "Frame %d: detection %d rejected by geometric filter: reason=%s, w/h=%.2f, conf=%.3f",
+                    frame_index,
+                    det.technical_track_id,
+                    reason,
+                    ratio,
+                    det.confidence,
+                )
+                self._emit(
+                    "DETECTION_REJECTED_GEOMETRY",
+                    timestamp_s,
+                    frame_index,
+                    reason=reason or "aspect_ratio_out_of_range",
+                    bbox_wh_ratio=round(float(ratio), 4),
+                    confidence=round(float(det.confidence), 4),
+                    frame=frame_index,
+                    bbox=[round(float(v), 2) for v in det.bbox],
+                    min_ratio=self.config.geometry.min_aspect_ratio_wh,
+                    max_ratio=self.config.geometry.max_aspect_ratio_wh,
+                    technical_track_id=int(det.technical_track_id),
+                )
+                continue
+            valid_detections.append(det)
+        detections = valid_detections
+
         self.scale.observe_many([detection.bbox for detection in detections])
 
         if self.budget is None:
@@ -243,7 +352,7 @@ class OccupancyManager:
             return
 
         budget = self.budget
-        self._update_warmup(frame_index, timestamp_s)
+        self._advance_warmup(timestamp_s)
         dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
         margin_ratio = self.config.geometry.anchor_edge_margin_ratio
 
@@ -288,6 +397,9 @@ class OccupancyManager:
         if self.profiler is not None:
             self.profiler.record("reid", reid_timer.ms)
 
+        ambiguity_radius_px = self.scale.ratio_to_px(
+            self.config.geometry.occlusion_ambiguity_ratio
+        )
         with Timer() as fsm_timer:
             views: list[_View] = []
             seen: set[int] = set()
@@ -301,7 +413,7 @@ class OccupancyManager:
                 seen.add(track.person_id)
                 self._update_track(
                     track, assignment, width, height, dead_zone_px, budget,
-                    timestamp_s, frame_index,
+                    timestamp_s, frame_index, ambiguity_radius_px,
                 )
                 if track.is_visible:
                     views.append(
@@ -322,6 +434,7 @@ class OccupancyManager:
         if self.profiler is not None:
             self.profiler.record("fsm", fsm_timer.ms)
 
+        self._report_warmup_end_if_pending(timestamp_s, frame_index, budget)
         self._publish_snapshot_if_due(timestamp_s, frame_index)
         for person_id in self.identities.release_expired(timestamp_s):
             # La purge a déjà été journalisée lors du passage à ABSENTE : la
@@ -374,19 +487,93 @@ class OccupancyManager:
     # ------------------------------------------------------------------
     # Warm-up
     # ------------------------------------------------------------------
-    def _update_warmup(self, frame_index: int, timestamp_s: float) -> None:
+    def _advance_warmup(self, timestamp_s: float) -> None:
+        """Décide si la frame courante appartient encore au warm-up.
+
+        Frontière **explicite** : le warm-up couvre les frames ``1..K``, où
+        ``K`` est la première frame pour laquelle ``K >= warmup_min_frames``
+        **et** ``t_K - t_1 >= warmup_seconds``. La frame ``K`` appartient donc au
+        warm-up ; ``_warmup_done`` ne passe à vrai qu'en arrivant sur la frame
+        ``K+1``, qui est la première frame comptée. Les deux bornes sont exigées :
+        la borne de frames protège des FPS élevés (15 frames en 0,15 s) et la
+        borne de durée protège des FPS faibles (0,5 s pour 3 frames vues).
+        """
         if self._warmup_done or self.budget is None:
             return
-        if frame_index >= self.budget.warmup_frames:
+        if self._warmup_first_timestamp_s is None:
+            self._warmup_first_timestamp_s = timestamp_s
+            self._warmup_frames_observed = 1
+            return
+        elapsed = timestamp_s - self._warmup_first_timestamp_s
+        if (
+            self._warmup_frames_observed >= self.budget.warmup_min_frames
+            and elapsed >= self.config.timing.warmup_seconds
+        ):
             self._warmup_done = True
-            self._emit(
-                "WARMUP_END",
-                timestamp_s,
-                frame_index,
-                initial_occupancy=self.initial_occupancy,
-                budget_frames=self.budget.warmup_frames,
-                fps=round(self.budget.fps, 3),
+            self._warmup_report_pending = True
+            return
+        self._warmup_frames_observed += 1
+        self._warmup_elapsed_seconds = elapsed
+
+    def _report_warmup_end_if_pending(
+        self, timestamp_s: float, frame_index: int, budget: FrameBudget
+    ) -> None:
+        """Publie ``WARMUP_END`` après la première frame comptée.
+
+        L'événement est émis **après** le traitement de la frame ``K+1`` : c'est
+        sur cette frame que les règles de la table emploient l'effectif initial
+        (``EMPLACE_INITIAL``). L'émettre plus tôt — à la fin de la dernière frame
+        de warm-up — publierait systématiquement ``initial_occupancy = 0``, ce qui
+        rendrait l'événement inexploitable pour l'audit.
+        """
+        if not self._warmup_report_pending:
+            return
+        self._warmup_report_pending = False
+        self._emit(
+            "WARMUP_END",
+            timestamp_s,
+            frame_index,
+            initial_occupancy=self.initial_occupancy,
+            warmup_frames_observed=self._warmup_frames_observed,
+            warmup_elapsed_seconds=round(self._warmup_elapsed_seconds, 4),
+            warmup_min_frames=budget.warmup_min_frames,
+            budget_frames=budget.warmup_frames,
+            fps=round(budget.fps, 3),
+        )
+
+    def _occlusion_ambiguity_radius_px(self) -> float | None:
+        """Rayon (relatif à l'échelle locale) d'ambiguïté avec une personne occultée.
+
+        Au-delà, une apparition intérieure ne peut plus être confondue avec une
+        personne déjà comptée dont l'observation est perdue.
+        """
+        return self.scale.ratio_to_px(self.config.geometry.occlusion_ambiguity_ratio)
+
+    def occluded_counted_neighbours(
+        self, track: PersonTrack, anchor: tuple[float, float], radius_px: float | None
+    ) -> list[int]:
+        """``person_id`` déjà comptés, en occultation, à moins de ``radius_px``.
+
+        C'est la condition qui interdit de confirmer un ``NEW`` : compter une
+        nouvelle personne à l'endroit exact où une personne comptée vient d'être
+        perdue produirait un doublon d'occupation. La proximité est exprimée en
+        fraction de l'échelle locale (hauteur médiane des bbox), jamais en pixels
+        absolus (règle 0.3).
+        """
+        if radius_px is None:
+            return []
+        neighbours: list[int] = []
+        for person_id, other in self.tracks.items():
+            if person_id == track.person_id or not other.inside_occupancy:
+                continue
+            if other.state not in (TrackState.OCCULTEE, TrackState.ABSENTE):
+                continue
+            distance = float(
+                np.hypot(anchor[0] - other.anchor[0], anchor[1] - other.anchor[1])
             )
+            if distance <= radius_px:
+                neighbours.append(person_id)
+        return sorted(neighbours)
 
     # ------------------------------------------------------------------
     # Suivi d'une personne observée
@@ -404,6 +591,7 @@ class OccupancyManager:
             ),
             technical_track_id=assignment.technical_track_id,
             anchor=assignment.anchor,
+            last_reliable_anchor=assignment.anchor if assignment.anchor_reliable else None,
             bbox=np.asarray(assignment.bbox, dtype=float),
             bbox_height=assignment.bbox_height,
             last_seen_s=timestamp_s,
@@ -423,22 +611,74 @@ class OccupancyManager:
         budget: FrameBudget,
         timestamp_s: float,
         frame_index: int,
+        ambiguity_radius_px: float | None = None,
     ) -> None:
         previous_state = track.state
-        reliable = bool(assignment.anchor_reliable)
-        distance = self.line.distance(assignment.anchor, width, height)
+        anchor_cfg = self.config.anchor
+        is_drop, drop_ratio, ref_h = check_anchor_height_drop(
+            assignment.bbox_height,
+            track.height_history,
+            anchor_cfg.max_height_drop_ratio,
+        )
+
+        effective_anchor = assignment.anchor
+        if is_drop:
+            track.height_drop_streak += 1
+            track.drop_previous_height = ref_h
+            track.drop_current_height = float(assignment.bbox_height)
+            track.drop_ratio = drop_ratio
+            if track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames:
+                # La chute s'est stabilisée (personne assise et restée assise) :
+                # réadaptation de l'historique de hauteur et réactivation de la fiabilité.
+                track.height_history = [float(assignment.bbox_height)]
+                track.height_drop_streak = 0
+                track.anchor_unreliable_reason = None
+                reliable = bool(assignment.anchor_reliable)
+                effective_anchor = assignment.anchor
+            else:
+                # Chute brutale non confirmée : ancre non fiable, gel de la coordonnée verticale
+                reliable = False
+                track.anchor_unreliable_reason = "height_drop"
+                if track.last_reliable_anchor is not None:
+                    effective_anchor = (assignment.anchor[0], track.last_reliable_anchor[1])
+        else:
+            track.height_drop_streak = 0
+            track.anchor_unreliable_reason = None
+            track.height_history.append(float(assignment.bbox_height))
+            if len(track.height_history) > anchor_cfg.height_history_window_frames:
+                track.height_history.pop(0)
+            reliable = bool(assignment.anchor_reliable)
+
+        if reliable:
+            track.last_reliable_anchor = effective_anchor
+
+        distance = self.line.distance(effective_anchor, width, height)
         side = side_of(distance, self.line.inside_side, self.line.on_line_policy)
         zone = zone_of(distance, dead_zone_px, self.line.inside_side)
+
+        if reliable and zone is Zone.EXTERIEURE:
+            # Historique extérieur : dès qu'il existe, ``NEW`` est interdit par
+            # la table — la personne entre (franchissement ou entrée signalée),
+            # elle n'apparaît pas.
+            track.observed_outside = True
+        blocked_by_occlusion = bool(
+            self.occluded_counted_neighbours(
+                track, effective_anchor, ambiguity_radius_px
+            )
+        )
+        if not blocked_by_occlusion:
+            # La situation ambiguë a cessé : un futur report sera re-journalisé.
+            track.new_deferred_reported = False
 
         crossed: str | None = None
         if reliable and track.previous_anchor is not None:
             crossed = self.line.crossing(
-                track.previous_anchor, assignment.anchor, width, height
+                track.previous_anchor, effective_anchor, width, height
             )
         if reliable:
             # Seule une ancre fiable alimente la référence de franchissement
             # (spec 5.4) : pendant une suspension, la référence est gelée.
-            track.previous_anchor = assignment.anchor
+            track.previous_anchor = effective_anchor
         if crossed is not None and not self._warmup_done:
             track.crossed += 1
 
@@ -466,13 +706,15 @@ class OccupancyManager:
             approach=track.approach,
             pending_crossing=track.pending_crossing,
             in_progress_policy=self.config.occupancy.in_progress_disappearance_policy,
+            exterior_history=track.observed_outside,
+            new_blocked_by_occlusion=blocked_by_occlusion,
         )
         decision = self.machine.resolve(track.state, context)
         self._apply_decision(
             track, decision, context, assignment, width, height, timestamp_s, frame_index
         )
 
-        track.anchor = assignment.anchor
+        track.anchor = effective_anchor
         track.bbox = np.asarray(assignment.bbox, dtype=float)
         track.bbox_height = assignment.bbox_height
         track.technical_track_id = assignment.technical_track_id
@@ -515,6 +757,8 @@ class OccupancyManager:
             approach=track.approach,
             pending_crossing=track.pending_crossing,
             in_progress_policy=self.config.occupancy.in_progress_disappearance_policy,
+            exterior_history=track.observed_outside,
+            new_blocked_by_occlusion=False,
         )
         decision = self.machine.resolve(track.state, context)
         self._apply_decision(
@@ -548,19 +792,41 @@ class OccupancyManager:
         if action is Action.SUSPEND_DECISION:
             track.anchor_suspend_streak += 1
             if track.anchor_suspend_streak == 1:
-                reason = "edge_margin" if not context.anchor_reliable else "scale_unavailable"
-                self._emit(
-                    "ANCHOR_UNRELIABLE",
-                    timestamp_s,
-                    frame_index,
-                    person_id=track.person_id,
-                    reason=reason,
-                    margin_px=round(
-                        self.config.geometry.anchor_edge_margin_ratio * min(width, height), 2
-                    ),
-                    bbox=None if track.bbox is None else [round(float(v), 2) for v in track.bbox],
-                    consecutive_frames=1,
+                bbox_val = (
+                    [round(float(v), 2) for v in assignment.bbox]
+                    if assignment is not None and getattr(assignment, "bbox", None) is not None
+                    else [round(float(v), 2) for v in track.bbox]
+                    if track.bbox is not None
+                    else None
                 )
+                if track.anchor_unreliable_reason == "height_drop":
+                    self._emit(
+                        "ANCHOR_UNRELIABLE",
+                        timestamp_s,
+                        frame_index,
+                        person_id=track.person_id,
+                        reason="height_drop",
+                        previous_height=round(float(track.drop_previous_height), 2),
+                        current_height=round(float(track.drop_current_height), 2),
+                        drop_ratio=round(float(track.drop_ratio), 4),
+                        frame=frame_index,
+                        bbox=bbox_val,
+                        consecutive_frames=1,
+                    )
+                else:
+                    reason = "edge_margin" if not context.anchor_reliable else "scale_unavailable"
+                    self._emit(
+                        "ANCHOR_UNRELIABLE",
+                        timestamp_s,
+                        frame_index,
+                        person_id=track.person_id,
+                        reason=reason,
+                        margin_px=round(
+                            self.config.geometry.anchor_edge_margin_ratio * min(width, height), 2
+                        ),
+                        bbox=bbox_val,
+                        consecutive_frames=1,
+                    )
             return
         track.anchor_suspend_streak = 0
 
@@ -606,6 +872,52 @@ class OccupancyManager:
 
         elif action is Action.ANNULE_FRANCHISSEMENT:
             track.pending_crossing = None
+
+        elif action is Action.SIGNALE_ENTREE_SANS_FRANCHISSEMENT:
+            # Symétrique de `inside_drift_outside_without_crossing` : le demi-plan
+            # a changé vers l'intérieur sans intersection capturée (ligne non
+            # couvrante ou saut de suivi). L'entrée est **signalée** puis soumise
+            # à confirmation par la zone morte ; elle n'est ni ignorée ni
+            # comptée comme une nouvelle présence.
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="entry_side_change_without_crossing",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details=(
+                    "Demi-plan passé à l'intérieur sans intersection de la ligne "
+                    "capturée, alors que la personne a déjà été observée à "
+                    "l'extérieur"
+                ),
+                resolution="entrée soumise à confirmation (jamais comptée comme NEW)",
+            )
+            track.pending_crossing = "in"
+
+        elif action is Action.DIFFERE_NOUVELLE_PRESENCE:
+            # Une personne déjà comptée est occultée à proximité : confirmer un
+            # NEW ici risquerait de compter deux fois la même personne. La
+            # décision est différée, et journalisée une fois par épisode.
+            if not track.new_deferred_reported:
+                track.new_deferred_reported = True
+                self._emit(
+                    "INCONSISTENT_STATE",
+                    timestamp_s,
+                    frame_index,
+                    kind="new_deferred_occluded_person_nearby",
+                    person_id=track.person_id,
+                    technical_track_id=int(technical_id),
+                    details=(
+                        "Apparition intérieure stable alors que des personnes "
+                        "déjà comptées sont en occultation à proximité : NEW "
+                        "n'est pas confirmé, le doublon est possible"
+                    ),
+                    resolution=(
+                        "NEW différé ; il sera confirmé si la situation se "
+                        "clarifie (sortie confirmée ou réapparition cohérente)"
+                    ),
+                )
 
         elif action is Action.SIGNALE_DERIVE:
             self._emit(
@@ -710,7 +1022,60 @@ class OccupancyManager:
     def _count_new(
         self, track: PersonTrack, technical_id: int, timestamp_s: float, frame_index: int
     ) -> None:
+        """Confirme une nouvelle présence — sous conditions strictes (spec 4).
+
+        La table de :mod:`fsm` n'y mène déjà que pour une personne jamais vue à
+        l'extérieur et sans personne comptée occultée à proximité ; ce contrôle
+        est répété ici en défense en profondeur (même principe que ``_count_out``
+        et son ``out_without_in``) : une règle mal configurée ne doit jamais
+        pouvoir incrémenter l'occupation en silence.
+        """
         if track.inside_occupancy:
+            return
+        if track.pending_crossing is not None:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="new_with_pending_crossing",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details=(
+                    "Apparition intérieure alors qu'un franchissement "
+                    f"({track.pending_crossing}) est amorcé : NEW refusé"
+                ),
+                resolution="NEW non compté ; le franchissement amorcé reste la décision",
+            )
+            return
+        if track.observed_outside:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="new_after_exterior_observation",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details=(
+                    "La personne a déjà été observée à l'extérieur : son "
+                    "apparition intérieure est une entrée, pas une nouvelle présence"
+                ),
+                resolution="NEW non compté",
+            )
+            return
+        neighbours = self.occluded_counted_neighbours(
+            track, track.anchor, self._occlusion_ambiguity_radius_px()
+        )
+        if neighbours:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="new_with_occluded_candidates",
+                person_id=track.person_id,
+                technical_track_id=int(technical_id),
+                details=f"Personnes déjà comptées et occultées à proximité : {neighbours}",
+                resolution="NEW non compté, décision différée",
+            )
             return
         track.inside_occupancy = True
         self._uncertain.discard(track.person_id)
@@ -792,7 +1157,13 @@ class OccupancyManager:
         self._emit("OCCUPANCY_SNAPSHOT", timestamp_s, frame_index, **self.snapshot().to_fields())
 
     def _check_consistency(self, timestamp_s: float, frame_index: int) -> None:
-        ledger = self.initial_occupancy + self.total_in + self.total_new - self.total_out
+        """Vérifie l'invariant ``opérationnel == observable + incertain``.
+
+        Aucune valeur n'est bornée ni corrigée : l'incohérence est publiée telle
+        quelle et journalisée (règle 0.4). Un ``max(0, ...)`` masquerait
+        exactement le défaut qu'il faut voir.
+        """
+        ledger = self.occupancy_operational
         if ledger < 0:
             self._emit(
                 "INCONSISTENT_STATE",
@@ -801,6 +1172,24 @@ class OccupancyManager:
                 kind="negative_occupancy_before_clamp",
                 details=f"Bilan d'occupation négatif : {ledger}",
                 resolution="valeur publiée bornée, incohérence journalisée (jamais silencieuse)",
+            )
+            return
+        observable = self.occupancy_observed + self.occupancy_uncertain
+        if ledger != observable:
+            self._emit(
+                "INCONSISTENT_STATE",
+                timestamp_s,
+                frame_index,
+                kind="occupancy_ledger_mismatch",
+                details=(
+                    f"Occupation opérationnelle {ledger} != observable {observable} "
+                    f"(observée {self.occupancy_observed} + incertaine "
+                    f"{self.occupancy_uncertain})"
+                ),
+                resolution=(
+                    "incohérence publiée et journalisée : elle signale une "
+                    "identité comptée dont l'enregistrement logique a été perdu"
+                ),
             )
 
     # ------------------------------------------------------------------
@@ -907,7 +1296,8 @@ class OccupancyManager:
         snapshot = self.snapshot()
         lines = [
             f"OCCUPATION CONFIRMEE: {snapshot.confirmed}",
-            f"INCERTAINE: {snapshot.uncertain}  RANGE: [{snapshot.range_low}, {snapshot.range_high}]",
+            f"OBSERVEE: {snapshot.observed}  INCERTAINE: {snapshot.uncertain}  "
+            f"RANGE: [{snapshot.range_low}, {snapshot.range_high}]",
             f"IN: {snapshot.total_in}  OUT: {snapshot.total_out}  NEW: {snapshot.total_new}",
             f"Visibles: {snapshot.visible}  Occultees: {snapshot.occluded}  Phase: {self.phase}",
         ]

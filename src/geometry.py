@@ -59,6 +59,8 @@ class AnchorReliability(Enum):
     FIABLE = auto()
     BORD_IMAGE = auto()        # bbox tronquée par un bord : ancre fantôme possible
     SCALE_INDISPONIBLE = auto()  # aucune échelle locale : aucune décision possible
+    CHUTE_HAUTEUR = auto()     # réduction de hauteur anormale (occlusion basse, personne assise)
+
 
 
 class LineError(ValueError):
@@ -404,3 +406,57 @@ def median_height_of(boxes: Sequence[BBox]) -> float | None:
     if len(heights) % 2:
         return heights[middle]
     return (heights[middle - 1] + heights[middle]) / 2.0
+
+
+def check_detection_geometry(
+    bbox: BBox,
+    confidence: float = 1.0,
+    min_aspect_ratio: float = 0.1,
+    max_aspect_ratio: float = 2.5,
+    min_height_px: float = 10.0,
+    min_width_px: float = 10.0,
+) -> tuple[bool, str | None, float]:
+    """Vérifie si une détection respecte les contraintes géométriques plausibles.
+
+    Permet d'écarter les faux positifs (artefacts, reflets horizontaux extrêmes)
+    tout en acceptant explicitement les personnes assises (ratio W/H jusqu'à 2.0-2.5).
+
+    Returns:
+        (is_valid, reason, bbox_wh_ratio)
+    """
+    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    ratio = (w / h) if h > 1e-6 else float("inf")
+
+    if h < min_height_px or w < min_width_px:
+        return False, "box_too_small", ratio
+    if ratio < min_aspect_ratio or ratio > max_aspect_ratio:
+        return False, "aspect_ratio_out_of_range", ratio
+    return True, None, ratio
+
+
+def check_anchor_height_drop(
+    current_height: float,
+    height_history: Sequence[float],
+    max_drop_ratio: float = 0.35,
+) -> tuple[bool, float, float]:
+    """Détecte une chute anormale et brutale de la hauteur de boîte par rapport à l'historique.
+
+    Returns:
+        (is_drop, drop_ratio, reference_height)
+    """
+    if not height_history:
+        return False, 0.0, float(current_height)
+    valid_history = [float(h) for h in height_history if float(h) > 0]
+    if not valid_history:
+        return False, 0.0, float(current_height)
+    from statistics import median
+
+    ref_height = float(median(valid_history))
+    if ref_height <= 0:
+        return False, 0.0, float(current_height)
+    drop_ratio = (ref_height - float(current_height)) / ref_height
+    is_drop = drop_ratio >= max_drop_ratio
+    return is_drop, float(drop_ratio), float(ref_height)
+

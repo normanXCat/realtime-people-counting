@@ -26,6 +26,13 @@ Corrections apportées par rapport à l'audit (§2.1) :
   de la source (spec 5.3) ;
 - distinction explicite fin de flux / absence de détection / erreur de source
   (spec 5.5) ;
+- distinction explicite entre « aucune détection » et « boîtes présentes sans
+  identifiant technique » : le second cas ne produit **aucun** identifiant
+  inventé, aucun ``IN``/``OUT``/``NEW``, et un événement ``TRACK_ID_ABSENT``
+  (diagnostic de perte de piste, spec 3 du prompt) ;
+- les incohérences de configuration qui dégradent le pipeline sans l'empêcher
+  de tourner sont journalisées en ``CONFIG_WARNING`` au démarrage, jamais
+  silencieuses ;
 - latence instrumentée par étape (spec 6.5) avec moyenne, médiane, minimum, P95 ;
 - les événements sont écrits en JSON Lines dans ``results/{session_id}/``, jamais
   dans le répertoire courant (spec 6.1, 6.4).
@@ -36,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import sys
 import time
 from datetime import datetime, timezone
@@ -62,6 +70,7 @@ from config import (
     ConfigError,
     FrameBudget,
     PipelineConfig,
+    coherence_warnings,
     load_config,
     override_config,
 )
@@ -69,6 +78,14 @@ from events import EventLogger
 from geometry import LineError, VirtualLine
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
+from track_diagnostics import (
+    BOXES_EMPTY,
+    BOXES_MISSING,
+    BOXES_PRESENT,
+    DetectionDiagnostics,
+    DetectionSnapshot,
+    box_count,
+)
 
 #: Modes d'exécution du point d'entrée. Le comptage est le **seul** mode
 #: officiel : il commence obligatoirement par la définition manuelle de la ligne
@@ -417,6 +434,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[CONFIG] {error}", file=sys.stderr)
         return 2
 
+    log_level = getattr(logging, config.logging.level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+
     source = resolve_source(config.source.default)
     model_path = config.resolve_path(config.model.path)
     tracker_path = config.resolve_path(config.tracker.config_path)
@@ -438,6 +462,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         flush_every_n_events=config.output.flush_every_n_events,
     )
     budget: FrameBudget | None = None
+    diagnostics = DetectionDiagnostics(
+        config.diagnostics,
+        event_sink=logger,
+        track_high_thresh=config.tracker.track_high_thresh,
+    )
     start_s = time.perf_counter()
 
     try:
@@ -462,7 +491,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         fps_source=config.timing.fps_source,
         line_policy="manual_required",
         mode=args.mode,
+        tracker_high_thresh=config.tracker.track_high_thresh,
+        tracker_low_thresh=config.tracker.track_low_thresh,
+        tracker_new_thresh=config.tracker.new_track_thresh,
+        warmup_min_frames=config.timing.warmup_min_frames,
+        warmup_seconds=config.timing.warmup_seconds,
     )
+    # Incohérences de configuration : journalisées explicitement (un seuil YOLO
+    # plus haut que le seuil bas du tracker rend la récupération des personnes
+    # floues impossible avant même que BoT-SORT voie la détection).
+    for code, message in coherence_warnings(config):
+        logger.emit(
+            "CONFIG_WARNING", 0.0, 0, code=code, details=message, source="config"
+        )
+        print(f"[CONFIG] {code} : {message}", file=sys.stderr)
     print(
         f"[MODE] {args.mode} | source={source} | étape 1/2 : définition manuelle "
         "de la ligne virtuelle (la première image va s'afficher)"
@@ -581,6 +623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             resolved_config_path=resolved_config_path, model_path=model_path,
             model_sha256=model_sha256, frames_processed=0,
             duration_s=time.perf_counter() - start_s, budget=None,
+            diagnostics=diagnostics,
         )
         logger.close()
         return 5
@@ -626,8 +669,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             profiler.record("tracking", float(speed.get("postprocess", 0.0)))
 
             detections: list[Detection] = []
+            observed_confidences: list[float] = []
             boxes = getattr(result, "boxes", None)
-            if boxes is not None and boxes.id is not None:
+            boxes_count = box_count(boxes)
+            tracker_ids_present = (
+                boxes is not None and getattr(boxes, "id", None) is not None
+            )
+            if tracker_ids_present and boxes_count:
                 xyxy = boxes.xyxy.cpu().numpy()
                 ids = boxes.id.int().cpu().tolist()
                 confidences = (
@@ -641,8 +689,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                             confidence=float(confidence),
                         )
                     )
+                    observed_confidences.append(float(confidence))
+
+            # Diagnostic systématique des détections brutes YOLO avant filtrage (spec correction 1)
+            raw_boxes_array = None
+            raw_conf_array = None
+            if boxes is not None:
+                if hasattr(boxes, "xyxy") and boxes.xyxy is not None:
+                    raw_boxes_array = boxes.xyxy.cpu().numpy()
+                if hasattr(boxes, "conf") and boxes.conf is not None:
+                    raw_conf_array = boxes.conf.cpu().numpy()
+            diagnostics.observe_yolo_detections(
+                raw_boxes_array,
+                raw_conf_array,
+                confidence_threshold=config.model.confidence,
+                frame_index=frame_index,
+            )
 
             timestamp_s = time.perf_counter() - start_s
+            # Diagnostic de la frame : distingue « aucune détection » de « boîtes
+            # présentes sans identifiant technique ». Le second cas laisse
+            # `detections` vide (aucun identifiant n'est inventé) : les pistes
+            # déjà connues suivent donc la politique d'occultation, sans qu'aucun
+            # IN/OUT/NEW ne puisse être produit.
+            diagnostics.observe(
+                DetectionSnapshot(
+                    boxes_status=(
+                        BOXES_MISSING if boxes is None
+                        else BOXES_PRESENT if boxes_count
+                        else BOXES_EMPTY
+                    ),
+                    boxes_count=boxes_count,
+                    ids_present=bool(tracker_ids_present and boxes_count),
+                    confidences=tuple(observed_confidences),
+                ),
+                timestamp_s,
+                frame_index,
+            )
             fps_estimator.tick(timestamp_s)
             if fps_estimator.is_ready:
                 budget = config.timing.frame_budget(fps_estimator.require_fps())
@@ -699,6 +782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(
                     f"\r[LIVE] CONFIRMEE={occupancy.occupancy_confirmed} "
+                    f"OBSERVEE={occupancy.occupancy_observed} "
                     f"INCERTAINE={occupancy.occupancy_uncertain} "
                     f"IN={occupancy.total_in} OUT={occupancy.total_out} "
                     f"NEW={occupancy.total_new} PHASE={occupancy.phase}",
@@ -731,6 +815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             frames_processed=frame_index,
             duration_s=time.perf_counter() - start_s,
             budget=budget,
+            diagnostics=diagnostics,
         )
         logger.close()
 
@@ -771,6 +856,7 @@ def _finalize(
     frames_processed: int,
     duration_s: float,
     budget: FrameBudget | None,
+    diagnostics: DetectionDiagnostics | None = None,
 ) -> None:
     """Écrit le bilan de session : événement final, résumé, environnement (spec 6.5)."""
     latency = profiler.summary()
@@ -786,7 +872,9 @@ def _finalize(
         fps_median=round(fps_estimator.fps_median or 0.0, 3),
         fps_min=round(fps_estimator.fps_min or 0.0, 3),
         occupancy_confirmed=snapshot.confirmed,
+        occupancy_observed=snapshot.observed,
         occupancy_uncertain=snapshot.uncertain,
+        occupancy_operational=snapshot.operational,
         total_in=snapshot.total_in,
         total_out=snapshot.total_out,
         total_new=snapshot.total_new,
@@ -812,13 +900,18 @@ def _finalize(
         "bootstrap_frames": occupancy.bootstrap_frames,
         "counters": {
             "initial_occupancy": snapshot.initial,
+            # `occupancy_confirmed` est l'effectif opérationnel (initial + IN +
+            # NEW - OUT) : il ne diminue que sur une sortie confirmée.
             "occupancy_confirmed": snapshot.confirmed,
+            "occupancy_observed": snapshot.observed,
             "occupancy_uncertain": snapshot.uncertain,
+            "occupancy_operational": snapshot.operational,
             "occupancy_range": [snapshot.range_low, snapshot.range_high],
             "total_in": snapshot.total_in,
             "total_out": snapshot.total_out,
             "total_new": snapshot.total_new,
         },
+        "diagnostics": None if diagnostics is None else diagnostics.summary(),
         "latency_ms": latency,
         "events_written": logger.event_count,
     }
@@ -827,7 +920,8 @@ def _finalize(
 
     print(
         f"\n[BILAN] OCCUPATION_CONFIRMEE={snapshot.confirmed} "
-        f"INCERTAINE={snapshot.uncertain} RANGE=[{snapshot.range_low}, {snapshot.range_high}] "
+        f"OBSERVEE={snapshot.observed} INCERTAINE={snapshot.uncertain} "
+        f"RANGE=[{snapshot.range_low}, {snapshot.range_high}] "
         f"IN={snapshot.total_in} OUT={snapshot.total_out} NEW={snapshot.total_new}"
     )
     if latency:

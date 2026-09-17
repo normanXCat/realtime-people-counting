@@ -62,10 +62,15 @@ def make_test_line(p1=(0.0, 0.5), p2=(1.0, 0.5), inside_side="negative"):
 @pytest.fixture
 def test_config(make_config):
     """Configuration de test : durées courtes, orientation intérieure par défaut."""
+    # Warm-up de test : les deux bornes sont calibrées pour que la dernière
+    # frame de warm-up soit la 4e (4 frames observées ET 0,3 s écoulées à
+    # 10 fps), donc la 5e frame est la première frame comptée — c'est la
+    # convention que suit ``Sim.warmup()`` dans toute la suite.
     return make_config({
         "line": {"inside_side": "negative"},
         "timing": {
-            "warmup_seconds": 0.5,      # 5 frames à 10 fps
+            "warmup_seconds": 0.3,
+            "warmup_min_frames": 4,
             "confirmation_seconds": 0.2,  # 2 frames
             "grace_period_seconds": 1.0,  # 10 frames
             "fps_estimate_window": 4,

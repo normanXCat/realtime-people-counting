@@ -226,6 +226,9 @@ class IdentityRecord:
     purge_reason: str | None = None
     observations: int = 0
     aliases: set[int] = field(default_factory=set)
+    #: Dernière raison de rejet d'apparence (`REID_DESCRIPTOR_REJECTED`). Sert à
+    #: ne journaliser qu'un changement de situation, jamais une ligne par frame.
+    last_rejection: str | None = None
 
     @property
     def age_s(self) -> float:
@@ -236,11 +239,14 @@ class IdentityRecord:
 # Gestionnaire
 # ---------------------------------------------------------------------------
 class IdentityManager:
-    """Convertit les pistes techniques en ``person_id`` stables (spec 3.2, 3.3)."""
+    """Convertit les pistes techniques en ``person_id`` stables (spec 3.2, 3.3).
 
-    #: Qualité minimale d'un descripteur pour rafraîchir la galerie (héritage
-    #: ``HybridAssociation._feature_is_trustworthy``).
-    MIN_CONFIDENCE_FOR_GALLERY = 0.70
+    La galerie n'accepte que des apparences **exploitables** : les seuils
+    (confiance minimale, taille minimale de crop, netteté, ancre fiable) vivent
+    dans :class:`config.LongTermReidConfig`, jamais en dur ici (règle 0.3). Un
+    descripteur refusé ne remplace **jamais** l'apparence connue d'une identité
+    et le refus est journalisé une fois par changement de motif.
+    """
 
     def __init__(
         self,
@@ -274,6 +280,9 @@ class IdentityManager:
         self._claimed: set[int] = set()
         #: Identités provisoires issues d'une décision ambiguë (spec 3.3 étape 5).
         self.provisional_ids: set[int] = set()
+        #: Diagnostics (compteurs publiés dans le résumé de session).
+        self.descriptor_rejections = 0
+        self.technical_id_changes = 0
 
     # -- API de lecture ----------------------------------------------------
     @property
@@ -300,6 +309,64 @@ class IdentityManager:
         if frame is None:
             return None
         return self.appearance.describe(frame, bbox)
+
+    # -- Qualité du descripteur avant écriture en galerie -------------------
+    @staticmethod
+    def sharpness(frame: np.ndarray, bbox: Sequence[float]) -> float | None:
+        """Netteté d'un crop : variance du Laplacien (0 = image uniforme).
+
+        Une personne légèrement floue produit un descripteur d'apparence peu
+        informatif : l'écrire en galerie dégraderait durablement la
+        réassociation. Le contrôle n'est actif que si
+        ``reid.long_term.gallery_min_sharpness`` > 0.
+        """
+        if frame is None:
+            return None
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = (int(v) for v in bbox[:4])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return None
+        gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _gallery_rejection(
+        self,
+        observation: Observation,
+        feature: np.ndarray | None,
+        frame: np.ndarray | None,
+    ) -> tuple[str | None, float | None, float | None]:
+        """Motif de rejet d'une apparence pour la galerie, ou ``None``.
+
+        Returns:
+            ``(raison, seuil, valeur_mesurée)``. ``raison`` est l'un de
+            ``low_confidence``, ``tiny_crop``, ``edge_truncated``,
+            ``blurred_or_unreliable`` — ou ``None`` si l'apparence est
+            exploitable.
+        """
+        limits = self.long_term
+        if observation.confidence < limits.gallery_min_confidence:
+            return "low_confidence", float(limits.gallery_min_confidence), float(
+                observation.confidence
+            )
+        bbox = np.asarray(observation.bbox, dtype=float)
+        box_height = float(bbox[3] - bbox[1])
+        box_width = float(bbox[2] - bbox[0])
+        if (
+            box_height < limits.gallery_min_crop_height_px
+            or box_width < limits.gallery_min_crop_width_px
+        ):
+            return "tiny_crop", float(limits.gallery_min_crop_height_px), box_height
+        if not observation.anchor_reliable:
+            return "edge_truncated", None, None
+        if feature is None:
+            return "blurred_or_unreliable", None, None
+        if limits.gallery_min_sharpness > 0 and frame is not None:
+            measured = self.sharpness(frame, bbox)
+            if measured is not None and measured < limits.gallery_min_sharpness:
+                return "blurred_or_unreliable", float(limits.gallery_min_sharpness), measured
+        return None, None, None
 
     # -- Affectation -------------------------------------------------------
     def assign(
@@ -356,8 +423,9 @@ class IdentityManager:
                 return self._create_new(
                     observation, feature, timestamp_s, frame_index,
                     reason="duplicate_claim_new_identity",
+                    frame=frame,
                 )
-            self._touch(record, observation, feature, timestamp_s)
+            self._touch(record, observation, feature, timestamp_s, frame_index, frame)
             return Assignment(
                 technical_track_id=technical_id,
                 person_id=record.person_id,
@@ -374,6 +442,7 @@ class IdentityManager:
             return self._create_new(
                 observation, feature, timestamp_s, frame_index,
                 reason="long_term_reid_disabled",
+                frame=frame,
             )
 
         candidates = self._plausible_candidates(observation, timestamp_s)
@@ -382,6 +451,7 @@ class IdentityManager:
                 observation, feature, timestamp_s, frame_index,
                 reason="no_plausible_candidate",
                 candidates_evaluated=0,
+                frame=frame,
             )
 
         if feature is None:
@@ -389,6 +459,7 @@ class IdentityManager:
                 observation, feature, timestamp_s, frame_index,
                 reason="no_descriptor",
                 candidates_evaluated=len(candidates),
+                frame=frame,
             )
 
         scored = sorted(
@@ -404,6 +475,7 @@ class IdentityManager:
                 observation, feature, timestamp_s, frame_index,
                 reason="candidates_without_descriptor",
                 candidates_evaluated=len(candidates),
+                frame=frame,
             )
 
         best_similarity, best_person, allowed, distance = scored[0]
@@ -417,6 +489,7 @@ class IdentityManager:
                 reason="below_similarity_threshold",
                 candidates_evaluated=len(scored),
                 best_similarity=best_similarity,
+                frame=frame,
             )
 
         if runner_up is not None and (best_similarity - runner_up) < margin:
@@ -424,7 +497,7 @@ class IdentityManager:
             return self._resolve_ambiguous(
                 observation, feature, best_person, best_similarity, runner_up,
                 [person for _score, person, _a, _d in scored],
-                timestamp_s, frame_index, allowed, distance,
+                timestamp_s, frame_index, allowed, distance, frame,
             )
 
         return self._attach_existing(
@@ -436,6 +509,7 @@ class IdentityManager:
             distance=distance,
             reason="reid_match",
             frame_index=frame_index,
+            frame=frame,
         )
 
     # -- Mise en relation --------------------------------------------------
@@ -452,11 +526,33 @@ class IdentityManager:
         distance: float | None,
         reason: str,
         frame_index: int,
+        frame: np.ndarray | None = None,
     ) -> Assignment:
         record = self.records[person_id]
-        self.technical_to_person[int(observation.technical_track_id)] = person_id
-        record.aliases.add(int(observation.technical_track_id))
-        self._touch(record, observation, feature, timestamp_s)
+        new_technical_id = int(observation.technical_track_id)
+        previous_technical_id = record.technical_track_id
+        self.technical_to_person[new_technical_id] = person_id
+        record.aliases.add(new_technical_id)
+        if previous_technical_id is not None and previous_technical_id != new_technical_id:
+            # Un nouvel identifiant technique est rattaché à la même personne :
+            # c'est la trace explicite de la perte/reprise de piste (flou,
+            # occultation). Sans cet événement, le changement d'identifiant
+            # technique serait invisible dans le journal.
+            self.technical_id_changes += 1
+            self._emit(
+                "TECHNICAL_ID_CHANGED", timestamp_s, frame_index,
+                person_id=person_id,
+                technical_track_id=new_technical_id,
+                previous_technical_track_id=previous_technical_id,
+                decision="reassigned_to_existing_person",
+                reason=reason,
+                similarity=None if similarity is None else round(similarity, 4),
+                distance=None if distance is None else round(distance, 2),
+                allowed_distance=None if allowed is None else round(allowed, 2),
+                descriptor_reliable=self._gallery_rejection(observation, feature, frame)[0]
+                is None,
+            )
+        self._touch(record, observation, feature, timestamp_s, frame_index, frame)
         if similarity is not None:
             self._emit(
                 "REID_MATCH", timestamp_s, frame_index,
@@ -499,6 +595,7 @@ class IdentityManager:
         frame_index: int,
         allowed: float | None,
         distance: float | None,
+        frame: np.ndarray | None = None,
     ) -> Assignment:
         """Décision ambiguë : jamais de fusion arbitraire (spec 3.3 étape 5)."""
         policy = self.long_term.ambiguous_policy
@@ -536,6 +633,7 @@ class IdentityManager:
             reason="reid_ambiguous_provisional",
             candidates_evaluated=len(candidate_ids),
             best_similarity=best_similarity,
+            frame=frame,
         )
         # Identité provisoire : elle compte comme une nouvelle personne, mais
         # reste marquée incertaine pour l'audit des décisions ambiguës (spec 3.3).
@@ -558,13 +656,19 @@ class IdentityManager:
         candidates_evaluated: int = 0,
         best_similarity: float | None = None,
         deferred: bool = False,
+        frame: np.ndarray | None = None,
     ) -> Assignment:
         person_id = self._next_person_id
         self._next_person_id += 1
+        # L'apparence initiale passe le même contrôle de qualité que les mises
+        # à jour : un descripteur non exploitable n'entre pas dans la galerie
+        # (il ne servirait qu'à produire de fausses réassociations), et le refus
+        # est journalisé plutôt que silencieux.
+        rejection, threshold, measured = self._gallery_rejection(observation, feature, frame)
         self.records[person_id] = IdentityRecord(
             person_id=person_id,
             technical_track_id=int(observation.technical_track_id),
-            feature=feature,
+            feature=feature if rejection is None else None,
             anchor=observation.anchor,
             bbox_height=observation.bbox_height,
             bbox=np.asarray(observation.bbox, dtype=float),
@@ -575,6 +679,11 @@ class IdentityManager:
             aliases={int(observation.technical_track_id)},
         )
         self.technical_to_person[int(observation.technical_track_id)] = person_id
+        if rejection is not None:
+            self._report_descriptor_rejection(
+                self.records[person_id], observation, rejection, threshold, measured,
+                timestamp_s, frame_index,
+            )
         self._emit(
             "REID_NEW", timestamp_s, frame_index,
             person_id=person_id,
@@ -657,6 +766,8 @@ class IdentityManager:
         observation: Observation,
         feature: np.ndarray | None,
         timestamp_s: float,
+        frame_index: int = 0,
+        frame: np.ndarray | None = None,
     ) -> None:
         record.live = True
         record.technical_track_id = int(observation.technical_track_id)
@@ -671,8 +782,46 @@ class IdentityManager:
         # REID_MATCH et par la transition d'état depuis ABSENTE.
         record.purged_at_s = None
         record.purge_reason = None
-        if feature is not None and observation.confidence >= self.MIN_CONFIDENCE_FOR_GALLERY:
+        rejection, threshold, measured = self._gallery_rejection(observation, feature, frame)
+        if rejection is None:
             record.feature = _blend(record.feature, feature, self.feature_momentum)
+            record.last_rejection = None
+            return
+        # Apparence refusée : l'apparence connue est conservée telle quelle.
+        self._report_descriptor_rejection(
+            record, observation, rejection, threshold, measured, timestamp_s, frame_index
+        )
+
+    def _report_descriptor_rejection(
+        self,
+        record: IdentityRecord,
+        observation: Observation,
+        reason: str,
+        threshold: float | None,
+        measured: float | None,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        """Journalise un refus d'apparence, une fois par changement de motif."""
+        if record.last_rejection == reason:
+            return
+        record.last_rejection = reason
+        self.descriptor_rejections += 1
+        self._emit(
+            "REID_DESCRIPTOR_REJECTED", timestamp_s, frame_index,
+            person_id=record.person_id,
+            technical_track_id=int(observation.technical_track_id),
+            reason=reason,
+            threshold=None if threshold is None else round(threshold, 4),
+            confidence=round(float(observation.confidence), 4),
+            bbox_height=round(float(observation.bbox_height), 2),
+            bbox_width=round(
+                float(observation.bbox[2] - observation.bbox[0]) if len(observation.bbox) >= 4
+                else 0.0,
+                2,
+            ),
+            **({} if measured is None else {"sharpness": round(float(measured), 4)}),
+        )
 
     def mark_purged(
         self,
@@ -690,6 +839,11 @@ class IdentityManager:
         (``purge_retention_seconds``) ; au-delà, :meth:`release_expired` libère la
         mémoire. La purge du ``person_id`` elle-même est **toujours** explicite :
         raison, dernière position et dernier statut sont journalisés.
+
+        ``purge_kind="technical"`` et ``is_exit=False`` : cette méthode ne peut
+        pas produire une sortie. Seul ``COMPTE_SORTIE`` diminue l'occupation
+        (spec 6 du prompt) — la libération de mémoire d'une piste perdue n'a
+        aucune signification métier de sortie.
         """
         record = self.records.get(person_id)
         if record is None:
@@ -703,6 +857,8 @@ class IdentityManager:
             occupancy_impact=occupancy_impact,
             grace_period_frames=grace_period_frames,
             lifetime_s=round(record.age_s, 4),
+            purge_kind="technical",
+            is_exit=False,
         )
         record.purged_at_s = timestamp_s
         record.purge_reason = reason

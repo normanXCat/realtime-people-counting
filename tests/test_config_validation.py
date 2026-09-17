@@ -28,6 +28,8 @@ def _raw() -> dict:
 def test_default_config_loads_and_is_valid():
     config = load_config()
     assert config.schema_version == 1
+    assert config.timing.warmup_min_frames == 15
+    assert config.timing.warmup_seconds == pytest.approx(0.5)
     assert config.line.inside_side == "negative"
     assert config.line.on_line_policy == "indeterminate"
     assert config.timing.fps_source == "measured"
@@ -47,6 +49,101 @@ def test_frame_budget_uses_measured_fps():
     assert budget.fps == 25.0
 
 
+def test_frame_budget_carries_the_warmup_frame_floor():
+    """Les deux bornes du warm-up voyagent ensemble dans le budget."""
+    config = load_config()
+    budget = config.timing.frame_budget(25.0)
+    assert budget.warmup_min_frames == config.timing.warmup_min_frames
+    assert budget.to_dict()["warmup_min_frames"] == config.timing.warmup_min_frames
+
+
+# ---------------------------------------------------------------------------
+# Seuils de détection / d'association (spec 2 du prompt)
+# ---------------------------------------------------------------------------
+def test_yolo_threshold_is_low_enough_for_the_tracker_low_stage():
+    """Le seuil d'inférence ne doit pas supprimer les détections faibles utiles.
+
+    Ultralytics filtre avec ``model.confidence`` **avant** BoT-SORT : tout score
+    sous ce seuil n'existe plus pour le second étage d'association. La cohérence
+    ``model.confidence <= tracker.track_low_thresh`` est donc ce qui rend la
+    récupération des personnes floues possible.
+    """
+    from config import coherence_warnings
+
+    config = load_config()
+    assert config.model.confidence == pytest.approx(0.10)
+    assert config.tracker.track_low_thresh == pytest.approx(0.1)
+    assert config.tracker.track_high_thresh == pytest.approx(0.4)
+    assert config.tracker.new_track_thresh == pytest.approx(0.7)
+    assert config.model.confidence <= config.tracker.track_low_thresh
+    assert coherence_warnings(config) == []
+
+
+def test_high_yolo_threshold_is_warned_about_not_silently_accepted():
+    """Un seuil YOLO trop haut reste possible (ablation) mais est journalisé."""
+    from config import coherence_warnings
+
+    raised = override_config(load_config(), {"model": {"confidence": 0.42}})
+    warnings = coherence_warnings(raised)
+    assert [code for code, _message in warnings] == [
+        "yolo_confidence_above_tracker_low_thresh"
+    ]
+    assert "track_low_thresh" in warnings[0][1]
+    assert "blou" in warnings[0][1] or "flou" in warnings[0][1]
+
+
+def test_tracker_thresholds_must_stay_distinct_and_ordered():
+    raw = _raw()
+    raw["tracker"]["track_low_thresh"] = raw["tracker"]["track_high_thresh"]
+    with pytest.raises(ConfigError) as error:
+        build_config(raw)
+    assert "track_low_thresh" in str(error.value)
+
+    raw = _raw()
+    raw["tracker"]["new_track_thresh"] = 0.2
+    with pytest.raises(ConfigError) as error:
+        build_config(raw)
+    assert "new_track_thresh" in str(error.value)
+
+
+def test_botsort_yaml_is_synchronised_with_the_configuration():
+    """Divergence silencieuse interdite entre le YAML lu par Ultralytics et la config."""
+    from config import REPO_ROOT
+
+    config = load_config()
+    tracker_yaml = yaml.safe_load(
+        (REPO_ROOT / config.tracker.config_path).read_text(encoding="utf-8")
+    )
+    assert tracker_yaml["track_high_thresh"] == pytest.approx(
+        config.tracker.track_high_thresh
+    )
+    assert tracker_yaml["track_low_thresh"] == pytest.approx(
+        config.tracker.track_low_thresh
+    )
+    assert tracker_yaml["new_track_thresh"] == pytest.approx(
+        config.tracker.new_track_thresh
+    )
+
+
+def test_diagnostics_section_is_exposed_and_configurable():
+    config = load_config()
+    assert config.diagnostics.enabled is True
+    assert config.diagnostics.min_interval_seconds == pytest.approx(1.0)
+    updated = override_config(
+        config, {"diagnostics": {"enabled": False, "min_interval_seconds": 2.5}}
+    )
+    assert updated.diagnostics.enabled is False
+    assert updated.diagnostics.min_interval_seconds == pytest.approx(2.5)
+    assert "diagnostics" in config.to_dict()
+
+
+def test_occlusion_ambiguity_radius_is_relative_to_the_local_scale():
+    """Le rayon d'ambiguïté d'un NEW est une fraction de hauteur, pas des pixels."""
+    config = load_config()
+    assert config.geometry.occlusion_ambiguity_ratio > 0.0
+    assert config.geometry.occlusion_ambiguity_ratio == pytest.approx(0.5)
+
+
 def test_frame_budget_refuses_unknown_fps():
     config = load_config()
     with pytest.raises(ConfigError):
@@ -62,15 +159,25 @@ def test_frame_budget_refuses_unknown_fps():
         ("model", "image_size", -640),
         ("model", "image_size", 1000),          # non multiple de 32
         ("timing", "warmup_seconds", -1.0),
+        ("timing", "warmup_min_frames", 0),
         ("timing", "grace_period_seconds", 0.0),
         ("timing", "fps_estimate_window", 1),
         ("geometry", "dead_zone_ratio", 0.0),
         ("geometry", "anchor_edge_margin_ratio", 0.6),
         ("geometry", "scale_window", 0),
+        ("geometry", "occlusion_ambiguity_ratio", -0.1),
         ("line", "min_length_ratio", -0.2),
         ("reid.long_term", "safety_margin", -0.1),
         ("reid.long_term", "v_max_ratio", 0.0),
         ("reid.long_term", "similarity_threshold", 2.0),
+        ("reid.long_term", "gallery_min_confidence", 1.5),
+        ("reid.long_term", "gallery_min_crop_height_px", 0),
+        ("reid.long_term", "gallery_min_crop_width_px", 0),
+        ("reid.long_term", "gallery_min_sharpness", -1.0),
+        ("tracker", "track_high_thresh", 0.0),
+        ("tracker", "track_low_thresh", 1.0),
+        ("tracker", "new_track_thresh", 2.0),
+        ("diagnostics", "min_interval_seconds", 0.0),
         ("occupancy", "snapshot_interval_seconds", 0.0),
         ("output", "flush_every_n_events", 0),
         ("source", "no_detection_seconds", -1.0),

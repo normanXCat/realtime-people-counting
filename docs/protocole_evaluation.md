@@ -15,8 +15,49 @@ Seuils choisis **uniquement** sur l'ensemble de calibration :
 | Paramètre de configuration | Rôle |
 |---|---|
 | `model.confidence`, `model.nms_iou`, `model.image_size` | détection |
-| `geometry.dead_zone_ratio`, `timing.confirmation_seconds`, `timing.grace_period_seconds` | franchissement |
-| `reid.long_term.similarity_threshold`, `safety_margin`, `v_max_ratio`, `spatial_margin_ratio` | réassociation long terme |
+| `tracker.track_high_thresh`, `tracker.track_low_thresh`, `tracker.new_track_thresh` | persistance de piste (association à deux étages) |
+| `geometry.dead_zone_ratio`, `geometry.occlusion_ambiguity_ratio`, `timing.confirmation_seconds`, `timing.grace_period_seconds` | franchissement et ambiguïté d'occupation |
+| `timing.warmup_seconds`, `timing.warmup_min_frames` | mesure de l'effectif initial |
+| `reid.long_term.similarity_threshold`, `safety_margin`, `v_max_ratio`, `spatial_margin_ratio`, `gallery_min_*` | réassociation long terme et qualité des apparences |
+
+Compromis à documenter dans la courbe de calibration (spec 2 du prompt) : un
+seuil de détection plus bas améliore la récupération des personnes floues mais
+ajoute des candidats faibles ; un seuil de détection plus haut réduit les faux
+positifs mais casse la persistance de piste. `model.confidence` doit rester
+`<= tracker.track_low_thresh` — au-delà, la gamme
+`[track_low_thresh, model.confidence[` n'atteint jamais BoT-SORT et la
+récupération des personnes floues est impossible. Toute divergence est
+journalisée en `CONFIG_WARNING` au démarrage de la session.
+
+### 1.1 Comparaison des seuils sur les scénarios synthétiques
+
+Mesure reproductible (`test_threshold_matrix_on_the_same_blurred_scenario`,
+tests/test_track_loss_recovery.py) : une personne comptée à l'intérieur devient
+floue, puis une détection isolée à faible score apparaît ailleurs dans l'image.
+Les deux étages de BoT-SORT sont modélisés — le seuil d'inférence décide si la
+détection *existe*, `track_low_thresh` décide si elle peut *nourrir* une piste,
+`new_track_thresh` décide si elle peut en *créer* une.
+
+| `model.confidence` | `track_low_thresh` | flou (conf.) | piste maintenue | pertes de piste | faux positifs |
+|---|---|---|---|---|---|
+| 0,25 (ancien) | 0,10 | 0,12 | non → `OCCULTEE` | 1 / 1 | 0 |
+| **0,10 (retenu)** | **0,10** | 0,12 | **oui** | **0 / 1** | **0** |
+| 0,10 | 0,30 | 0,12 | non (seuil tracker) | 1 / 1 | 0 |
+| 0,10 | 0,10 | 0,08 | non (sous le plancher) | 1 / 1 | 0 |
+| 0,10 | 0,10 | 0,12 + parasite 0,20 | oui | 0 / 1 | 0 |
+| 0,10 | 0,10 | 0,12 + parasite 0,80 | oui | 0 / 1 | 0 (nouvelle personne réelle, `NEW` attendu) |
+
+Lecture : l'abaissement du seuil d'inférence supprime la seule perte de piste sur
+flou **sans** créer de faux positif, parce que le seuil de création de piste
+(`new_track_thresh = 0,7`) reste strict — une détection parasite sous 0,7 ne peut
+pas devenir une piste. Un `track_low_thresh` au-dessus du score flou annule le
+bénéfice du seuil bas : les deux valeurs doivent être calibrées ensemble.
+
+Dans tous les cas de figure, `total_out` reste à 0 et `occupancy_operational`
+reste à 1 : une perte de piste est une *incertitude*, jamais un comptage.
+
+Sur vidéos réelles, cette matrice doit être rejouée sur l'ensemble de
+calibration pour fixer `model.confidence` et les trois seuils tracker.
 
 L'ensemble de test n'est exécuté **qu'une fois**, pour le rapport final. Toute
 valeur encore marquée « PROVISOIRE » dans `config/pipeline.yaml` doit avoir été
@@ -117,6 +158,16 @@ Sorties : `results/protocol/<variante>/report.json` (détail + verdict),
 `results/protocol/summary_<ensemble>.md` (tableau comparatif), et par session
 `events.jsonl`, `summary.json`, `environment.json`, `calibration.json`,
 `config_resolved.yaml` (qui fige l'orientation intérieur/extérieur validée).
+
+Définition des deux métriques d'occupation (pour que `max_occupancy_mae` soit
+sans ambiguïté) :
+
+- `max_occupancy_mae` porte sur `occupancy_confirmed`, l'effectif
+  **opérationnel** (`initial_occupancy + IN + NEW - OUT`), qui ne diminue que sur
+  une sortie confirmée par la machine à états ;
+- `range_coverage` mesure la proportion de relevés de vérité terrain couverts par
+  l'intervalle publié `[occupancy_observed, occupancy_confirmed]`, la borne basse
+  ne comptant que les personnes actuellement observables.
 
 ## 6. Traçabilité exigée par le rapport
 

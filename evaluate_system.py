@@ -217,10 +217,16 @@ def evaluer_occupation(
 ) -> dict[str, Any]:
     """Compare les `OCCUPANCY_SNAPSHOT` du journal aux relevés de la vérité terrain.
 
-    Retourne l'erreur absolue moyenne sur l'occupation **confirmée**, ainsi que
-    le taux de couverture de la vérité terrain par l'intervalle
-    `[occupancy_confirmed, occupancy_confirmed + occupancy_uncertain]` — c'est ce
-    couple qui est publié, pas un nombre unique (spec 4.4).
+    L'erreur absolue moyenne porte sur l'occupation **confirmée au sens
+    opérationnel** : le bilan `occupation initiale + IN + NEW - OUT`, publiée
+    dans `occupancy_confirmed`. C'est l'effectif que le système affirme présent,
+    et il ne diminue **que** sur une sortie confirmée par la machine à états —
+    jamais sur une occultation, une expiration de grâce ou une purge technique.
+
+    Le taux de couverture mesure si la vérité terrain tombe dans l'intervalle
+    publié `[occupancy_observed, occupancy_operational]` : la borne basse ne
+    compte que les personnes actuellement observables, la borne haute conserve
+    celles dont l'observation est perdue (spec 4.4).
     """
     errors: list[float] = []
     covered = 0
@@ -230,8 +236,8 @@ def evaluer_occupation(
         if truth is None:
             continue
         compared += 1
-        confirmed = int(snapshot["occupancy_confirmed"])
-        errors.append(abs(confirmed - truth))
+        operational = int(snapshot["occupancy_confirmed"])
+        errors.append(abs(operational - truth))
         low, high = snapshot["occupancy_range"]
         if float(low) <= truth <= float(high):
             covered += 1

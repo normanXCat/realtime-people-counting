@@ -1,3 +1,14 @@
+# Configuration BoT-SORT lue directement par Ultralytics.
+#
+# Les trois seuils ci-dessous sont DOUBLÉS dans config/pipeline.yaml (section
+# `tracker`) : le pipeline les valide, les publie et journalise leur cohérence
+# avec le seuil d'inférence YOLO. Un test vérifie que les deux sources ne
+# divergent pas — une divergence serait sinon totalement silencieuse.
+#
+# track_low_thresh reste volontairement bas (0.1) : c'est lui qui conserve les
+# détections faibles (personne floue) pour le second étage d'association. Le
+# garde-fou contre les faux positifs est new_track_thresh (0.7), pas le seuil
+# d'inférence YOLO (model.confidence = 0.10 dans pipeline.yaml).
 tracker_type: botsort
 
 # Association et conservation des pistes pendant les occlusions.

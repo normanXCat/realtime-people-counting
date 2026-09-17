@@ -20,7 +20,15 @@ Corrections apportées par rapport à l'audit (§2.2 c, h, i et spec 4.2) :
   émet ``AMBIGUOUS_CROSSING`` sans compter ; ``ambiguous_immediate`` tranche dès
   la disparition en déclarant l'ambiguïté ;
 - une dérive de demi-plan sans intersection capturée (ligne non couvrante) émet
-  ``INCONSISTENT_STATE`` au lieu d'être ignorée ou tranchée silencieusement.
+  ``INCONSISTENT_STATE`` au lieu d'être ignorée ou tranchée silencieusement ;
+- ``NEW`` est strictement réservé à une personne **jamais observée à
+  l'extérieur** : une piste vue dehors puis retrouvée loin à l'intérieur sans
+  intersection capturée produit une entrée signalée (``ENTREE_EN_COURS``), pas
+  une nouvelle présence — sinon une personne qui entre réellement serait
+  comptée comme une apparition intérieure ;
+- une apparition intérieure stable est **différée** tant qu'une personne déjà
+  comptée est en occultation à proximité : le ``NEW`` peut être un doublon de
+  cette personne, et l'ambiguïté est journalisée plutôt que tranchée.
 
 Sémantique de résolution : la **première** ligne dont l'état source correspond
 et dont la condition est vraie l'emporte. La ligne de suspension (spec 5.4) est
@@ -71,6 +79,8 @@ class Action(Enum):
     MARCHE_ZONE_MORTE_DEPUIS_INTERIEUR = auto()
     MARCHE_ZONE_MORTE_DEPUIS_EXTERIEUR = auto()
     SUSPEND_DECISION = auto()         # ancre non fiable : aucune décision (spec 5.4)
+    SIGNALE_ENTREE_SANS_FRANCHISSEMENT = auto()  # changement de côté sans intersection
+    DIFFERE_NOUVELLE_PRESENCE = auto()  # NEW retenu : personne comptée en occultation
 
 
 class Approach(Enum):
@@ -110,6 +120,22 @@ class FsmContext:
     warmup_done: bool = True
     warmup_stable: bool = False
     """Stable en position et sans décision de franchissement claire (spec 5.8)."""
+
+    exterior_history: bool = False
+    """La piste a-t-elle déjà été observée dans la zone **extérieure** ?
+
+    C'est la condition qui interdit ``NEW`` : une personne vue dehors ne peut
+    pas « apparaître » à l'intérieur, elle y entre (franchissement capturé ou
+    entrée signalée). Sans ce drapeau, une piste perdue puis réapparue de
+    l'autre côté de la ligne produirait un faux ``NEW`` en plus de son ``IN``.
+    """
+
+    new_blocked_by_occlusion: bool = False
+    """Une personne déjà comptée est en occultation à proximité de cette piste.
+
+    Une apparition intérieure stable ne peut alors pas être confirmée comme
+    nouvelle : le ``NEW`` serait possiblement un doublon de la personne occultée.
+    """
 
     approach: Approach = Approach.INTERIEUR
     pending_crossing: str | None = None
@@ -191,6 +217,16 @@ CONDITIONS: dict[str, Callable[[FsmContext], bool]] = {
     and ctx.warmup_stable
     and ctx.side is Side.EXTERIEURE,
     "warmup_done_and_unstable": lambda ctx: ctx.warmup_done and not ctx.warmup_stable,
+    # -- Nouvelle présence (restreinte, spec 4 du prompt) ------------------
+    "interior_stable_blocked_by_occlusion": lambda ctx: ctx.interior_streak
+    >= max(1, ctx.confirmation_frames)
+    and ctx.new_blocked_by_occlusion,
+    "interior_stable_with_exterior_history": lambda ctx: ctx.interior_streak
+    >= max(1, ctx.confirmation_frames)
+    and ctx.exterior_history,
+    "interior_stable_without_exterior_history": lambda ctx: ctx.interior_streak
+    >= max(1, ctx.confirmation_frames)
+    and not ctx.exterior_history,
     # -- Perte de piste ---------------------------------------------------
     "lost": lambda ctx: ctx.lost,
     "grace_expired_without_pending": lambda ctx: ctx.grace_expired
@@ -218,8 +254,7 @@ CONDITIONS: dict[str, Callable[[FsmContext], bool]] = {
     "approach_inside_and_far_outside": lambda ctx: _approach_inside(ctx) and _far_outside(ctx),
     "approach_outside_and_far_inside": lambda ctx: not _approach_inside(ctx)
     and _far_inside(ctx),
-    # -- Nouvelle présence -------------------------------------------------
-    "interior_stable": lambda ctx: ctx.interior_streak >= max(1, ctx.confirmation_frames),
+
     # -- Réapparition ------------------------------------------------------
     "recovered": lambda ctx: ctx.observed and ctx.lost_frames > 0,
     "recovered_pending_in_confirmed": lambda ctx: ctx.observed
@@ -266,10 +301,21 @@ S, A = TrackState, Action
 
 TRANSITION_TABLE: tuple[TransitionRule, ...] = (
     # --- Sûreté : aucune décision sur une ancre non fiable (spec 5.4) -----
+    # Ordre de priorité effectif de la table (spec 8 du prompt) :
+    #   1. ancre non fiable / échelle indisponible (suspension, court-circuit) ;
+    #   2. warm-up (état INITIALISATION) ;
+    #   3. perte de piste ;
+    #   4. franchissement confirmé ;
+    #   5. franchissement amorcé ;
+    #   6. demi-tour ;
+    #   7. changement de zone / nouvelle présence ;
+    #   8. aucune transition (état inchangé, aucune décision inventée).
+    # ``tests/test_fsm.py::test_priority_order_matches_the_documented_intent``
+    # verrouille cet ordre.
     TransitionRule(
         "suspend_unreliable_anchor", None,
         "observed_and_unreliable_anchor", None, A.SUSPEND_DECISION,
-        "Ancre pieds au bord de l'image ou échelle locale indisponible",
+        "Ancre pieds au bord de l'image, chute anormale de hauteur ou échelle locale indisponible",
     ),
     # --- INITIALISATION (warm-up, spec 5.8) ------------------------------
     TransitionRule(
@@ -303,9 +349,23 @@ TRANSITION_TABLE: tuple[TransitionRule, ...] = (
         "in_dead_zone", S.EN_ZONE_MORTE, A.MARCHE_ZONE_MORTE_DEPUIS_EXTERIEUR,
     ),
     TransitionRule(
+        "outside_new_presence_deferred_by_occlusion", S.EXTERIEUR,
+        "interior_stable_blocked_by_occlusion", S.EXTERIEUR,
+        A.DIFFERE_NOUVELLE_PRESENCE,
+        "Apparition intérieure stable mais une personne comptée est occultée à "
+        "proximité : NEW retenu et journalisé, jamais compté à l'aveugle",
+    ),
+    TransitionRule(
+        "outside_entry_without_crossing_signalled", S.EXTERIEUR,
+        "interior_stable_with_exterior_history", S.ENTREE_EN_COURS,
+        A.SIGNALE_ENTREE_SANS_FRANCHISSEMENT,
+        "Personne déjà observée dehors et retrouvée loin à l'intérieur sans "
+        "intersection capturée : entrée signalée puis confirmée (jamais NEW)",
+    ),
+    TransitionRule(
         "outside_new_presence_confirmed", S.EXTERIEUR,
-        "interior_stable", S.PRESENTE, A.NOUVELLE_PRESENCE,
-        "Apparition directe à l'intérieur, sans franchissement observé",
+        "interior_stable_without_exterior_history", S.PRESENTE, A.NOUVELLE_PRESENCE,
+        "Apparition directe à l'intérieur d'une personne jamais vue dehors",
     ),
     TransitionRule("outside_lost", S.EXTERIEUR, "lost", S.OCCULTEE, A.MARQUE_OCCULTEE),
     # --- PRESENTE ---------------------------------------------------------
@@ -345,16 +405,10 @@ TRANSITION_TABLE: tuple[TransitionRule, ...] = (
         "dead_zone_cross_commits_entry", S.EN_ZONE_MORTE,
         "crossed_in_in_buffer", S.ENTREE_EN_COURS, A.AMORCE_ENTREE,
     ),
-    TransitionRule(
-        "dead_zone_return_to_inside", S.EN_ZONE_MORTE,
-        "approach_inside_and_far_inside", S.PRESENTE, A.AUCUNE,
-        "Demi-tour dans la zone morte, retour côté intérieur",
-    ),
-    TransitionRule(
-        "dead_zone_return_to_outside", S.EN_ZONE_MORTE,
-        "approach_outside_and_far_outside", S.EXTERIEUR, A.AUCUNE,
-        "Demi-tour dans la zone morte, retour côté extérieur",
-    ),
+    # Ordre : franchissement amorcé (traversée complète du tampon) avant
+    # demi-tour, conformément à la priorité annoncée en tête de table. Les
+    # conditions sont mutuellement exclusives (approche + zone), l'ordre n'est
+    # donc pas qu'une convention : il rend la priorité lisible et testable.
     TransitionRule(
         "dead_zone_commit_exit", S.EN_ZONE_MORTE,
         "approach_inside_and_far_outside", S.SORTIE_EN_COURS, A.AMORCE_SORTIE,
@@ -364,6 +418,16 @@ TRANSITION_TABLE: tuple[TransitionRule, ...] = (
         "dead_zone_commit_entry", S.EN_ZONE_MORTE,
         "approach_outside_and_far_inside", S.ENTREE_EN_COURS, A.AMORCE_ENTREE,
         "Traversée du tampon depuis l'extérieur sans signal de franchissement capturé",
+    ),
+    TransitionRule(
+        "dead_zone_return_to_inside", S.EN_ZONE_MORTE,
+        "approach_inside_and_far_inside", S.PRESENTE, A.AUCUNE,
+        "Demi-tour dans la zone morte, retour côté intérieur",
+    ),
+    TransitionRule(
+        "dead_zone_return_to_outside", S.EN_ZONE_MORTE,
+        "approach_outside_and_far_outside", S.EXTERIEUR, A.AUCUNE,
+        "Demi-tour dans la zone morte, retour côté extérieur",
     ),
     TransitionRule(
         "dead_zone_lost", S.EN_ZONE_MORTE, "lost", S.OCCULTEE, A.MARQUE_OCCULTEE

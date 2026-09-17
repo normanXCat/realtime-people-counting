@@ -203,7 +203,9 @@ def test_long_occlusion_ends_in_the_uncertain_bound(sim, sink):
     sim.steps(2, [det(1, OUTSIDE_Y, x=150.0)])
     sim.steps(3, [det(1, INSIDE_Y, x=150.0)])
     sim.steps(20)  # bien au-delà de la grâce
-    assert manager.occupancy_confirmed == 0
+    # L'occultation ne retire jamais la personne de l'occupation confirmée.
+    assert manager.occupancy_confirmed == 1
+    assert manager.occupancy_observed == 0
     assert manager.occupancy_uncertain == 1
     assert manager.occupancy_range == (0, 1)
     assert sink.count("PURGE") == 1
@@ -288,8 +290,10 @@ def test_full_session_scenario_counts_are_exact(sim, sink):
     assert manager.total_out == 1
     assert manager.total_new == 0
     assert sink.count("AMBIGUOUS_CROSSING") == 0
-    # 1 est toujours présente, 2 est sortie, 3 est dans la borne haute.
-    assert manager.occupancy_confirmed == 1
+    # 1 est toujours présente, 2 est sortie, 3 est dans l'incertitude :
+    # l'effectif opérationnel vaut 3 entrées - 1 sortie = 2.
+    assert manager.occupancy_confirmed == 2
+    assert manager.occupancy_observed == 1
     assert manager.occupancy_uncertain == 1
     assert manager.occupancy_range == (1, 2)
     # Chaque purge est journalisée ; seule celle de 3 est incertaine (2 est

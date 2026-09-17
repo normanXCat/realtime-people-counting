@@ -153,6 +153,58 @@ et aucune marge géométrique n'est codé en dur.
 - les valeurs marquées « PROVISOIRE » ne sont pas encore calibrées : elles
   doivent être fixées sur l'ensemble de calibration du protocole d'évaluation.
 
+Points de configuration à connaître :
+
+- **`model.confidence` (0,10) et `tracker.track_low_thresh` (0,1)** : le seuil
+  d'inférence YOLO s'applique *avant* BoT-SORT, il doit donc rester au plus égal
+  au seuil bas du tracker, sinon la gamme
+  `[track_low_thresh, model.confidence[` n'atteint jamais l'association et les
+  personnes floues sont perdues. Une incohérence est journalisée en
+  `CONFIG_WARNING` (elle n'empêche pas un run d'ablation) ;
+- **`timing.warmup_seconds` + `timing.warmup_min_frames`** : le warm-up exige les
+  **deux** bornes (durée écoulée *et* frames observées). La dernière frame de
+  warm-up est celle qui atteint les deux ; la suivante est la première frame
+  comptée, et `WARMUP_END` publie `warmup_frames_observed`,
+  `warmup_elapsed_seconds` et l'`initial_occupancy` réellement retenu ;
+- **`reid.long_term.gallery_*`** : qualité minimale d'une apparence avant
+  écriture en galerie (confiance, taille de crop, netteté). Une apparence
+  refusée n'écrase jamais une apparence connue et le refus est journalisé
+  (`REID_DESCRIPTOR_REJECTED`) ;
+- **`geometry.occlusion_ambiguity_ratio`** : rayon (fraction de la hauteur
+  médiane) dans lequel une apparition intérieure peut être confondue avec une
+  personne déjà comptée dont l'observation est perdue. Dans ce rayon, `NEW` est
+  différé et signalé, jamais deviné ;
+- **`diagnostics`** : journalisation des pertes d'association
+  (`DETECTION_ABSENT`, `TRACK_ID_ABSENT`, `DETECTION_LOW_CONFIDENCE`) avec
+  limitation de débit — le front montant est toujours écrit, les compteurs
+  complets restent dans `summary.json`.
+
+Occupation publiée — trois valeurs, un invariant :
+
+- `occupancy_confirmed` **est** l'effectif opérationnel, c'est-à-dire le bilan
+  `initial_occupancy + IN + NEW - OUT`. Il ne diminue **que** sur une sortie
+  confirmée par la machine à états (ou une réapparition cohérente côté
+  extérieur, qui vaut confirmation de sortie). Ni une occultation, ni
+  l'expiration de la période de grâce, ni une absence de détection (`boxes`
+  absentes ou sans `track_id`), ni une purge technique, ni un changement
+  d'identifiant technique, ni la libération de la mémoire de galerie ne le font
+  baisser ;
+- `occupancy_observed` est la part de cet effectif actuellement observable ;
+- `occupancy_uncertain` est la part dont l'observation est perdue. Elle n'est
+  jamais retirée de l'occupation : une personne occultée reste comptée jusqu'à
+  une sortie réellement observée ;
+- l'invariant `observed + uncertain == confirmed` est vérifié à chaque
+  snapshot publié, et `occupancy_range` vaut `[occupancy_observed,
+  occupancy_confirmed]`. Une divergence est journalisée
+  (`INCONSISTENT_STATE`, kind `occupancy_ledger_mismatch`), jamais corrigée par
+  un `max(0, …)` : un test vérifie l'absence de tout clamp silencieux.
+
+`PURGE` est toujours une purge **technique** (`purge_kind: technical`,
+`is_exit: false`) : elle ne produit jamais de sortie. Seul un événement `OUT`
+(issu des actions FSM `COMPTE_SORTIE` / `CONFIRME_SORTIE_DIFFEREE`) décrémente
+l'occupation — un test d'audit verrouille le fait que `total_out` n'est
+incrémenté nulle part ailleurs.
+
 ## Tests
 
 ```bash
@@ -170,12 +222,16 @@ Quatre niveaux de tests (section 8 du cahier des charges) :
    stabilisation (`test_stabilization_flags.py`) ;
 2. **trajectoires synthétiques** — compteurs et occupation attendus, scénarios
    d'hésitation, de franchissement rapide et de scène initialement peuplée
-   (`test_occupancy_synthetic.py`) ;
+   (`test_occupancy_synthetic.py`), frontière du warm-up et effectif initial
+   (`test_warmup.py`), occupation opérationnelle/incertaine, purge technique et
+   demi-tours (`test_occupancy_operational.py`) ;
 3. **intégration sans caméra** — croisements, occultations, réapparitions,
-   situation ambiguë de ReID (`test_pipeline_integration.py`), et parcours
-   complets du point d'entrée avec détection simulée : ligne validée utilisée
-   partout (horizontale et inclinée), annulation, `--no-show` sans écran
-   (`test_main_e2e.py`) ;
+   situation ambiguë de ReID (`test_pipeline_integration.py`), perte de piste
+   par flou et réapparition avec un nouvel ID technique
+   (`test_track_loss_recovery.py`), diagnostics de détection
+   (`test_track_diagnostics.py`), et parcours complets du point d'entrée avec
+   détection simulée : ligne validée utilisée partout (horizontale et inclinée),
+   annulation, `--no-show` sans écran (`test_main_e2e.py`) ;
 4. **vidéos réelles annotées** — exécutées par le protocole d'évaluation, avec
    les métriques de la section 9 (`scripts/run_protocol.py`).
 

@@ -280,8 +280,10 @@ def test_disappearance_during_exit_is_ambiguous_and_bounded(manager, frame, sink
     assert manager.total_out == 0
     assert sink.of_type("AMBIGUOUS_CROSSING")[0]["direction"] == "out"
     # La personne était comptée présente et aucune sortie n'est observée :
-    # elle reste dans la borne haute de l'occupation (spec 4.4).
-    assert manager.occupancy_confirmed == 0
+    # elle reste comptée (occupation confirmée = opérationnelle) et seule son
+    # observation est perdue (spec 4.4, 6).
+    assert manager.occupancy_confirmed == 1
+    assert manager.occupancy_observed == 0
     assert manager.occupancy_uncertain == 1
     assert manager.occupancy_range == (0, 1)
 
@@ -325,7 +327,10 @@ def test_recovery_outside_confirms_the_exit(manager, frame, sink):
 
 def test_ambiguous_immediate_policy_decides_at_loss(frame, sink, make_config):
     config = make_config({
-        "timing": {"warmup_seconds": 0.5, "confirmation_seconds": 0.2, "grace_period_seconds": 1.0},
+        "timing": {
+            "warmup_seconds": 0.3, "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2, "grace_period_seconds": 1.0,
+        },
         "occupancy": {"in_progress_disappearance_policy": "ambiguous_immediate"},
     })
     manager = build_manager(config, sink)
@@ -350,15 +355,19 @@ def test_purge_without_exit_feeds_the_uncertain_bound(manager, frame, sink):
 
     sim.steps(13)  # disparition prolongée
     assert manager.total_out == 0
-    assert manager.occupancy_confirmed == 0
+    # Une purge est technique : elle ne décrémente pas l'occupation confirmée.
+    assert manager.occupancy_confirmed == 1
+    assert manager.occupancy_observed == 0
     assert manager.occupancy_uncertain == 1
     assert manager.occupancy_range == (0, 1)
     purge = sink.of_type("PURGE")[0]
     assert purge["reason"] == "grace_expired"
     assert purge["occupancy_impact"] == "uncertain"
+    assert purge["is_exit"] is False
     # Le snapshot publié porte bien les trois valeurs (spec 4.4).
     snapshot = sink.of_type("OCCUPANCY_SNAPSHOT")[-1]
-    assert snapshot["occupancy_confirmed"] == 0
+    assert snapshot["occupancy_confirmed"] == 1
+    assert snapshot["occupancy_observed"] == 0
     assert snapshot["occupancy_uncertain"] == 1
     assert snapshot["occupancy_range"] == [0, 1]
 
@@ -388,8 +397,10 @@ def test_reappearance_after_release_creates_a_new_identity(manager, frame, sink)
     assert sink.count("REID_MATCH") == 0
     # Nouvelle identité confirmée comme apparition intérieure.
     assert manager.total_new == 1
-    assert manager.occupancy_confirmed == 1
-    # L'ancienne personne reste dans la borne haute : jamais retirée en silence.
+    # L'effectif opérationnel contient les deux : la nouvelle personne et
+    # l'ancienne, jamais retirée en silence.
+    assert manager.occupancy_confirmed == 2
+    assert manager.occupancy_observed == 1
     assert manager.occupancy_uncertain == 1
     assert manager.occupancy_range == (1, 2)
 
@@ -411,7 +422,10 @@ def test_snapshot_is_published_at_the_configured_interval(manager, frame, sink):
 def test_crossing_an_inclined_line_is_counted(frame, sink, make_config):
     """Une ligne inclinée validée sert telle quelle à la détection de franchissement."""
     config = make_config({
-        "timing": {"warmup_seconds": 0.5, "confirmation_seconds": 0.2, "grace_period_seconds": 1.0},
+        "timing": {
+            "warmup_seconds": 0.3, "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2, "grace_period_seconds": 1.0,
+        },
     })
     # Diagonale (0,2 ; 0,2) -> (0,8 ; 0,8), soit la droite y = x dans une image
     # 600×600 : la distance signée vaut signe(x - y), l'intérieur est négatif.
@@ -428,7 +442,10 @@ def test_crossing_an_inclined_line_is_counted(frame, sink, make_config):
 def test_vertical_line_is_used_as_validated(frame, sink, make_config):
     """Ligne verticale : l'intérieur est le demi-plan x >= 0,5 (orientation validée)."""
     config = make_config({
-        "timing": {"warmup_seconds": 0.5, "confirmation_seconds": 0.2, "grace_period_seconds": 1.0},
+        "timing": {
+            "warmup_seconds": 0.3, "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2, "grace_period_seconds": 1.0,
+        },
     })
     # x = 0,5 dans une image 600×600 : distance signée = signe(x - 300).
     manager = build_manager(config, sink, line=make_test_line((0.5, 0.0), (0.5, 1.0)))
@@ -470,7 +487,10 @@ def test_side_change_without_crossing_is_reported(frame, sink, make_config):
     latéralement hors de son étendue ne peut produire aucune intersection.
     """
     config = make_config({
-        "timing": {"warmup_seconds": 0.5, "confirmation_seconds": 0.2, "grace_period_seconds": 1.0},
+        "timing": {
+            "warmup_seconds": 0.3, "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2, "grace_period_seconds": 1.0,
+        },
     })
     # La ligne ne couvre que la partie centrale : c'est la ligne « validée par
     # l'opérateur » pour ce scénario (elle ne vient plus de la configuration).
@@ -528,7 +548,10 @@ def test_dead_zone_follows_local_bbox_height(sink, make_config, height, expected
     import numpy as _np
 
     config = make_config({
-        "timing": {"warmup_seconds": 0.5, "confirmation_seconds": 0.2, "grace_period_seconds": 1.0},
+        "timing": {
+            "warmup_seconds": 0.3, "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2, "grace_period_seconds": 1.0,
+        },
     })
     manager = build_manager(config, sink)
     big_frame = _np.zeros((1200, 1200, 3), dtype=_np.uint8)

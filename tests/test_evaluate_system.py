@@ -43,6 +43,14 @@ def _crossing(event_type: str, timestamp_s: float, person_id: int = 1) -> dict:
 
 
 def _snapshot(timestamp_s: float, confirmed: int, uncertain: int = 0) -> dict:
+    """Ligne `OCCUPANCY_SNAPSHOT` conforme à ce que publie le pipeline.
+
+    `confirmed` est l'effectif **opérationnel** (`initial + IN + NEW - OUT`),
+    `uncertain` en est la part dont l'observation est perdue ; le reste
+    (`occupancy_observed`) est actuellement observable, et l'encadrement publié
+    vaut `[observed, operational]`.
+    """
+    observed = max(0, confirmed - uncertain)
     return {
         "schema_version": 1,
         "event_id": f"e-snap-{timestamp_s}",
@@ -51,8 +59,9 @@ def _snapshot(timestamp_s: float, confirmed: int, uncertain: int = 0) -> dict:
         "timestamp_s": timestamp_s,
         "frame_index": int(timestamp_s * 30),
         "occupancy_confirmed": confirmed,
+        "occupancy_observed": observed,
         "occupancy_uncertain": uncertain,
-        "occupancy_range": [confirmed, confirmed + uncertain],
+        "occupancy_range": [observed, confirmed],
     }
 
 

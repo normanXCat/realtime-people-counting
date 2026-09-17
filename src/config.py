@@ -62,9 +62,25 @@ class SourceConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    """Inférence YOLO.
+
+    ``confidence`` est le **seuil global** de l'inférence : c'est lui qui décide
+    quelles détections existent avant BoT-SORT. Il doit rester suffisamment bas
+    pour laisser passer les détections faibles qu'une personne floue produit
+    encore, sinon l'association de BoT-SORT (et donc la persistance de piste)
+    perd une information qui existait. Le garde-fou contre les faux positifs
+    n'est pas ce seuil : il est porté par les seuils distincts de
+    :class:`TrackerConfig` (``new_track_thresh``) et par le comptage lui-même
+    (confirmation, zone morte, ReID).
+
+    La cohérence ``confidence <= TrackerConfig.track_low_thresh`` est vérifiée
+    par :func:`coherence_warnings` : au-delà, la gamme
+    ``[track_low_thresh, confidence[`` n'atteint jamais le tracker.
+    """
+
     path: str = "models/yolo11n.pt"
     expected_sha256: str = ""
-    confidence: float = 0.25
+    confidence: float = 0.10
     nms_iou: float = 0.55
     image_size: int = 960
     classes: tuple[int, ...] = (0,)
@@ -72,18 +88,54 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrackerConfig:
+    """BoT-SORT : persistance de piste et association à deux étages.
+
+    Les trois seuils sont distincts du seuil YOLO (règle 0.3 appliquée au
+    tracking) :
+
+    - ``track_high_thresh`` : plancher des détections utilisées pour
+      l'association principale ;
+    - ``track_low_thresh`` : plancher des détections conservées pour le second
+      étage d'association (celles qu'une personne floue produit encore) ;
+    - ``new_track_thresh`` : plancher exigé pour créer une **nouvelle** piste,
+      c'est-à-dire le garde-fou explicite contre les faux positifs du tracker.
+
+    Ces valeurs doivent rester synchronisées avec le fichier YAML lu par
+    Ultralytics (``config_path``) ; un test le vérifie, car une divergence
+    serait silencieuse au runtime.
+    """
+
     config_path: str = "src/configs/custom_botsort.yaml"
     persist: bool = True
+    track_high_thresh: float = 0.4
+    track_low_thresh: float = 0.1
+    new_track_thresh: float = 0.7
 
 
 @dataclass(frozen=True)
 class LongTermReidConfig:
+    """Galerie long terme et **qualité des descripteurs écrits en galerie**.
+
+    Les quatre garde-fous ``gallery_*`` décrivent quand une apparence est
+    exploitable. Ils existent parce qu'un descripteur calculé sur une détection
+    faible, un crop minuscule, une boîte tronquée par un bord ou une image floue
+    dégrade la galerie : réassocier une identité connue à partir d'une apparence
+    non fiable est exactement ce qui produit les fausses identités et les faux
+    ``NEW``. Une apparence rejetée n'écrase **jamais** une apparence connue ;
+    le rejet est journalisé (``REID_DESCRIPTOR_REJECTED``), jamais silencieux.
+    """
+
     enabled: bool = True
     similarity_threshold: float = 0.40
     safety_margin: float = 0.10
     v_max_ratio: float = 1.5
     spatial_margin_ratio: float = 0.3
     ambiguous_policy: str = "provisional_person"
+    gallery_min_confidence: float = 0.70
+    gallery_min_crop_height_px: int = 32
+    gallery_min_crop_width_px: int = 16
+    #: Variance minimale du Laplacien du crop (netteté). 0 = contrôle désactivé.
+    gallery_min_sharpness: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -120,15 +172,55 @@ class LineConfig:
 
 @dataclass(frozen=True)
 class GeometryConfig:
+    """Géométrie relative à l'échelle locale, en fractions (règle 0.3).
+
+    ``occlusion_ambiguity_ratio`` est le rayon — fraction de la hauteur médiane
+    des bbox — dans lequel une apparition intérieure peut être confondue avec
+    une personne déjà comptée dont l'observation est perdue. C'est le rayon qui
+    interdit de confirmer un ``NEW`` (spec 4 du prompt) : ni un pixel absolu, ni
+    un seuil codé en dur.
+    """
+
     dead_zone_ratio: float = 0.15
     anchor_edge_margin_ratio: float = 0.02
     scale_window: int = 61
+    occlusion_ambiguity_ratio: float = 0.5
+    min_aspect_ratio_wh: float = 0.1
+    max_aspect_ratio_wh: float = 2.5
+    min_box_height_px: float = 10.0
+    min_box_width_px: float = 10.0
+
+
+@dataclass(frozen=True)
+class AnchorConfig:
+    """Stabilité de l'ancre pieds lors des chutes anormales de hauteur de box."""
+
+    height_history_window_frames: int = 30
+    max_height_drop_ratio: float = 0.35
+    height_drop_confirm_frames: int = 3
+
 
 
 @dataclass(frozen=True)
 class TimingConfig:
+    """Fenêtres temporelles du pipeline (toutes en **secondes**, règle 0.2).
+
+    Le warm-up est terminé quand **les deux** conditions sont vraies :
+
+    - ``warmup_min_frames`` frames ont été observées (borne dure, robuste aux
+      FPS très élevés où 0,5 s représentent beaucoup d'images) ;
+    - ``warmup_seconds`` secondes se sont écoulées sur l'horloge réellement
+      mesurée (borne de durée, robuste aux FPS faibles où il faut du temps pour
+      voir tout le monde).
+
+    S'exiger d'une seule des deux bornes terminerait le warm-up trop tôt soit à
+    faible FPS (durée écoulée mais 3 frames vues), soit à haut FPS (15 frames
+    vues en 0,15 s).
+    """
+
     fps_source: str = "measured"
-    warmup_seconds: float = 1.0
+    warmup_seconds: float = 0.5
+    warmup_min_frames: int = 15
     confirmation_seconds: float = 0.5
     grace_period_seconds: float = 5.0
     fps_estimate_window: int = 30
@@ -147,6 +239,7 @@ class TimingConfig:
         return FrameBudget(
             fps=float(fps),
             warmup_frames=max(1, round(self.warmup_seconds * fps)),
+            warmup_min_frames=max(1, int(self.warmup_min_frames)),
             confirmation_frames=max(1, round(self.confirmation_seconds * fps)),
             grace_period_frames=max(1, round(self.grace_period_seconds * fps)),
         )
@@ -154,15 +247,37 @@ class TimingConfig:
 
 @dataclass(frozen=True)
 class FrameBudget:
-    """Durées de la configuration exprimées en frames pour un FPS mesuré."""
+    """Durées de la configuration exprimées en frames pour un FPS mesuré.
+
+    ``warmup_frames`` est la conversion de ``warmup_seconds`` ;
+    ``warmup_min_frames`` est la borne dure en frames. La fin du warm-up exige
+    les deux (voir :class:`TimingConfig`).
+    """
 
     fps: float
     warmup_frames: int
+    warmup_min_frames: int
     confirmation_frames: int
     grace_period_frames: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class DiagnosticsConfig:
+    """Diagnostics de détection et d'association (spec 2 et 3 du prompt).
+
+    Chaque situation ambiguë doit être journalisée, mais un journal qui écrit un
+    événement par frame devient illisible et masque l'information utile
+    (limitation de débit explicite, jamais silencieuse : le compteur de frames
+    concernées reste publié dans le résumé de session).
+    """
+
+    enabled: bool = True
+    #: Intervalle minimal entre deux événements de même nature (secondes). Le
+    #: front montant d'une situation est toujours journalisé.
+    min_interval_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -220,6 +335,8 @@ class PipelineConfig:
     stabilization: StabilizationConfig
     display: DisplayConfig
     logging: LoggingConfig
+    diagnostics: DiagnosticsConfig
+    anchor: AnchorConfig = field(default_factory=AnchorConfig)
     config_path: Path = DEFAULT_CONFIG_PATH
 
     # -- Accès pratiques ---------------------------------------------------
@@ -305,6 +422,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     known = {
         "schema_version", "source", "model", "tracker", "reid", "line", "geometry",
         "timing", "occupancy", "output", "stabilization", "display", "logging",
+        "diagnostics", "anchor",
     }
     for key in raw:
         if key not in known:
@@ -347,7 +465,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     # :func:`calibration.LineSelection.confirm` appelle ``validate_line``.
 
     model_raw = _section(raw, "model")
-    confidence = _unit_interval(model_raw.get("confidence", 0.25), "model.confidence", problems)
+    confidence = _unit_interval(model_raw.get("confidence", 0.10), "model.confidence", problems)
     nms_iou = _unit_interval(model_raw.get("nms_iou", 0.55), "model.nms_iou", problems)
     image_size = _positive_int(model_raw.get("image_size", 960), "model.image_size", problems)
     if image_size is not None and image_size % 32 != 0:
@@ -373,6 +491,58 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     scale_window = _positive_int(
         geometry_raw.get("scale_window", 61), "geometry.scale_window", problems
     )
+    occlusion_ambiguity_ratio = _non_negative(
+        geometry_raw.get("occlusion_ambiguity_ratio", 0.5),
+        "geometry.occlusion_ambiguity_ratio",
+        problems,
+    )
+    min_aspect_ratio_wh = _positive(
+        geometry_raw.get("min_aspect_ratio_wh", 0.1),
+        "geometry.min_aspect_ratio_wh",
+        problems,
+    )
+    max_aspect_ratio_wh = _positive(
+        geometry_raw.get("max_aspect_ratio_wh", 2.5),
+        "geometry.max_aspect_ratio_wh",
+        problems,
+    )
+    min_box_height_px = _positive(
+        geometry_raw.get("min_box_height_px", 10.0),
+        "geometry.min_box_height_px",
+        problems,
+    )
+    min_box_width_px = _positive(
+        geometry_raw.get("min_box_width_px", 10.0),
+        "geometry.min_box_width_px",
+        problems,
+    )
+    if (
+        min_aspect_ratio_wh is not None
+        and max_aspect_ratio_wh is not None
+        and min_aspect_ratio_wh >= max_aspect_ratio_wh
+    ):
+        problems.append(
+            f"geometry.min_aspect_ratio_wh ({min_aspect_ratio_wh}) doit être < "
+            f"geometry.max_aspect_ratio_wh ({max_aspect_ratio_wh})"
+        )
+
+    anchor_raw = _section(raw, "anchor")
+    anchor_window = _positive_int(
+        anchor_raw.get("height_history_window_frames", 30),
+        "anchor.height_history_window_frames",
+        problems,
+    )
+    anchor_drop_ratio = _unit_interval(
+        anchor_raw.get("max_height_drop_ratio", 0.35),
+        "anchor.max_height_drop_ratio",
+        problems,
+    )
+    anchor_confirm_frames = _positive_int(
+        anchor_raw.get("height_drop_confirm_frames", 3),
+        "anchor.height_drop_confirm_frames",
+        problems,
+    )
+
 
     timing_raw = _section(raw, "timing")
     fps_source = str(timing_raw.get("fps_source", "measured"))
@@ -382,7 +552,10 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             "supposée est interdite par la règle 0.2"
         )
     warmup_seconds = _non_negative(
-        timing_raw.get("warmup_seconds", 1.0), "timing.warmup_seconds", problems
+        timing_raw.get("warmup_seconds", 0.5), "timing.warmup_seconds", problems
+    )
+    warmup_min_frames = _positive_int(
+        timing_raw.get("warmup_min_frames", 15), "timing.warmup_min_frames", problems
     )
     confirmation_seconds = _non_negative(
         timing_raw.get("confirmation_seconds", 0.5), "timing.confirmation_seconds", problems
@@ -420,6 +593,28 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             f"reid.long_term.ambiguous_policy doit être l'un de "
             f"{ALLOWED_AMBIGUOUS_POLICIES} (reçu {ambiguous_policy!r})"
         )
+    gallery_min_confidence = _bounded(
+        long_term_raw.get("gallery_min_confidence", 0.70),
+        "reid.long_term.gallery_min_confidence",
+        problems,
+        low=0.0,
+        high=1.0,
+    )
+    gallery_min_crop_height = _positive_int(
+        long_term_raw.get("gallery_min_crop_height_px", 32),
+        "reid.long_term.gallery_min_crop_height_px",
+        problems,
+    )
+    gallery_min_crop_width = _positive_int(
+        long_term_raw.get("gallery_min_crop_width_px", 16),
+        "reid.long_term.gallery_min_crop_width_px",
+        problems,
+    )
+    gallery_min_sharpness = _non_negative(
+        long_term_raw.get("gallery_min_sharpness", 0.0),
+        "reid.long_term.gallery_min_sharpness",
+        problems,
+    )
     external_raw = _section(reid_raw, "external_reid")
     image_size_pair = external_raw.get("image_size", (256, 128))
     if not (isinstance(image_size_pair, (list, tuple)) and len(image_size_pair) == 2):
@@ -470,9 +665,48 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     no_detection_seconds = _non_negative(
         source_raw.get("no_detection_seconds", 2.0), "source.no_detection_seconds", problems
     )
+
+    # -- BoT-SORT : seuils distincts du seuil YOLO (spec 2 du prompt) -------
     tracker_raw = _section(raw, "tracker")
+    track_high_thresh = _unit_interval(
+        tracker_raw.get("track_high_thresh", 0.4), "tracker.track_high_thresh", problems
+    )
+    track_low_thresh = _unit_interval(
+        tracker_raw.get("track_low_thresh", 0.1), "tracker.track_low_thresh", problems
+    )
+    new_track_thresh = _unit_interval(
+        tracker_raw.get("new_track_thresh", 0.7), "tracker.new_track_thresh", problems
+    )
+    if (
+        track_low_thresh is not None
+        and track_high_thresh is not None
+        and track_low_thresh >= track_high_thresh
+    ):
+        problems.append(
+            "tracker.track_low_thresh doit rester strictement inférieur à "
+            f"tracker.track_high_thresh (reçu {track_low_thresh} >= {track_high_thresh}) : "
+            "sinon l'association à deux étages n'a plus de second étage."
+        )
+    if (
+        track_high_thresh is not None
+        and new_track_thresh is not None
+        and new_track_thresh < track_high_thresh
+    ):
+        problems.append(
+            "tracker.new_track_thresh doit être >= tracker.track_high_thresh "
+            f"(reçu {new_track_thresh} < {track_high_thresh}) : une nouvelle piste ne "
+            "peut pas être créée sur une détection moins fiable que celles utilisées "
+            "pour l'association existante."
+        )
+
     display_raw = _section(raw, "display")
     logging_raw = _section(raw, "logging")
+    diagnostics_raw = _section(raw, "diagnostics")
+    diagnostics_interval = _positive(
+        diagnostics_raw.get("min_interval_seconds", 1.0),
+        "diagnostics.min_interval_seconds",
+        problems,
+    )
 
     # Le nom de fenêtre est utilisé par `cv2.namedWindow` / `cv2.setMouseCallback` :
     # le backend Qt d'OpenCV 5.0 ne retrouve plus une fenêtre dont le nom contient
@@ -496,12 +730,19 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         )
 
     assert warmup_seconds is not None and confirmation_seconds is not None
+    assert warmup_min_frames is not None and diagnostics_interval is not None
+    assert gallery_min_crop_height is not None and gallery_min_crop_width is not None
     assert grace_period_seconds is not None and snapshot_interval is not None
     assert dead_zone_ratio is not None and edge_margin_ratio is not None
     assert min_length_ratio is not None and scale_window is not None
+    assert occlusion_ambiguity_ratio is not None
     assert fps_window is not None and flush_every is not None
     assert similarity_threshold is not None and safety_margin is not None
     assert v_max_ratio is not None and spatial_margin_ratio is not None
+    assert anchor_window is not None and anchor_drop_ratio is not None
+    assert anchor_confirm_frames is not None
+    assert min_aspect_ratio_wh is not None and max_aspect_ratio_wh is not None
+    assert min_box_height_px is not None and min_box_width_px is not None
 
     return PipelineConfig(
         schema_version=1,
@@ -513,7 +754,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         model=ModelConfig(
             path=str(model_raw.get("path", "models/yolo11n.pt")),
             expected_sha256=str(model_raw.get("expected_sha256", "")),
-            confidence=float(confidence or 0.25),
+            confidence=float(confidence if confidence is not None else 0.10),
             nms_iou=float(nms_iou or 0.55),
             image_size=int(image_size or 960),
             classes=classes,
@@ -521,6 +762,9 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         tracker=TrackerConfig(
             config_path=str(tracker_raw.get("config_path", "src/configs/custom_botsort.yaml")),
             persist=bool(tracker_raw.get("persist", True)),
+            track_high_thresh=float(track_high_thresh if track_high_thresh is not None else 0.4),
+            track_low_thresh=float(track_low_thresh if track_low_thresh is not None else 0.1),
+            new_track_thresh=float(new_track_thresh if new_track_thresh is not None else 0.7),
         ),
         reid=ReidConfig(
             short_term=str(reid_raw.get("short_term", "native_botsort")),
@@ -531,6 +775,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 v_max_ratio=v_max_ratio,
                 spatial_margin_ratio=spatial_margin_ratio,
                 ambiguous_policy=ambiguous_policy,
+                gallery_min_confidence=float(
+                    gallery_min_confidence if gallery_min_confidence is not None else 0.70
+                ),
+                gallery_min_crop_height_px=int(gallery_min_crop_height),
+                gallery_min_crop_width_px=int(gallery_min_crop_width),
+                gallery_min_sharpness=float(gallery_min_sharpness or 0.0),
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
@@ -548,10 +798,16 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             dead_zone_ratio=dead_zone_ratio,
             anchor_edge_margin_ratio=edge_margin_ratio,
             scale_window=scale_window,
+            occlusion_ambiguity_ratio=float(occlusion_ambiguity_ratio or 0.0),
+            min_aspect_ratio_wh=float(min_aspect_ratio_wh or 0.1),
+            max_aspect_ratio_wh=float(max_aspect_ratio_wh or 2.5),
+            min_box_height_px=float(min_box_height_px or 10.0),
+            min_box_width_px=float(min_box_width_px or 10.0),
         ),
         timing=TimingConfig(
             fps_source=fps_source,
             warmup_seconds=warmup_seconds,
+            warmup_min_frames=warmup_min_frames,
             confirmation_seconds=confirmation_seconds,
             grace_period_seconds=grace_period_seconds,
             fps_estimate_window=fps_window,
@@ -586,8 +842,46 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             level=str(logging_raw.get("level", "INFO")),
             print_state_transitions=bool(logging_raw.get("print_state_transitions", False)),
         ),
+        diagnostics=DiagnosticsConfig(
+            enabled=bool(diagnostics_raw.get("enabled", True)),
+            min_interval_seconds=diagnostics_interval,
+        ),
+        anchor=AnchorConfig(
+            height_history_window_frames=int(anchor_window or 30),
+            max_height_drop_ratio=float(anchor_drop_ratio or 0.35),
+            height_drop_confirm_frames=int(anchor_confirm_frames or 3),
+        ),
         config_path=config_path or DEFAULT_CONFIG_PATH,
     )
+
+
+def coherence_warnings(config: PipelineConfig) -> list[tuple[str, str]]:
+    """Incohérences de configuration qui dégradent le pipeline sans l'arrêter.
+
+    Elles ne sont **pas** des erreurs : un opérateur peut volontairement évaluer
+    un seuil YOLO élevé (ablation de la section 9). En revanche elles ne peuvent
+    pas être silencieuses : ``main`` les journalise en ``CONFIG_WARNING`` au
+    démarrage de la session, avec la conséquence exacte sur le pipeline.
+
+    Returns:
+        Liste de couples ``(code, message)``, vide si la configuration est
+        cohérente.
+    """
+    warnings: list[tuple[str, str]] = []
+    if config.model.confidence > config.tracker.track_low_thresh:
+        warnings.append((
+            "yolo_confidence_above_tracker_low_thresh",
+            (
+                f"model.confidence={config.model.confidence} > "
+                f"tracker.track_low_thresh={config.tracker.track_low_thresh} : "
+                "les détections dont le score est dans "
+                "[track_low_thresh, model.confidence[ n'atteignent jamais "
+                "BoT-SORT. Les personnes floues restent donc plus souvent "
+                "perdues (nouvelle piste technique ou absence), et le risque "
+                "de faux NEW augmente."
+            ),
+        ))
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +940,20 @@ def _non_negative(value: Any, name: str, problems: list[str]) -> float | None:
         return None
     if number < 0:
         problems.append(f"{name} doit être >= 0 (reçu {number})")
+        return None
+    return number
+
+
+def _bounded(
+    value: Any, name: str, problems: list[str], *, low: float, high: float
+) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} doit être un nombre (reçu {value!r})")
+        return None
+    if not (low <= number <= high):
+        problems.append(f"{name} doit être dans [{low}, {high}] (reçu {number})")
         return None
     return number
 

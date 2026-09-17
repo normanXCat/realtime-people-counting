@@ -85,6 +85,19 @@ class PersonTrack:
     crossed: int = 0
     occlusion_events: int = 0
     anchor_suspend_streak: int = 0
+    height_history: list[float] = field(default_factory=list)
+    height_drop_streak: int = 0
+    anchor_unreliable_reason: str | None = None
+    last_reliable_anchor: tuple[float, float] | None = None
+    drop_previous_height: float = 0.0
+    drop_current_height: float = 0.0
+    drop_ratio: float = 0.0
+    #: La piste a-t-elle été observée dans la zone **extérieure** ? Condition qui
+    #: interdit ``NEW`` (une personne vue dehors entre, elle n'apparaît pas).
+    observed_outside: bool = False
+    #: Le report de ``NEW`` (personne comptée occultée à proximité) a déjà été
+    #: journalisé : évite une ligne par frame tant que la situation dure.
+    new_deferred_reported: bool = False
     last_rule: str = ""
     last_zone: str = ""
     last_distance: float = 0.0
@@ -114,7 +127,21 @@ class PersonTrack:
 
 @dataclass(frozen=True)
 class OccupancySnapshot:
-    """Occupation publiée à intervalle régulier (spec 4.4)."""
+    """Occupation publiée à intervalle régulier (spec 4.4).
+
+    Trois valeurs distinctes, jamais confondues (spec 6 du prompt) :
+
+    - ``confirmed`` = ``operational`` : l'effectif **opérationnel**, tenu par le
+      bilan ``occupation initiale + IN + NEW - OUT``. Il conserve une personne
+      occultée et ne diminue donc **que** sur une sortie confirmée par la machine
+      à états — jamais sur une occultation, une expiration de grâce, une absence
+      de détection ou une purge technique ;
+    - ``observed`` : la part de cet effectif **actuellement observable** ;
+    - ``uncertain`` : la part dont l'observation est perdue. Invariant vérifié à
+      chaque frame : ``observed + uncertain == operational`` ;
+    - ``range_low``/``range_high`` : l'encadrement publié, ``[observed,
+      operational]``.
+    """
 
     confirmed: int
     uncertain: int
@@ -126,12 +153,16 @@ class OccupancySnapshot:
     total_in: int
     total_out: int
     total_new: int
+    observed: int = 0
+    operational: int = 0
 
     def to_fields(self) -> dict[str, object]:
         return {
             "occupancy_confirmed": self.confirmed,
+            "occupancy_observed": self.observed,
             "occupancy_uncertain": self.uncertain,
             "occupancy_range": [self.range_low, self.range_high],
+            "occupancy_operational": self.operational,
             "visible_count": self.visible,
             "occluded_count": self.occluded,
             "total_in": self.total_in,

@@ -228,6 +228,59 @@ Aucun résidu de l'ancienne double ligne L1/L2 n'est réintroduit : une régress
 vérifie l'absence de `calibrate_two_lines`, `line2*`, `gate_width` et
 `line_pos_ratio` dans `src/`, et le schéma `LineConfig` ne porte que
 `inside_side`, `on_line_policy` et `min_length_ratio`.
+### 4.3 Mise à jour — audit des compteurs d'occupation et pertes de détection sur flou
+
+Audit demandé par le prompt de correction ciblée (« occupancy_confirmee ne doit
+décrémenter que sur un OUT confirmé »). Méthode : balayage de `src/*.py`
+(recherche des écritures sur `total_in` / `total_out` / `total_new` /
+`initial_occupancy`, des purges et timeouts, des branches `except`, et de tout
+`max(0, occupancy)` masquant un décompte).
+
+**Écritures trouvées — toutes dans `src/occupancy_manager.py` :**
+
+| Compteur | Ligne | Déclencheur | Verdict |
+|---|---:|---|---|
+| `initial_occupancy += 1` | 733 | action FSM `EMPLACE_INITIAL` (warm-up), une seule fois par `person_id` | conforme |
+| `total_in += 1` | 864 | `_count_in` ← `COMPTE_ENTREE`, `CONFIRME_ENTREE_DIFFEREE` | conforme |
+| `total_out += 1` | 900 | `_count_out` ← `COMPTE_SORTIE`, `CONFIRME_SORTIE_DIFFEREE`, `RECUPERE_EXTERIEUR` (réapparition extérieure cohérente) | conforme |
+| `total_new += 1` | 979 | `_count_new`, gardé par les conditions `NEW` du FSM | conforme |
+
+Aucun timeout, aucune purge, aucun `except` et aucune branche `else` ne touche
+ces compteurs ; aucun `max(0, occupancy)` ne porte sur l'occupation
+(`max(0, …)` n'apparaît que sur des indices de frame et des coordonnées de
+crop). Les purges passent par `identity_manager.py:852` et émettent `PURGE`,
+dont le schéma (`src/events.py:138`) **exclut** toute interprétation comme
+sortie ; `_count_out` n'est jamais atteint depuis ce chemin.
+
+**Cause réelle du décrément observé.** La formule `initial + IN + NEW - OUT`
+était correcte, mais la valeur **publiée** par frame (`occupancy_confirmed`,
+celle lue par le tableau de bord, les snapshots et `evaluate_system.py`)
+était recalculée en excluant les pistes non visibles : une personne occultée, ou
+dont la piste était purgée après la grâce, disparaissait donc de la valeur
+affichée **sans** `total_out` — d'où l'impression d'une décrémentation par
+purge/timeout.
+
+**Correction.** `occupancy_confirmed` est désormais un alias explicite de
+`occupancy_operational` (`occupancy_manager.py:183-208`), bilan
+`initial_occupancy + total_in + total_new - total_out`, jamais recalculé à partir
+des pistes visibles et jamais borné : une occultation, une absence de détection
+ou une purge n'y changent rien. `occupancy_uncertain` compte les personnes
+comptées mais non observées, et l'invariant
+`occupancy_observed + occupancy_uncertain == occupancy_operational` est vérifié à
+chaque frame puis journalisé en cas d'écart, sans correction silencieuse.
+`evaluate_system.py` mesure donc la MAE sur l'occupation **opérationnelle**.
+
+**Pertes de détection sur flou.** `model.confidence` passe de 0,25 à 0,10
+(configurable, `config/pipeline.yaml`), avec les seuils tracker distincts et
+validés `track_high_thresh = 0,4`, `track_low_thresh = 0,1`,
+`new_track_thresh = 0,7`. L'invariant `model.confidence <= track_low_thresh` est
+vérifié au chargement et toute divergence est journalisée en `CONFIG_WARNING`.
+Résultats de la comparaison `model.confidence` × `track_low_thresh` sur le
+scénario synthétique flou : `docs/protocole_evaluation.md` §1.1.
+
+**Tests ajoutés** (niveaux 1-3, sans caméra) : `tests/test_warmup.py`,
+`tests/test_track_loss_recovery.py` (dont la matrice de seuils),
+`tests/test_occupancy_operational.py`, `tests/test_track_diagnostics.py`.
 
 ## 5. Plan d'exécution retenu (étapes revuables)
 

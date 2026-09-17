@@ -40,6 +40,8 @@ BASE = dict(
     confirmation_frames=2,
     warmup_done=True,
     warmup_stable=False,
+    exterior_history=False,
+    new_blocked_by_occlusion=False,
     approach=Approach.INTERIEUR,
     pending_crossing=None,
     in_progress_policy="deferred_confirmation",
@@ -103,9 +105,26 @@ CASES: dict[str, tuple[TrackState, FsmContext, TrackState, Action]] = {
     ),
     "outside_new_presence_confirmed": (
         S.EXTERIEUR,
-        ctx(zone=Zone.INTERIEURE, interior_streak=2),
+        ctx(zone=Zone.INTERIEURE, interior_streak=2, exterior_history=False),
         S.PRESENTE,
         A.NOUVELLE_PRESENCE,
+    ),
+    "outside_entry_without_crossing_signalled": (
+        S.EXTERIEUR,
+        ctx(zone=Zone.INTERIEURE, interior_streak=2, exterior_history=True),
+        S.ENTREE_EN_COURS,
+        A.SIGNALE_ENTREE_SANS_FRANCHISSEMENT,
+    ),
+    "outside_new_presence_deferred_by_occlusion": (
+        S.EXTERIEUR,
+        ctx(
+            zone=Zone.INTERIEURE,
+            interior_streak=2,
+            exterior_history=False,
+            new_blocked_by_occlusion=True,
+        ),
+        S.EXTERIEUR,
+        A.DIFFERE_NOUVELLE_PRESENCE,
     ),
     "outside_lost": (S.EXTERIEUR, ctx(**LOST), S.OCCULTEE, A.MARQUE_OCCULTEE),
     # -- PRESENTE ----------------------------------------------------------
@@ -373,6 +392,78 @@ def test_suspension_short_circuits_even_grace_expiry():
     decision = MACHINE.resolve(TrackState.OCCULTEE, context)
     assert decision.action is Action.SUSPEND_DECISION
     assert decision.state_to is TrackState.OCCULTEE
+
+
+def test_priority_order_matches_the_documented_intent():
+    """Ordre de priorité de la table (spec 8 du prompt).
+
+    ``ancre non fiable -> warm-up -> perte de piste -> franchissement confirmé
+    -> franchissement amorcé -> demi-tour -> changement de zone -> aucune
+    transition``. Deux propriétés sont vérifiées ici :
+
+    - la suspension est la **première** ligne, et la seule inter-états ;
+    - dans chaque état, les règles de franchissement confirmé précèdent celles
+      de franchissement amorcé, qui précèdent demi-tour, changement de zone et
+      fin de séquence (perte de piste).
+    """
+    assert TRANSITION_TABLE[0].action is Action.SUSPEND_DECISION
+    assert [rule for rule in TRANSITION_TABLE if rule.state_from is None] == [
+        TRANSITION_TABLE[0]
+    ]
+
+    stage = {
+        "cross_confirms_entry": 0,
+        "cross_confirms_exit": 0,
+        "cross_commits_entry": 1,
+        "cross_commits_exit": 1,
+        "commit_entry": 1,
+        "commit_exit": 1,
+        "return_to_inside": 2,
+        "return_to_outside": 2,
+        "turnaround": 2,
+        "enter_dead_zone": 3,
+        "drift": 3,
+        "new_presence": 3,
+        "lost": 4,
+    }
+
+    def stage_of(rule_name: str) -> int:
+        for token, value in sorted(stage.items(), key=lambda item: -len(item[0])):
+            if token in rule_name:
+                return value
+        return -1
+
+    by_state: dict[TrackState, list[tuple[int, int]]] = {}
+    for index, rule in enumerate(TRANSITION_TABLE):
+        if rule.state_from is None:
+            continue
+        by_state.setdefault(rule.state_from, []).append((stage_of(rule.name), index))
+    for state, entries in by_state.items():
+        ordered = sorted(entries, key=lambda item: item[1])
+        stages = [entry[0] for entry in ordered if entry[0] >= 0]
+        assert stages == sorted(stages), (
+            f"L'ordre des règles de {state.name} ne respecte pas la priorité "
+            f"annoncée : {[name for name, _ in ordered]}"
+        )
+
+
+def test_new_is_forbidden_once_the_person_was_seen_outside():
+    """Une personne vue dehors entre dans la salle : elle n'y apparaît pas."""
+    outside_then_inside = ctx(zone=Zone.INTERIEURE, interior_streak=5, exterior_history=True)
+    decision = MACHINE.resolve(TrackState.EXTERIEUR, outside_then_inside)
+    assert decision.action is Action.SIGNALE_ENTREE_SANS_FRANCHISSEMENT
+    assert decision.state_to is TrackState.ENTREE_EN_COURS
+    assert decision.action is not Action.NOUVELLE_PRESENCE
+
+
+def test_new_is_deferred_while_a_counted_person_is_occluded_nearby():
+    blocked = ctx(
+        zone=Zone.INTERIEURE, interior_streak=5, new_blocked_by_occlusion=True
+    )
+    decision = MACHINE.resolve(TrackState.EXTERIEUR, blocked)
+    assert decision.action is Action.DIFFERE_NOUVELLE_PRESENCE
+    assert decision.state_to is TrackState.EXTERIEUR
+    assert decision.state_changed is False
 
 
 def test_state_changed_flag_reports_transitions():
