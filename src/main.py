@@ -494,6 +494,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         tracker_high_thresh=config.tracker.track_high_thresh,
         tracker_low_thresh=config.tracker.track_low_thresh,
         tracker_new_thresh=config.tracker.new_track_thresh,
+        # Persistance / ReID natif : publiés pour que le journal permettent de
+        # rattacher un changement d'identifiant technique à un réglage donné.
+        tracker_track_buffer=config.tracker.track_buffer,
+        tracker_with_reid=config.tracker.with_reid,
+        tracker_appearance_thresh=config.tracker.appearance_thresh,
+        tracker_proximity_thresh=config.tracker.proximity_thresh,
+        tracker_match_thresh=config.tracker.match_thresh,
+        tracker_gmc_method=config.tracker.gmc_method,
         warmup_min_frames=config.timing.warmup_min_frames,
         warmup_seconds=config.timing.warmup_seconds,
     )
@@ -564,7 +572,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 4
 
     locker = (
-        BBoxHeightLocker(min_height_ratio=config.stabilization.bbox_locker_min_height_ratio)
+        BBoxHeightLocker(
+            min_height_ratio=config.stabilization.bbox_locker_min_height_ratio,
+            # Même fenêtre que la surveillance de chute : la hauteur lissée sert
+            # à la fois à corriger le bas de boîte et à fixer l'échelle locale de
+            # la zone morte, sans entretenir un second jeu de seuils redondant.
+            history_window=config.anchor.height_history_window_frames,
+        )
         if config.stabilization.use_bbox_locker
         else None
     )
@@ -752,7 +766,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 no_detection_announced = False
 
             if locker is not None or stabilizer is not None:
-                _purge_stabilizers(locker, stabilizer, detections)
+                # Purge basée sur les **personnes** encore suivies, jamais sur les
+                # identifiants de la frame : une seule frame manquée (occultation,
+                # flou, perte de piste BoT-SORT) détruirait sinon l'historique de
+                # hauteur, c'est-à-dire la correction elle-même.
+                _purge_stabilizers(
+                    locker, stabilizer, occupancy.stabilization_keys()
+                )
 
             if write_video:
                 if writer is None and fps_estimator.is_ready:
@@ -822,12 +842,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code
 
 
-def _purge_stabilizers(locker, stabilizer, detections: Sequence[Detection]) -> None:
-    active = {int(detection.technical_track_id) for detection in detections}
-    if locker is not None:
-        locker.purge_lost_tracks(active)
-    if stabilizer is not None:
-        stabilizer.purge_lost_tracks(active)
+def _purge_stabilizers(locker, stabilizer, active_keys: set[int]) -> None:
+    """Libère les profils des **personnes** sorties du suivi (spec 7).
+
+    ``active_keys`` provient de ``OccupancyManager.stabilization_keys()`` : les
+    clés y sont des ``person_id`` (stables). Une piste momentanément non détectée
+    conserve donc son historique, y compris quand BoT-SORT lui attribue un nouvel
+    identifiant technique.
+    """
+    for component in (locker, stabilizer):
+        if component is not None:
+            component.purge_lost_tracks(active_keys)
 
 
 def _open_writer(
@@ -912,6 +937,36 @@ def _finalize(
             "total_new": snapshot.total_new,
         },
         "diagnostics": None if diagnostics is None else diagnostics.summary(),
+        # Garde-fou de swap : le nombre de discontinuités d'apparence est publié
+        # AVEC les seuils qui l'ont produit. C'est la mesure quantitative
+        # avant/après réglage (track_buffer, appearance_thresh,
+        # proximity_thresh) : comparer deux sessions revient à comparer ce bloc,
+        # pas une impression visuelle.
+        "appearance_continuity": {
+            "enabled": bool(config.reid.appearance_continuity.enabled),
+            "similarity_threshold": float(
+                config.reid.appearance_continuity.similarity_threshold
+            ),
+            "max_gap_frames": int(
+                config.reid.appearance_continuity.max_gap_frames
+            ),
+            "discontinuities": int(
+                occupancy.identities.appearance_discontinuities
+            ),
+            "technical_id_changes": int(
+                occupancy.identities.technical_id_changes
+            ),
+            "descriptor_rejections": int(
+                occupancy.identities.descriptor_rejections
+            ),
+        },
+        "tracker": {
+            "track_buffer": int(config.tracker.track_buffer),
+            "with_reid": bool(config.tracker.with_reid),
+            "appearance_thresh": float(config.tracker.appearance_thresh),
+            "proximity_thresh": float(config.tracker.proximity_thresh),
+            "match_thresh": float(config.tracker.match_thresh),
+        },
         "latency_ms": latency,
         "events_written": logger.event_count,
     }

@@ -44,6 +44,27 @@ tracker:
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
   new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
 
+  # -- Persistance de piste et ré-identification native -------------------
+  # track_buffer : nombre de frames pendant lesquelles une piste perdue reste
+  # vivante côté tracker. Valeur réglée sur les occlusions RÉELLEMENT mesurées
+  # dans results/*/events.jsonl (OCCLUDED -> réapparition) : médiane 2,5 s,
+  # p90 5,1 s, maximum 13,5 s à la cadence source (~30 ips). 150 frames couvrent
+  # le p90 (~5 s) ; au-delà, la galerie ReID long terme (section reid) prend le
+  # relais. Compromis : plus long = moins de changements d'identifiant technique,
+  # mais plus de mémoire/calcul et un risque légèrement accru de réassociation
+  # erronée en forte densité de personnes d'apparence similaire.
+  track_buffer: 150
+  # with_reid : module d'apparence de BoT-SORT. Il tente une réassociation AVANT
+  # de créer un nouvel identifiant technique, en complément du ReID long terme
+  # de IdentityManager (qui, lui, opère après expiration de la piste technique).
+  with_reid: true
+  match_thresh: 0.9         # seuil d'association IoU principal
+  proximity_thresh: 0.5     # seuil de proximité du ReID natif
+  appearance_thresh: 0.25   # seuil d'apparence du ReID natif
+  # Caméra FIXE : aucune compensation de mouvement ne doit être estimée (une GMC
+  # active introduirait une instabilité de boîte et d'identifiant sans cause).
+  gmc_method: none
+
 reid:
   # Niveau 1 : ReID natif BoT-SORT (réassociation intra-buffer), activé par
   # `with_reid: true` dans la configuration du tracker. Aucune logique
@@ -66,6 +87,20 @@ reid:
     gallery_min_crop_height_px: 32
     gallery_min_crop_width_px: 16
     gallery_min_sharpness: 0.0   # variance du Laplacien ; 0 = contrôle désactivé
+    # Rétention de la galerie d'apparence APRÈS purge de l'identité. null =
+    # alignée sur timing.grace_period_seconds : la mémoire d'apparence n'est
+    # jamais libérée avant que la personne n'ait eu une chance réaliste de
+    # réapparaître (fenêtre totale = grâce + rétention, soit 2 × grâce par
+    # défaut). Une valeur explicite découple la mémoire ReID de la grâce
+    # d'occupation et doit être justifiée.
+    gallery_retention_seconds: null
+    # Tolérance progressive du seuil d'apparence selon la durée d'absence (une
+    # longue occultation change un peu l'apparence : angle, luminosité). Le seuil
+    # descend linéairement de similarity_threshold vers ce plancher au bout de
+    # long_absence_seconds. null = aucun assouplissement (défaut) : le compromis
+    # est choisi explicitement pour ne pas provoquer de fausses réassociations.
+    long_absence_seconds: 2.0
+    long_absence_similarity_floor: null
   # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
   # uniquement : si false, le descripteur léger HSV est utilisé.
   external_reid:
@@ -73,6 +108,30 @@ reid:
     model_path: osnet_x0_25_msmt17.pt
     weights: osnet_x0_25
     image_size: [256, 128]
+
+  # -- Garde-fou « inversement d'identifiant » (swap) ----------------------
+  # Un swap n'est PAS une perte de piste : deux identifiants BoT-SORT restent
+  # actifs en continu mais échangent la personne qu'ils suivent. Il se produit à
+  # l'intérieur du matching du tracker, donc ni TECHNICAL_ID_CHANGED ni
+  # TRACK_ID_ABSENT ne le signalent. Ce garde-fou le mesure : sur une piste qui
+  # n'a jamais été perdue, une chute brutale de similarité d'apparence d'une
+  # frame à l'autre est journalisée en TRACK_ID_APPEARANCE_DISCONTINUITY.
+  # Aucune correction automatique : réaffecter les identités sur un faux positif
+  # serait pire que le swap lui-même.
+  appearance_continuity:
+    enabled: true
+    # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4) : trop élevé
+    # multiplie les diagnostics (faux positifs), trop bas ne voit que les
+    # échanges francs.
+    similarity_threshold: 0.50
+    # Écart maximal (frames traitées) pour qu'une piste reste « continue ».
+    # Au-delà, la piste a réellement été perdue : c'est le chemin de
+    # réassociation normal, pas un swap.
+    max_gap_frames: 2
+    # Limitation de débit par piste : une discontinuité n'est écrite qu'une fois
+    # tant que la continuité n'est pas rétablie, et au plus une fois par
+    # intervalle.
+    min_interval_seconds: 1.0
 
 # Ligne virtuelle : les deux points ne sont PAS configurables. Ils sont
 # obligatoirement définis par l'opérateur au démarrage (première image affichée,
@@ -135,10 +194,17 @@ output:
   annotated_video_codec: mp4v
 
 stabilization:
-  # Activés seulement après l'ablation de la section 9. Quand ils sont actifs,
-  # la boîte brute et la raison de la correction restent journalisées (spec 7).
-  use_bbox_locker: false
-  bbox_locker_min_height_ratio: 0.70
+  # Verrouillage de hauteur des bounding boxes : ACTIF dans le pipeline officiel.
+  # Sans lui, une chute brutale de hauteur (jambes masquées, personne assise,
+  # flou) fait remonter le bas de boîte, donc l'ancre pieds : le calcul de zone
+  # dans geometry.py voit une fausse transition. Le profil de hauteur est indexé
+  # par person_id (stable), jamais par l'identifiant technique de BoT-SORT, et il
+  # survit donc à une occultation / un changement d'identifiant technique.
+  # La boîte brute et la raison de la correction restent journalisées (spec 7) et
+  # la chute anormale est signalée en ANCHOR_UNRELIABLE (prioritaire sur tout
+  # changement de zone dans la FSM).
+  use_bbox_locker: true
+  bbox_locker_min_height_ratio: 0.70   # PROVISOIRE — à calibrer sur l'ensemble de calibration
   use_anchor_stabilizer: false
   anchor_stabilizer_tolerance_ratio: 0.15  # fraction de la hauteur médiane
 

@@ -147,6 +147,7 @@ class OccupancyManager:
         self.identities = identity_manager or IdentityManager(
             long_term=config.reid.long_term,
             external_reid=config.reid.external_reid,
+            appearance_continuity=config.reid.appearance_continuity,
             grace_period_seconds=config.timing.grace_period_seconds,
             event_sink=event_sink,
         )
@@ -174,6 +175,54 @@ class OccupancyManager:
         self._last_snapshot_s: float | None = None
         self._frame_size: tuple[int, int] = (0, 0)
         self._views: list[_View] = []
+        #: Hauteur de boîte **brute** de la frame courante, par identifiant
+        #: technique : c'est la mesure qui alimente la détection de chute.
+        self._raw_heights: dict[int, float] = {}
+        #: Clés de repli créées dans la frame courante (identifiant technique pas
+        #: encore résolu par ``IdentityManager``) : elles ne doivent pas être
+        #: conservées, contrairement aux profils indexés par ``person_id``.
+        self._fallback_keys: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # Clés de stabilisation : indexées par person_id, jamais par ID technique
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fallback_key(technical_track_id: int) -> int:
+        """Clé de repli pour un identifiant technique **pas encore résolu**.
+
+        Négative, donc impossible à confondre avec un ``person_id`` (qui commence
+        à 1) : un profil de personne ne peut pas hériter de la hauteur d'une piste
+        technique homonyme.
+        """
+        return -1 - int(technical_track_id)
+
+    def stabilization_key(self, technical_track_id: int) -> int:
+        """Clé d'historique de hauteur/ancre pour un identifiant technique.
+
+        BoT-SORT réattribue un identifiant technique après une occultation ;
+        indexer l'historique par cet identifiant volatil le réinitialiserait
+        exactement au moment où la correction de hauteur est la plus utile. Le
+        ``person_id`` résolu par :mod:`identity_manager` est donc utilisé dès
+        qu'il est connu, et la correspondance reste valable après un
+        ``TECHNICAL_ID_CHANGED``.
+        """
+        resolved = self.identities.person_of(int(technical_track_id))
+        if resolved is not None:
+            return int(resolved)
+        key = self._fallback_key(technical_track_id)
+        self._fallback_keys.add(key)
+        return key
+
+    def stabilization_keys(self) -> set[int]:
+        """Clés d'historique encore vivantes (état courante du suivi).
+
+        Utilisée pour purger les profils : la purge doit se baser sur la
+        **personne** suivie, pas sur les identifiants présents dans la frame, sinon
+        une seule frame manquée détruirait l'historique de hauteur.
+        """
+        keys = {int(track.person_id) for track in self.tracks.values()}
+        keys.update(self._fallback_keys)
+        return keys
 
     # ------------------------------------------------------------------
     # Propriétés d'état
@@ -341,36 +390,61 @@ class OccupancyManager:
             valid_detections.append(det)
         detections = valid_detections
 
-        self.scale.observe_many([detection.bbox for detection in detections])
-
         if self.budget is None:
             # Aucun FPS mesuré : les durées ne peuvent pas être converties en
             # frames, donc aucune décision n'est prise (règle 0.2). Seule
-            # l'échelle locale est accumulée.
+            # l'échelle locale est accumulée — sur les boîtes brutes, faute de
+            # pouvoir appliquer la stabilisation à ce stade.
+            self.scale.observe_many([detection.bbox for detection in detections])
             self._bootstrapping_frames += 1
             self._views = []
             return
 
         budget = self.budget
         self._advance_warmup(timestamp_s)
-        dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
         margin_ratio = self.config.geometry.anchor_edge_margin_ratio
 
         # Stabilisation optionnelle (spec 7) : la boîte brute reste disponible et
         # la correction est journalisée avec sa raison et son seuil.
         raw_boxes: dict[int, np.ndarray] = {}
         corrected: dict[int, tuple[np.ndarray, tuple[float, float]]] = {}
+        self._raw_heights.clear()
+        self._fallback_keys.clear()
         for detection in detections:
             technical_id = int(detection.technical_track_id)
             raw = np.asarray(detection.bbox, dtype=float)
             bbox = raw
             if self.bbox_locker is not None:
-                bbox = np.asarray(self.bbox_locker.process_bbox(technical_id, raw), dtype=float)
+                # Historique indexé par ``person_id`` : une occultation ou un
+                # changement d'identifiant technique ne doit pas réinitialiser la
+                # hauteur de référence, sinon le verrouillage disparaîtrait
+                # précisément sur la frame où la hauteur chute.
+                bbox = np.asarray(
+                    self.bbox_locker.process_bbox(
+                        self.stabilization_key(technical_id), raw
+                    ),
+                    dtype=float,
+                )
             anchor = compute_anchor(bbox)
             if self.anchor_stabilizer is not None:
-                anchor = tuple(self.anchor_stabilizer.get_stabilized_anchor(technical_id, bbox))
+                anchor = tuple(
+                    self.anchor_stabilizer.get_stabilized_anchor(
+                        self.stabilization_key(technical_id), bbox
+                    )
+                )
             raw_boxes[technical_id] = raw
+            self._raw_heights[technical_id] = float(raw[3] - raw[1])
             corrected[technical_id] = (bbox, anchor)
+
+        # Échelle locale (zone morte, rayon d'ambiguïté) : alimentée par la
+        # hauteur **stabilisée** de chaque personne (BBoxHeightLocker, clé
+        # ``person_id``), jamais par la hauteur brute instantanée. Alimentée par
+        # la boîte brute, la zone morte grossissait et rétrécissait au rythme du
+        # bruit de détection au lieu de suivre la personne. La hauteur stabilisée
+        # est déjà calculée pour l'ancre : aucune seconde logique de lissage
+        # n'est introduite, et le calcul reste causal (la frame courante compte).
+        self._observe_local_scale(detections, corrected)
+        dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
 
         observations = [
             Observation(
@@ -441,6 +515,32 @@ class OccupancyManager:
             # libération de mémoire n'est donc jamais silencieuse (spec 3.4).
             self.tracks.pop(person_id, None)
 
+    def _observe_local_scale(
+        self,
+        detections: Sequence[Detection],
+        corrected: dict[int, tuple[np.ndarray, tuple[float, float]]],
+    ) -> None:
+        """Alimente l'échelle locale avec la hauteur **stabilisée** par personne.
+
+        Sans verrouillage de hauteur, la boîte corrigée est la boîte brute : le
+        comportement reste alors celui d'avant (aucun lissage à dupliquer).
+        Lorsque le verrouillage est actif, ``h_stable`` (moyenne glissante par
+        ``person_id``) est préféré à la hauteur corrigée : c'est la même
+        grandeur que celle qui a servi à fixer l'ancre de la frame, et elle est
+        déjà bornée par ``anchor.height_history_window_frames``.
+        """
+        for detection in detections:
+            technical_id = int(detection.technical_track_id)
+            bbox = corrected[technical_id][0]
+            stabilized = (
+                None
+                if self.bbox_locker is None
+                else self.bbox_locker.stable_height(self.stabilization_key(technical_id))
+            )
+            if stabilized is None:
+                stabilized = float(bbox[3] - bbox[1])
+            self.scale.observe(stabilized)
+
     def _report_stabilization(
         self,
         assignment,
@@ -509,6 +609,12 @@ class OccupancyManager:
             self._warmup_frames_observed >= self.budget.warmup_min_frames
             and elapsed >= self.config.timing.warmup_seconds
         ):
+            # ``warmup_frames_observed`` et ``warmup_elapsed_seconds`` décrivent
+            # la **dernière frame de warm-up** (la frame K ci-dessus) : c'est bien
+            # la durée du warm-up, pas la durée écoulée sur la première frame
+            # comptée. Les deux bornes du budget (``warmup_min_frames`` et
+            # ``warmup_frames``) sont publiées avec, pour que l'écart entre le
+            # critère déclaré et le critère appliqué soit vérifiable après coup.
             self._warmup_done = True
             self._warmup_report_pending = True
             return
@@ -615,8 +721,18 @@ class OccupancyManager:
     ) -> None:
         previous_state = track.state
         anchor_cfg = self.config.anchor
+        # La surveillance de chute doit voir la hauteur **mesurée** (boîte brute).
+        # Alimentée par la hauteur corrigée, elle serait structurellement muette :
+        # le verrouillage empêche par construction toute chute, donc le signal
+        # « ancre non fiable » que la FSM consomme en priorité (règle
+        # ``suspend_unreliable_anchor``) ne pourrait plus jamais être émis.
+        raw_height = float(
+            self._raw_heights.get(
+                int(assignment.technical_track_id), assignment.bbox_height
+            )
+        )
         is_drop, drop_ratio, ref_h = check_anchor_height_drop(
-            assignment.bbox_height,
+            raw_height,
             track.height_history,
             anchor_cfg.max_height_drop_ratio,
         )
@@ -625,12 +741,12 @@ class OccupancyManager:
         if is_drop:
             track.height_drop_streak += 1
             track.drop_previous_height = ref_h
-            track.drop_current_height = float(assignment.bbox_height)
+            track.drop_current_height = float(raw_height)
             track.drop_ratio = drop_ratio
             if track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames:
                 # La chute s'est stabilisée (personne assise et restée assise) :
                 # réadaptation de l'historique de hauteur et réactivation de la fiabilité.
-                track.height_history = [float(assignment.bbox_height)]
+                track.height_history = [float(raw_height)]
                 track.height_drop_streak = 0
                 track.anchor_unreliable_reason = None
                 reliable = bool(assignment.anchor_reliable)
@@ -644,7 +760,7 @@ class OccupancyManager:
         else:
             track.height_drop_streak = 0
             track.anchor_unreliable_reason = None
-            track.height_history.append(float(assignment.bbox_height))
+            track.height_history.append(float(raw_height))
             if len(track.height_history) > anchor_cfg.height_history_window_frames:
                 track.height_history.pop(0)
             reliable = bool(assignment.anchor_reliable)

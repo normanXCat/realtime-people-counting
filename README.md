@@ -27,10 +27,38 @@ Comptage IN/OUT + occupation encadrée (confirmée / incertaine)
 Journal d'événements JSON Lines (écriture incrémentale)
 ```
 
-Point d'entrée unique : **`src/main.py`** (lancé par `run.sh`). Tout composant
-expérimental (stabilisation de boîtes, extracteur d'apparence profond) est
-désactivé par défaut et ne s'active que par configuration explicite, pour les
-expériences d'ablation.
+Point d'entrée unique : **`src/main.py`** (lancé par `run.sh`). Le **verrouillage
+de hauteur de boîte** (`stabilization.use_bbox_locker`) est actif dans la
+configuration livrée : sans lui, une chute brutale de hauteur (jambes masquées,
+personne assise, flou) fait remonter l'ancre pieds et produit une fausse
+transition de zone. Cette hauteur **stabilisée** (indexée par `person_id`, fenêtre
+`anchor.height_history_window_frames`) est aussi la source de l'échelle locale,
+donc de la **zone morte** : celle-ci ne suit plus le bruit de détection frame par
+frame. Les composants encore expérimentaux (stabilisation d'ancre, extracteur
+d'apparence profond) restent désactivés par défaut et ne s'activent que par
+configuration explicite, pour les expériences d'ablation.
+
+### Stabilité de piste, warm-up et zone morte
+
+Réglages issus des cinq symptômes observés sur les vidéos de test (détail et
+compromis dans `docs/rapport_final.md` § 4.6) :
+
+- **`tracker.track_buffer`** (150 frames ≈ 5 s à 30 ips) couvre le p90 des
+  occlusions **mesurées** (médiane 2,5 s, p90 5,1 s) ; au-delà, la galerie ReID
+  long terme prend le relais. `with_reid`, `match_thresh`, `proximity_thresh`,
+  `appearance_thresh` et `gmc_method` (caméra fixe : `none`) sont désormais
+  déclarés dans `config/pipeline.yaml` et vérifiés contre le YAML lu par
+  Ultralytics ; `track_buffer` et les seuils d'apparence sont publiés dans
+  `SESSION_START`.
+- **Warm-up** : il se termine sur les deux bornes déclarées
+  (`timing.warmup_min_frames` **et** `timing.warmup_seconds`), sans autre
+  condition ; le compteur de stabilité est indexé par `person_id`, donc un
+  changement d'identifiant technique réassocié ne le remet pas à zéro.
+- **Réidentification après occultation longue** :
+  `reid.long_term.gallery_retention_seconds: null` aligne la rétention de la
+  galerie d'apparence sur la grâce d'occupation (la mémoire n'est jamais libérée
+  avant que la personne n'ait eu une chance de réapparaître). Une tolérance
+  progressive du seuil, bornée, reste disponible mais désactivée par défaut.
 
 ## Installation
 
@@ -70,8 +98,10 @@ Options principales :
 | `--max-frames <n>` | Arrêt après N frames (diagnostic) |
 
 Drapeaux d'ablation (protocole de la section 9) : `--no-long-term-reid`,
-`--no-safety-margin`, `--no-spatial-constraint`, `--use-bbox-locker`,
-`--use-anchor-stabilizer`, `--external-reid`.
+`--no-safety-margin`, `--no-spatial-constraint`, `--use-anchor-stabilizer`,
+`--external-reid`. Le verrouillage de hauteur étant actif par défaut, il ne se
+pilote plus par un drapeau mais par `stabilization.use_bbox_locker`
+(`--use-bbox-locker` reste accepté, sans effet supplémentaire).
 
 ### Sélection de la ligne virtuelle (obligatoire)
 
@@ -219,7 +249,8 @@ Quatre niveaux de tests (section 8 du cahier des charges) :
    (`test_fsm.py`), identités et ReID long terme (`test_identity_manager.py`),
    configuration (`test_config_validation.py`), sélection de la ligne et de son
    côté intérieur (`test_calibration.py`, `test_calibration_window.py`),
-   stabilisation (`test_stabilization_flags.py`) ;
+   stabilisation et son câblage (`test_stabilization_flags.py`,
+   `test_bbox_locker_integration.py`) ;
 2. **trajectoires synthétiques** — compteurs et occupation attendus, scénarios
    d'hésitation, de franchissement rapide et de scène initialement peuplée
    (`test_occupancy_synthetic.py`), frontière du warm-up et effectif initial
@@ -265,7 +296,8 @@ src/occupancy_manager.py    orchestration du comptage et de l'occupation
 src/occupancy_types.py      types métier (états, zones, pistes logiques)
 src/metrics.py              FPS mesuré et latences instrumentées
 src/anchor_stabilizer.py    stabilisation d'ancre (expérimental, désactivé par défaut)
-src/bbox_height_locker.py   verrouillage de hauteur de boîte (expérimental, désactivé)
+src/bbox_height_locker.py   verrouillage de hauteur de boîte (actif, indexé par person_id,
+                            source de l'échelle locale / zone morte)
 src/configs/custom_botsort.yaml   configuration BoT-SORT
 scripts/run_protocol.py     exécution des baselines et ablations
 evaluate_system.py          évaluation F1 / occupation / FPS d'une session

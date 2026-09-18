@@ -1,6 +1,6 @@
 # Configuration BoT-SORT lue directement par Ultralytics.
 #
-# Les trois seuils ci-dessous sont DOUBLÉS dans config/pipeline.yaml (section
+# TOUTES les valeurs ci-dessous sont DOUBLÉES dans config/pipeline.yaml (section
 # `tracker`) : le pipeline les valide, les publie et journalise leur cohérence
 # avec le seuil d'inférence YOLO. Un test vérifie que les deux sources ne
 # divergent pas — une divergence serait sinon totalement silencieuse.
@@ -9,6 +9,11 @@
 # détections faibles (personne floue) pour le second étage d'association. Le
 # garde-fou contre les faux positifs est new_track_thresh (0.7), pas le seuil
 # d'inférence YOLO (model.confidence = 0.10 dans pipeline.yaml).
+#
+# track_buffer (150 frames ≈ 5 s à 30 ips) couvre le p90 des occlusions mesurées
+# sur les vidéos de test (médiane 2,5 s, p90 5,1 s) ; au-delà, la galerie ReID
+# long terme prend le relais. with_reid active l'apparence native de BoT-SORT en
+# complément du ReID long terme de IdentityManager.
 tracker_type: botsort
 
 # Association et conservation des pistes pendant les occlusions.

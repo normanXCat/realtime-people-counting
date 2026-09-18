@@ -45,6 +45,11 @@ ALLOWED_ON_LINE_POLICIES = ("indeterminate", "inside", "outside")
 ALLOWED_DISAPPEARANCE_POLICIES = ("deferred_confirmation", "ambiguous_immediate")
 ALLOWED_AMBIGUOUS_POLICIES = ("provisional_person", "defer")
 ALLOWED_FPS_SOURCES = ("measured",)
+#: Méthodes de compensation de mouvement caméra (GMC) acceptées par BoT-SORT.
+#: ``none`` est la seule correcte pour une caméra **fixe** : les autres
+#: réintroduiraient une estimation de mouvement sur une image immobile, donc une
+#: source d'instabilité gratuite des boîtes et des identifiants techniques.
+ALLOWED_GMC_METHODS = ("none", "sparseOptFlow", "orb", "ecc", "sof")
 
 
 class ConfigError(ValueError):
@@ -103,6 +108,24 @@ class TrackerConfig:
     Ces valeurs doivent rester synchronisées avec le fichier YAML lu par
     Ultralytics (``config_path``) ; un test le vérifie, car une divergence
     serait silencieuse au runtime.
+
+    Persistance de piste et ré-identification **native** du tracker :
+
+    - ``track_buffer`` : nombre de frames qu'une piste perdue reste vivante
+      avant suppression définitive côté tracker. Il doit couvrir la durée
+      typique des occlusions mesurée sur les vidéos de test (médiane ≈ 2,5 s,
+      p90 ≈ 5 s) : ``150`` frames valent ≈ 5 s à la cadence source de 30 ips,
+      soit le p90 observé. Compromis documenté : un buffer plus long réduit les
+      changements d'identifiant technique mais augmente la mémoire/le calcul et
+      le risque de réassociation erronée en forte densité ;
+    - ``with_reid`` : active le module d'apparence **de BoT-SORT**, qui tente une
+      réassociation avant de créer un nouvel identifiant technique. Il complète
+      (sans le remplacer) le ReID long terme de :mod:`identity_manager`, qui
+      opère, lui, après expiration de la piste technique ;
+    - ``match_thresh`` / ``proximity_thresh`` / ``appearance_thresh`` : seuils
+      d'association (IoU, proximité, apparence) du tracker ;
+    - ``gmc_method`` : compensation de mouvement caméra. ``none`` pour une
+      caméra fixe (toute autre valeur estimerait un mouvement inexistant).
     """
 
     config_path: str = "src/configs/custom_botsort.yaml"
@@ -110,6 +133,15 @@ class TrackerConfig:
     track_high_thresh: float = 0.4
     track_low_thresh: float = 0.1
     new_track_thresh: float = 0.7
+    #: Persistance de piste : durée d'occlusion couverte par le tracker.
+    track_buffer: int = 150
+    #: Ré-identification native BoT-SORT (association par apparence).
+    with_reid: bool = True
+    match_thresh: float = 0.9
+    proximity_thresh: float = 0.5
+    appearance_thresh: float = 0.25
+    #: Compensation de mouvement caméra : ``none`` (caméra fixe).
+    gmc_method: str = "none"
 
 
 @dataclass(frozen=True)
@@ -136,6 +168,62 @@ class LongTermReidConfig:
     gallery_min_crop_width_px: int = 16
     #: Variance minimale du Laplacien du crop (netteté). 0 = contrôle désactivé.
     gallery_min_sharpness: float = 0.0
+    #: Durée de rétention d'une identité **purgée** dans la galerie d'apparence.
+    #: ``None`` = alignée sur ``timing.grace_period_seconds`` (valeur par défaut) :
+    #: la mémoire d'apparence n'est alors jamais libérée avant que la personne
+    #: n'ait eu une chance réaliste de réapparaître (fenêtre totale = grâce +
+    #: rétention). Une valeur explicite découple la mémoire du ReID de la grâce
+    #: d'occupation, ce qui doit être justifié dans la configuration.
+    gallery_retention_seconds: float | None = None
+    #: Tolérance **progressive** du seuil d'apparence selon la durée d'absence
+    #: (une longue occultation change légèrement l'apparence : angle, lumière).
+    #: ``long_absence_similarity_floor`` = seuil plancher atteint au bout de
+    #: ``long_absence_seconds`` d'absence. ``None`` (défaut) = pas d'assouplissement
+    #: (le seuil reste ``similarity_threshold``) : le compromis est choisi
+    #: explicitement, jamais subi, pour éviter les fausses réassociations.
+    long_absence_seconds: float = 2.0
+    long_absence_similarity_floor: float | None = None
+
+
+@dataclass(frozen=True)
+class AppearanceContinuityConfig:
+    """Garde-fou « inversement d'identifiant » (swap) sous occlusion dense.
+
+    Un **swap** n'est pas une perte de piste : deux identifiants techniques
+    restent actifs en continu, mais s'échangent la personne qu'ils suivent. Le
+    phénomène se produit **à l'intérieur du matching de BoT-SORT**, avant que
+    :mod:`identity_manager` ne voie quoi que ce soit d'anormal : aucun
+    identifiant ne disparaît, donc ni ``TECHNICAL_ID_CHANGED`` ni
+    ``TRACK_ID_ABSENT`` ne se déclenche. C'est pour cette raison qu'il passait
+    inaperçu : les tests vérifiaient la continuité des identifiants, pas leur
+    exactitude sémantique.
+
+    Ce garde-fou **diagnostique sans corriger** : il compare le descripteur
+    d'apparence d'une piste qui n'a jamais été perdue d'une frame à l'autre et
+    journalise ``TRACK_ID_APPEARANCE_DISCONTINUITY`` quand la similarité
+    s'effondre. Réaffecter automatiquement les identités risquerait de
+    sur-corriger un cas où ce n'était pas un swap ; la métrique est d'abord
+    mesurée, la correction automatique restant hors périmètre.
+
+    - ``similarity_threshold`` : similarité cosinus en dessous de laquelle le
+      saut d'apparence de deux frames **consécutives** de la même piste est
+      considéré comme anormal. Un seuil élevé augmente la sensibilité (et les
+      faux positifs de diagnostic) ; un seuil bas ne détecte que les échanges
+      francs.
+    - ``max_gap_frames`` : écart maximal, en frames traitées, pour qu'une piste
+      reste considérée comme **continue**. Au-delà, la piste a réellement été
+      perdue : la réassociation normale (galerie, marge de sécurité) s'applique
+      et ce n'est plus un swap. ``0`` exige deux frames strictement
+      consécutives.
+    - ``min_interval_seconds`` : limitation de débit par piste. La
+      discontinuité n'est écrite qu'une fois tant que la continuité n'est pas
+      rétablie, et au plus une fois par intervalle.
+    """
+
+    enabled: bool = True
+    similarity_threshold: float = 0.50
+    max_gap_frames: int = 2
+    min_interval_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -151,6 +239,9 @@ class ReidConfig:
     short_term: str = "native_botsort"
     long_term: LongTermReidConfig = field(default_factory=LongTermReidConfig)
     external_reid: ExternalReidConfig = field(default_factory=ExternalReidConfig)
+    appearance_continuity: AppearanceContinuityConfig = field(
+        default_factory=AppearanceContinuityConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -615,6 +706,50 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "reid.long_term.gallery_min_sharpness",
         problems,
     )
+    gallery_retention_seconds = _optional_positive(
+        long_term_raw.get("gallery_retention_seconds", None),
+        "reid.long_term.gallery_retention_seconds",
+        problems,
+    )
+    long_absence_seconds = _positive(
+        long_term_raw.get("long_absence_seconds", 2.0),
+        "reid.long_term.long_absence_seconds",
+        problems,
+    )
+    long_absence_floor = _optional_cosine(
+        long_term_raw.get("long_absence_similarity_floor", None),
+        "reid.long_term.long_absence_similarity_floor",
+        problems,
+    )
+    if (
+        long_absence_floor is not None
+        and similarity_threshold is not None
+        and long_absence_floor > similarity_threshold
+    ):
+        problems.append(
+            "reid.long_term.long_absence_similarity_floor "
+            f"({long_absence_floor}) doit être <= similarity_threshold "
+            f"({similarity_threshold}) : une tolérance progressive ne peut que "
+            "descendre sous le seuil nominal, jamais le relever."
+        )
+    # -- Garde-fou de swap (continuité d'apparence d'une piste non perdue) --
+    continuity_raw = _section(reid_raw, "appearance_continuity")
+    continuity_threshold = _cosine(
+        continuity_raw.get("similarity_threshold", 0.50),
+        "reid.appearance_continuity.similarity_threshold",
+        problems,
+    )
+    continuity_max_gap = _non_negative_int(
+        continuity_raw.get("max_gap_frames", 2),
+        "reid.appearance_continuity.max_gap_frames",
+        problems,
+    )
+    continuity_min_interval = _non_negative(
+        continuity_raw.get("min_interval_seconds", 1.0),
+        "reid.appearance_continuity.min_interval_seconds",
+        problems,
+    )
+
     external_raw = _section(reid_raw, "external_reid")
     image_size_pair = external_raw.get("image_size", (256, 128))
     if not (isinstance(image_size_pair, (list, tuple)) and len(image_size_pair) == 2):
@@ -698,6 +833,26 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             "peut pas être créée sur une détection moins fiable que celles utilisées "
             "pour l'association existante."
         )
+    # -- Persistance de piste et ReID natif BoT-SORT ----------------------
+    track_buffer = _positive_int(
+        tracker_raw.get("track_buffer", 150), "tracker.track_buffer", problems
+    )
+    match_thresh = _unit_interval_inclusive(
+        tracker_raw.get("match_thresh", 0.9), "tracker.match_thresh", problems
+    )
+    proximity_thresh = _unit_interval_inclusive(
+        tracker_raw.get("proximity_thresh", 0.5), "tracker.proximity_thresh", problems
+    )
+    appearance_thresh = _unit_interval_inclusive(
+        tracker_raw.get("appearance_thresh", 0.25), "tracker.appearance_thresh", problems
+    )
+    gmc_method = str(tracker_raw.get("gmc_method", "none"))
+    if gmc_method not in ALLOWED_GMC_METHODS:
+        problems.append(
+            f"tracker.gmc_method doit être l'un de {ALLOWED_GMC_METHODS} "
+            f"(reçu {gmc_method!r}) : une compensation de mouvement caméra sur une "
+            "caméra fixe est une source d'instabilité des boîtes."
+        )
 
     display_raw = _section(raw, "display")
     logging_raw = _section(raw, "logging")
@@ -743,6 +898,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     assert anchor_confirm_frames is not None
     assert min_aspect_ratio_wh is not None and max_aspect_ratio_wh is not None
     assert min_box_height_px is not None and min_box_width_px is not None
+    assert long_absence_seconds is not None
 
     return PipelineConfig(
         schema_version=1,
@@ -765,6 +921,16 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             track_high_thresh=float(track_high_thresh if track_high_thresh is not None else 0.4),
             track_low_thresh=float(track_low_thresh if track_low_thresh is not None else 0.1),
             new_track_thresh=float(new_track_thresh if new_track_thresh is not None else 0.7),
+            track_buffer=int(track_buffer if track_buffer is not None else 150),
+            with_reid=bool(tracker_raw.get("with_reid", True)),
+            match_thresh=float(match_thresh if match_thresh is not None else 0.9),
+            proximity_thresh=float(
+                proximity_thresh if proximity_thresh is not None else 0.5
+            ),
+            appearance_thresh=float(
+                appearance_thresh if appearance_thresh is not None else 0.25
+            ),
+            gmc_method=gmc_method,
         ),
         reid=ReidConfig(
             short_term=str(reid_raw.get("short_term", "native_botsort")),
@@ -781,12 +947,34 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 gallery_min_crop_height_px=int(gallery_min_crop_height),
                 gallery_min_crop_width_px=int(gallery_min_crop_width),
                 gallery_min_sharpness=float(gallery_min_sharpness or 0.0),
+                gallery_retention_seconds=(
+                    None if gallery_retention_seconds is None
+                    else float(gallery_retention_seconds)
+                ),
+                long_absence_seconds=float(
+                    long_absence_seconds if long_absence_seconds is not None else 2.0
+                ),
+                long_absence_similarity_floor=(
+                    None if long_absence_floor is None else float(long_absence_floor)
+                ),
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
                 model_path=str(external_raw.get("model_path", "osnet_x0_25_msmt17.pt")),
                 weights=str(external_raw.get("weights", "osnet_x0_25")),
                 image_size=(int(image_size_pair[0]), int(image_size_pair[1])),
+            ),
+            appearance_continuity=AppearanceContinuityConfig(
+                enabled=bool(continuity_raw.get("enabled", True)),
+                similarity_threshold=float(
+                    continuity_threshold if continuity_threshold is not None else 0.50
+                ),
+                max_gap_frames=int(
+                    continuity_max_gap if continuity_max_gap is not None else 2
+                ),
+                min_interval_seconds=float(
+                    continuity_min_interval if continuity_min_interval is not None else 1.0
+                ),
             ),
         ),
         line=LineConfig(
@@ -908,6 +1096,37 @@ def _unit_interval(value: Any, name: str, problems: list[str]) -> float | None:
     return number
 
 
+def _unit_interval_inclusive(value: Any, name: str, problems: list[str]) -> float | None:
+    """Comme :func:`_unit_interval`, mais ``1.0`` est une valeur légitime.
+
+    BoT-SORT accepte un seuil d'association à 1.0 (toutes les associations
+    plausibles passent) ; refuser 1.0 serait une contrainte arbitraire. ``0.0``
+    reste refusé : il n'associerait plus rien du tout.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} doit être un nombre (reçu {value!r})")
+        return None
+    if not (0.0 < number <= 1.0):
+        problems.append(f"{name} doit être dans ]0, 1] (reçu {number})")
+        return None
+    return number
+
+
+def _optional_positive(value: Any, name: str, problems: list[str]) -> float | None:
+    """Valeur ``> 0`` facultative (``None`` = non déclarée, donc repli par défaut)."""
+    if value is None:
+        return None
+    return _positive(value, name, problems)
+
+
+def _optional_cosine(value: Any, name: str, problems: list[str]) -> float | None:
+    if value is None:
+        return None
+    return _cosine(value, name, problems)
+
+
 def _cosine(value: Any, name: str, problems: list[str]) -> float | None:
     try:
         number = float(value)
@@ -954,6 +1173,18 @@ def _bounded(
         return None
     if not (low <= number <= high):
         problems.append(f"{name} doit être dans [{low}, {high}] (reçu {number})")
+        return None
+    return number
+
+
+def _non_negative_int(value: Any, name: str, problems: list[str]) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} doit être un entier (reçu {value!r})")
+        return None
+    if number < 0:
+        problems.append(f"{name} doit être >= 0 (reçu {number})")
         return None
     return number
 

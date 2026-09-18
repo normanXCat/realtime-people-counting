@@ -51,7 +51,7 @@ atteints, 11 champs de piste jamais lus ni écrits, double ligne
 | Élément | Traitement |
 |---|---|
 | Persistance BoT-SORT (`persist=True`, `custom_botsort.yaml`) | conservée telle quelle |
-| `AnchorStabilizer`, `BBoxHeightLocker` | logique inchangée, désactivés par défaut, traçabilité ajoutée |
+| `AnchorStabilizer`, `BBoxHeightLocker` | logique interne inchangée ; `BBoxHeightLocker` est **actif par défaut** (historique indexé par `person_id`, purge sur les personnes suivies), `AnchorStabilizer` reste désactivé par défaut ; traçabilité ajoutée |
 | Extracteur d'apparence profond (ex-`reid.py`) | fusionné dans `identity_manager.py`, activé seulement par `reid.external_reid.enabled` |
 | Contrainte spatio-temporelle et qualité de descripteur (ex-`hybrid_tracker.py`) | fusionnées dans le niveau 2 du gestionnaire d'identités |
 | `evaluate_system.py` | corrigé sur place : lit le JSON Lines validé, raisonne en secondes, calcule F1, occupation et FPS |
@@ -178,6 +178,102 @@ Le dispositif vérifie la disjonction calibration / test, génère une configura
 revalidée par variante, refuse de conclure sans corpus et sans critère chiffré.
 Tests dédiés : `tests/test_evaluate_system.py`, `tests/test_protocol.py`.
 
+### 4.6 Stabilité de piste, warm-up et zone morte (corrections ciblées)
+
+Cinq symptômes avaient été observés sur les vidéos de test : identifiants
+techniques instables sous occlusion, personnes jamais réassociées après une
+longue occultation, personnes visibles au warm-up mais non comptées, warm-up
+anormalement long, zone morte qui grandit et rétrécit. L'hypothèse de départ —
+les symptômes d'identifiant, de comptage au warm-up et de zone morte partagent
+une cause commune (une grandeur dérivée de la **hauteur de boîte brute
+instantanée**), les deux autres étant distincts — a été vérifiée composant par
+composant avant toute correction.
+
+**1. Stabilité des identifiants BoT-SORT.** Les paramètres de persistance et de
+ReID natif sont désormais **déclarés** dans `config/pipeline.yaml` (section
+`tracker`) et non plus seulement dans le YAML lu par Ultralytics : un test
+vérifie que les deux sources ne divergent pas (`tracker.config_path`,
+`track_high_thresh`, `track_low_thresh`, `new_track_thresh`, `track_buffer`,
+`with_reid`, `match_thresh`, `proximity_thresh`, `appearance_thresh`,
+`gmc_method`). `track_buffer` n'est pas une valeur par défaut arbitraire : la
+durée des occlusions a été **mesurée** sur les sessions réelles
+(`results/*/events.jsonl`, événement `OCCLUDED` → réapparition) — médiane 2,5 s,
+p90 5,1 s, maximum 13,5 s. 150 frames ≈ 5 s à la cadence source de 30 ips
+couvrent donc le p90 ; au-delà, la galerie ReID long terme prend le relais.
+`with_reid: true` fait tenter à BoT-SORT une réassociation par apparence **avant**
+de créer un nouvel identifiant technique, en complément de `IdentityManager`
+(qui opère, lui, après expiration de la piste technique). `gmc_method: none` est
+imposé pour une caméra fixe : toute compensation de mouvement y serait une
+source d'instabilité gratuite.
+
+**2. Comptage pendant le warm-up.** Le compteur « frames stables en
+`ZONE_INTERIEURE` » vit sur la piste **logique** (`person_id`), jamais sur
+l'identifiant brut de BoT-SORT, et `IdentityManager` est actif **pendant** le
+warm-up (aucune phase parallèle). Un changement d'identifiant technique réassocié
+durant le warm-up ne remet donc plus le compteur à zéro : la personne, visible à
+chaque frame, est comptée normalement. Un test dédié rejoue ce scénario ; un
+second vérifie qu'un `person_id` réellement nouveau reste une entité distincte
+(pas de fusion).
+
+**3. Durée du warm-up.** Le code se termine bien sur les **deux** bornes
+déclarées (`warmup_min_frames` **et** `warmup_seconds`), sans condition
+supplémentaire : la stabilité individuelle ne détermine que l'entrée dans
+`initial_occupancy`, jamais la durée. Les sessions réelles se clôturent
+exactement à 15 frames observées (4,4 s à 6,1 s selon le FPS mesuré de 2,3 à
+3,2), soit `max(15 frames, 0,5 s)` — conforme à la configuration. Aucune valeur
+concurrente codée en dur : un test fait varier `warmup_min_frames` et
+`warmup_seconds` et vérifie que la durée **et** les valeurs publiées dans
+`WARMUP_END` suivent la configuration.
+
+**4. Stabilité de la zone morte.** Elle reste une fraction de l'échelle locale
+(`geometry.dead_zone_ratio`), mais l'échelle locale est désormais alimentée par
+la hauteur **stabilisée** du `BBoxHeightLocker` (moyenne glissante par
+`person_id`, fenêtre `anchor.height_history_window_frames`) — soit la **même**
+source que celle de l'ancre, sans seconde logique de lissage. Alimentée par la
+hauteur brute instantanée, la zone morte suivait le bruit de détection (une
+chute de 40 % la faisait rétrécir) ; désormais elle reste quasi constante pour
+une personne immobile, ne suit pas une occlusion basse, et s'adapte
+progressivement — sans à-coup — quand la personne se rapproche réellement. Un
+defaut de câblage a été corrigé au passage : le verrouillage est construit depuis
+la configuration dans `main.py` (seuil **et** fenêtre) et non plus avec la
+fenêtre codée en dur de 15 frames du module.
+
+**5. Ré-identification après occultation longue.** La rétention de la galerie
+d'apparence est désormais une valeur **explicite**
+(`reid.long_term.gallery_retention_seconds: null` = alignée sur
+`timing.grace_period_seconds`). La mémoire n'est donc jamais libérée avant que la
+personne n'ait eu une chance réaliste de réapparaître (fenêtre totale = grâce +
+rétention, soit 2 × grâce par défaut) ; la libérer plus tôt supprimerait
+l'événement `PURGE` et le passage en occupation incertaine. Le seuil de
+similarité reste **constant** par défaut : un assouplissement automatique serait
+un risque de fausse réassociation. Une tolérance **progressive et bornée** est
+toutefois disponible (`long_absence_seconds`,
+`long_absence_similarity_floor`) : le seuil descend linéairement vers le plancher
+déclaré au bout de la durée d'absence, jamais en dessous, et la marge de
+sécurité vis-à-vis du second candidat reste appliquée telle quelle. Elle est
+désactivée par défaut et testée dans les deux sens (une apparence légèrement
+changée est récupérée, une personne différente reste rejetée). Au-delà de la
+rétention, le comportement reste explicite : la personne comptée demeure
+`incertaine` (borne haute), aucune sortie n'est inventée, et la réapparition
+devient une identité distincte dont l'ambiguïté est publiée dans l'encadrement
+`[observée, opérationnelle]`.
+
+| Valeur retenue | Choix | Compromis documenté |
+|---|---|---|
+| `tracker.track_buffer` = 150 | couvre le p90 mesuré (5,1 s) | plus long = moins de changements d'ID, mais plus de mémoire/calcul et davantage de réassociations erronées en forte densité |
+| `tracker.with_reid` = true, `appearance_thresh` = 0,25 | réassociation par apparence avant création d'un ID technique | coût de calcul du descripteur natif ; complète, sans le remplacer, le ReID long terme |
+| `tracker.gmc_method` = none | caméra fixe | aucune estimation de mouvement à stabiliser |
+| `warmup_min_frames` = 15 / `warmup_seconds` = 0,5 | deux bornes exigées | à faible FPS la borne de frames domine (≈ 5 s réelles) ; c'est le prix de la robustesse aux FPS élevés |
+| `geometry.dead_zone_ratio` = 0,15 sur hauteur **stabilisée** | zone morte quasi constante | adaptation plus lente à un vrai changement de distance (bornée par la fenêtre de l'ancre) |
+| `gallery_retention_seconds` = null (≈ grâce) | mémoire jamais libérée avant la réapparition possible | galerie conservée plus longtemps |
+| `long_absence_similarity_floor` = null | aucun assouplissement subi | l'option reste disponible et bornée, testée, pour les longues occultations |
+
+Tests ajoutés ou étendus : `tests/test_dead_zone_stability.py`,
+`tests/test_long_occlusion_reid.py`, `tests/test_warmup.py`,
+`tests/test_config_validation.py` (synchronisation BoT-SORT, validation des
+nouveaux paramètres), `tests/test_bbox_locker_integration.py` (câblage du
+verrouillage depuis la configuration), `tests/test_stabilization_flags.py`.
+
 ## 5. Limites et reste à faire
 
 1. **Seuils non calibrés** : `model.confidence`, `model.nms_iou`,
@@ -185,7 +281,12 @@ Tests dédiés : `tests/test_evaluate_system.py`, `tests/test_protocol.py`.
    `timing.confirmation_seconds`, `timing.grace_period_seconds`,
    `reid.long_term.similarity_threshold`, `safety_margin`, `v_max_ratio`,
    `spatial_margin_ratio` restent marqués « PROVISOIRE » et doivent être figés
-   sur l'ensemble de calibration.
+   sur l'ensemble de calibration. Il en va de même pour `tracker.track_buffer`,
+   `tracker.appearance_thresh`, `tracker.proximity_thresh` et
+   `tracker.match_thresh` : les valeurs retenues sont justifiées par les
+   occlusions mesurées, mais la calibration finale (F1 / IDF1) doit les
+   reconfirmer. `long_absence_similarity_floor` reste `null` tant qu'aucune
+   mesure ne prouve qu'un assouplissement est nécessaire.
 2. **Corpus absent** : les ensembles `datasets.*` de `config/protocol.yaml` sont
    vides. Sans vidéos annotées, les métriques de la section 9.3 (F1, MAE
    d'occupation, FPS) ne peuvent pas être produites.

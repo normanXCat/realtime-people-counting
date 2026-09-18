@@ -172,6 +172,24 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "reason", "descriptor_reliable",
         ),
     ),
+    # Garde-fou « inversement d'identifiant » (swap) : une piste technique
+    # **active en continu** (jamais perdue selon BoT-SORT) change brutalement
+    # d'apparence. Ce phénomène se produit à l'intérieur du matching du tracker,
+    # avant qu'un identifiant ne disparaisse : aucun TECHNICAL_ID_CHANGED ni
+    # TRACK_ID_ABSENT ne le signale. L'événement est un **diagnostic** : le swap
+    # n'est pas corrigé automatiquement (sur-corriger un faux positif serait
+    # pire), il est seulement rendu mesurable.
+    "TRACK_ID_APPEARANCE_DISCONTINUITY": EventSpec(
+        required=(
+            "technical_track_id",
+            "similarity_to_previous_descriptor",
+            "reason",
+        ),
+        optional=(
+            "person_id_before", "gap_frames", "previous_descriptor_frame_index",
+            "descriptor_age_s", "threshold", "consecutive_frames",
+        ),
+    ),
     # Apparence refusée pour la galerie (jamais remplacée en silence).
     "REID_DESCRIPTOR_REJECTED": EventSpec(
         required=("person_id", "reason"),

@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from conftest import TEST_FPS, make_test_line, person_box
+from events import ListSink
 from identity_manager import IdentityManager
 from occupancy_manager import Detection, OccupancyManager
 
@@ -260,3 +261,109 @@ def test_warmup_event_is_published_exactly_once(manager, frame, sink):
     assert sink.count("WARMUP_END") == 1
     assert manager.initial_occupancy == 1
     assert manager.occupancy_operational == 1
+
+
+# ---------------------------------------------------------------------------
+# Compteur de stabilité indexé par person_id, jamais par ID technique
+# ---------------------------------------------------------------------------
+def test_a_technical_id_change_during_warmup_still_counts_the_person_once(
+    manager, frame, sink
+):
+    """Personne visible à chaque frame, mais dont l'ID technique change en cours.
+
+    Le compteur « frames stables en zone intérieure » vit sur la piste logique
+    (``person_id``), pas sur l'identifiant brut de BoT-SORT : une réassociation
+    au même ``person_id`` ne l'interrompt donc pas. Indexé sur l'ID technique, il
+    repartait de zéro sans que la moindre frame ait manqué — la bbox était bien
+    présente, mais la personne n'était jamais comptée.
+    """
+    sim = Sim(manager, frame)
+    sim.steps(2, [detection(1, INSIDE_Y)])
+    sim.steps(3, [detection(42, INSIDE_Y)])   # nouvel ID technique, même personne
+
+    changes = sink.of_type("TECHNICAL_ID_CHANGED")
+    assert len(changes) == 1, "la réassociation doit être journalisée, pas devinée"
+    assert changes[0]["person_id"] == 1
+    assert changes[0]["technical_track_id"] == 42
+    assert len(manager.tracks) == 1, "une seule entité logique"
+    assert manager.initial_occupancy == 1, "comptée malgré le changement d'ID"
+    assert warmup_end(sink)["initial_occupancy"] == 1
+    assert manager.total_in == 0 and manager.total_new == 0
+    assert manager.occupancy_confirmed == 1
+
+
+def test_a_real_new_person_during_warmup_is_not_merged(test_config):
+    """Un ``person_id`` réellement nouveau reste une entité distincte."""
+    sink = ListSink("warmup")   # collecteur dédié : le fixture ``sink`` est partagé
+    manager = build_manager(test_config, sink)
+    sim = Sim(manager, TINY_FRAME)
+    sim.steps(2, [detection(1, INSIDE_Y)])
+    # Deuxième personne à l'intérieur, apparence et position distinctes : elle ne
+    # doit pas être fusionnée avec la première.
+    sim.steps(3, [detection(1, INSIDE_Y), detection(2, INSIDE_Y, x=460.0)])
+    assert len(manager.tracks) == 2
+    assert manager.initial_occupancy == 2
+    assert sink.count("TECHNICAL_ID_CHANGED") == 0
+
+
+# ---------------------------------------------------------------------------
+# Durée du warm-up : bornes frames/temps, jamais la stabilité des pistes
+# ---------------------------------------------------------------------------
+def _warmup_completing_frame(config, detections_at, sink):
+    manager = build_manager(config, sink)
+    sim = Sim(manager, TINY_FRAME)
+    for index in range(1, 120):
+        sim.step(detections_at(index))
+        if manager.phase == "RUNNING":
+            return manager, index
+    raise AssertionError("le warm-up doit se terminer")
+
+
+def test_warmup_duration_does_not_depend_on_track_stability(make_config):
+    """Des pistes instables ne prolongent pas le warm-up.
+
+    Seules les personnes **stables** entrent dans ``initial_occupancy`` ; la durée
+    du warm-up, elle, ne dépend que des bornes frames/temps (spec 3 du prompt).
+    """
+    config = make_config({"timing": {"warmup_seconds": 0.5, "warmup_min_frames": 15}})
+
+    quiet_manager, quiet_frame = _warmup_completing_frame(
+        config, lambda _index: [detection(1, INSIDE_Y)], ListSink("quiet")
+    )
+
+    def with_unstable(index):
+        detections = [detection(1, INSIDE_Y)]
+        if index <= 3:                      # piste fantôme : vue 3 frames puis perdue
+            detections.append(detection(2, OUTSIDE_Y, x=460.0))
+        return detections
+
+    noisy_sink = ListSink("noisy")
+    noisy_manager, noisy_frame = _warmup_completing_frame(
+        config, with_unstable, noisy_sink
+    )
+
+    assert noisy_frame == quiet_frame, "la durée du warm-up ne dépend pas des pistes"
+    assert quiet_manager.initial_occupancy == 1
+    assert noisy_manager.initial_occupancy == 1, "la piste instable n'est pas comptée"
+    assert warmup_end(noisy_sink)["initial_occupancy"] == 1
+
+
+def test_warmup_bounds_have_a_single_source_of_truth(make_config):
+    """Changer la configuration change réellement la durée : aucun repli en dur."""
+    # Valeurs volontairement différentes du fichier livré (15 frames / 0,5 s) :
+    # si une constante codée en dur prenait le dessus, la durée ne suivrait pas.
+    config = make_config({"timing": {"warmup_seconds": 0.2, "warmup_min_frames": 9}})
+    sink = ListSink("single-source")
+    manager, completed_at = _warmup_completing_frame(
+        config, lambda _index: [detection(1, INSIDE_Y)], sink
+    )
+    event = warmup_end(sink)
+    # La borne de frames (9) domine la borne de temps (0,2 s = 2 frames) : la 10e
+    # frame est la première frame comptée.
+    assert completed_at == 10
+    assert event["warmup_min_frames"] == config.timing.warmup_min_frames == 9
+    assert event["budget_frames"] == round(config.timing.warmup_seconds * TEST_FPS) == 2
+    assert event["warmup_frames_observed"] == 9
+    assert event["warmup_frames_observed"] >= config.timing.warmup_min_frames
+    assert event["warmup_elapsed_seconds"] >= config.timing.warmup_seconds
+    assert manager.initial_occupancy == 1

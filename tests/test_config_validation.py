@@ -34,10 +34,16 @@ def test_default_config_loads_and_is_valid():
     assert config.line.on_line_policy == "indeterminate"
     assert config.timing.fps_source == "measured"
     assert config.output.write_mode == "append_incremental"
-    assert config.stabilization.use_bbox_locker is False
+    # Le verrouillage de hauteur est ACTIF dans le pipeline officiel (sans lui,
+    # une chute de hauteur de boîte produit une fausse transition de zone).
+    assert config.stabilization.use_bbox_locker is True
     assert config.stabilization.use_anchor_stabilizer is False
     assert config.reid.long_term.enabled is True
     assert config.reid.external_reid.enabled is False
+    # Garde-fou de swap : actif, mais purement diagnostique.
+    assert config.reid.appearance_continuity.enabled is True
+    assert config.reid.appearance_continuity.similarity_threshold == pytest.approx(0.5)
+    assert config.reid.appearance_continuity.max_gap_frames == 2
 
 
 def test_frame_budget_uses_measured_fps():
@@ -107,7 +113,13 @@ def test_tracker_thresholds_must_stay_distinct_and_ordered():
 
 
 def test_botsort_yaml_is_synchronised_with_the_configuration():
-    """Divergence silencieuse interdite entre le YAML lu par Ultralytics et la config."""
+    """Divergence silencieuse interdite entre le YAML lu par Ultralytics et la config.
+
+    La synchronisation porte sur **toutes** les valeurs de persistance et de ReID
+    natif, pas seulement sur les trois seuils : un ``track_buffer`` réglé dans le
+    YAML mais oublié dans la configuration piloterait le comportement sans que le
+    journal ni le protocole ne le sachent.
+    """
     from config import REPO_ROOT
 
     config = load_config()
@@ -123,6 +135,50 @@ def test_botsort_yaml_is_synchronised_with_the_configuration():
     assert tracker_yaml["new_track_thresh"] == pytest.approx(
         config.tracker.new_track_thresh
     )
+    assert tracker_yaml["track_buffer"] == config.tracker.track_buffer
+    assert tracker_yaml["with_reid"] == config.tracker.with_reid
+    assert tracker_yaml["match_thresh"] == pytest.approx(config.tracker.match_thresh)
+    assert tracker_yaml["proximity_thresh"] == pytest.approx(
+        config.tracker.proximity_thresh
+    )
+    assert tracker_yaml["appearance_thresh"] == pytest.approx(
+        config.tracker.appearance_thresh
+    )
+    assert tracker_yaml["gmc_method"] == config.tracker.gmc_method
+
+
+def test_track_buffer_covers_the_measured_occlusion_duration():
+    """``track_buffer`` est réglé sur les occlusions **mesurées**, pas par défaut.
+
+    Occlusions mesurées dans ``results/*/events.jsonl`` (OCCLUDED -> réapparition) :
+    médiane 2,5 s, p90 5,1 s. Le buffer doit couvrir au moins la médiane ; 150
+    frames valent 5 s à la cadence source de 30 ips, soit le p90 observé.
+    """
+    config = load_config()
+    source_fps = 30.0
+    typical_occlusion_s = 2.5
+    p90_occlusion_s = 5.1
+    covered_s = config.tracker.track_buffer / source_fps
+    assert covered_s >= typical_occlusion_s
+    assert covered_s == pytest.approx(p90_occlusion_s, abs=0.2)
+    assert config.tracker.track_buffer > 0
+
+
+def test_tracker_persistence_and_reid_are_enabled_and_camera_is_fixed():
+    config = load_config()
+    assert config.tracker.with_reid is True
+    assert config.tracker.gmc_method == "none"
+    assert config.tracker.persist is True
+    assert "gmc_method" in config.to_dict()["tracker"]
+
+
+def test_unknown_gmc_method_is_rejected():
+    """Une GMC sur caméra fixe est une source d'instabilité : elle est refusée."""
+    raw = _raw()
+    raw["tracker"]["gmc_method"] = "magic_flow"
+    with pytest.raises(ConfigError) as error:
+        build_config(raw)
+    assert "gmc_method" in str(error.value)
 
 
 def test_diagnostics_section_is_exposed_and_configurable():
@@ -135,6 +191,69 @@ def test_diagnostics_section_is_exposed_and_configurable():
     assert updated.diagnostics.enabled is False
     assert updated.diagnostics.min_interval_seconds == pytest.approx(2.5)
     assert "diagnostics" in config.to_dict()
+
+
+def test_gallery_retention_defaults_to_the_occupancy_grace_period():
+    """Par défaut, la mémoire d'apparence n'est pas libérée avant la grâce."""
+    config = load_config()
+    assert config.reid.long_term.gallery_retention_seconds is None
+    from identity_manager import IdentityManager
+
+    manager = IdentityManager(
+        long_term=config.reid.long_term,
+        grace_period_seconds=config.timing.grace_period_seconds,
+    )
+    assert manager.purge_retention_seconds == pytest.approx(
+        config.timing.grace_period_seconds
+    )
+
+
+def test_gallery_retention_can_be_decoupled_explicitly():
+    config = override_config(
+        load_config(), {"reid": {"long_term": {"gallery_retention_seconds": 12.0}}}
+    )
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(12.0)
+    with pytest.raises(ConfigError):
+        override_config(
+            load_config(),
+            {"reid": {"long_term": {"gallery_retention_seconds": -1.0}}},
+        )
+
+
+def test_progressive_similarity_floor_cannot_exceed_the_nominal_threshold():
+    config = load_config()
+    assert config.reid.long_term.long_absence_similarity_floor is None
+    with pytest.raises(ConfigError) as error:
+        override_config(
+            load_config(),
+            {"reid": {"long_term": {"long_absence_similarity_floor": 0.95}}},
+        )
+    assert "long_absence_similarity_floor" in str(error.value)
+
+
+def test_appearance_continuity_guard_is_exposed_and_configurable():
+    """Le garde-fou de swap vit dans la configuration, jamais en dur."""
+    config = load_config()
+    updated = override_config(
+        config,
+        {
+            "reid": {
+                "appearance_continuity": {
+                    "enabled": False,
+                    "similarity_threshold": 0.7,
+                    "max_gap_frames": 0,
+                    "min_interval_seconds": 2.0,
+                }
+            }
+        },
+    )
+    assert updated.reid.appearance_continuity.enabled is False
+    assert updated.reid.appearance_continuity.similarity_threshold == pytest.approx(0.7)
+    assert updated.reid.appearance_continuity.max_gap_frames == 0
+    assert updated.reid.appearance_continuity.min_interval_seconds == pytest.approx(2.0)
+    # La sérialisation doit rester revalidable telle quelle.
+    restored = build_config(copy.deepcopy(updated.to_dict()), config_path=config.config_path)
+    assert restored.reid.appearance_continuity == updated.reid.appearance_continuity
 
 
 def test_occlusion_ambiguity_radius_is_relative_to_the_local_scale():
@@ -177,11 +296,21 @@ def test_frame_budget_refuses_unknown_fps():
         ("tracker", "track_high_thresh", 0.0),
         ("tracker", "track_low_thresh", 1.0),
         ("tracker", "new_track_thresh", 2.0),
+        ("tracker", "track_buffer", 0),
+        ("tracker", "match_thresh", 0.0),
+        ("tracker", "match_thresh", 1.5),
+        ("tracker", "proximity_thresh", -0.1),
+        ("tracker", "appearance_thresh", 2.0),
+        ("reid.long_term", "gallery_retention_seconds", -1.0),
+        ("reid.long_term", "long_absence_seconds", 0.0),
         ("diagnostics", "min_interval_seconds", 0.0),
         ("occupancy", "snapshot_interval_seconds", 0.0),
         ("output", "flush_every_n_events", 0),
         ("source", "no_detection_seconds", -1.0),
         ("stabilization", "bbox_locker_min_height_ratio", 1.5),
+        ("reid.appearance_continuity", "similarity_threshold", 1.5),
+        ("reid.appearance_continuity", "max_gap_frames", -1),
+        ("reid.appearance_continuity", "min_interval_seconds", -0.1),
     ],
 )
 def test_invalid_numeric_values_are_rejected(section, key, value):

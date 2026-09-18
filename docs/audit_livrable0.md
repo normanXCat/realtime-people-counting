@@ -117,7 +117,15 @@ Correct pour son rôle, sans dépendance. Devient `stabilization.use_anchor_stab
 
 ### 2.11 `src/bbox_height_locker.py` (73 l.) — **CONSERVER, retirer le log, passer derrière un flag**
 
-Logique OK ; deux défauts : `print()` non conditionnel dans `process_bbox` (pollution du flux headless, §5.1) et `purge_lost_tracks(active_ids, max_age=90)` dont le compteur d'âge est en frames (§0.2). Devient `stabilization.use_bbox_locker: false` par défaut.
+Logique OK ; deux défauts : `print()` non conditionnel dans `process_bbox` (pollution du flux headless, §5.1) et `purge_lost_tracks(active_ids, max_age=90)` dont le compteur d'âge est en frames (§0.2).
+
+**Correction d'intégration (audit suivant).** Le composant avait d'abord été placé derrière `stabilization.use_bbox_locker: false`, ce qui le rendait inopérant dans le run officiel. Trois défauts de câblage ont été corrigés :
+
+1. il est désormais **actif par défaut** (`config/pipeline.yaml`), avec son seuil lu depuis la configuration (`stabilization.bbox_locker_min_height_ratio`) ;
+2. l'historique de hauteur est indexé par **`person_id`** (stable) et non par l'identifiant technique de BoT-SORT : un `TECHNICAL_ID_CHANGED` après occultation ne réinitialise plus la hauteur de référence (clé de repli négative `-1 - track_id` tant que l'identité n'est pas résolue) ;
+3. la purge des profils suit les **personnes encore suivies** (`OccupancyManager.stabilization_keys()`), et non les identifiants présents dans la frame : une seule frame manquée ne détruit plus la correction.
+
+En complément, la détection de chute (`check_anchor_height_drop`) est alimentée par la hauteur **brute** mesurée : alimentée par la hauteur corrigée, elle était structurellement muette et l'événement `ANCHOR_UNRELIABLE` (`reason="height_drop"`) — que la FSM consomme en priorité — ne pouvait plus être émis. Preuves : `tests/test_bbox_locker_integration.py` (dont un parcours complet écrivant l'événement dans `events.jsonl`).
 
 ### 2.12 `bbox_height_locker.py` (racine) — **SUPPRIMER**
 
@@ -168,14 +176,14 @@ Ces paramètres révèlent des fonctionnalités **écrites puis abandonnées** (
 
 | Élément | Flag | Test qui prouve qu'il fonctionne si activé |
 |---|---|---|
-| `BBoxHeightLocker` | `stabilization.use_bbox_locker` | test unitaire niveau 1 (boîte brute/corrigée/reason/seuil) |
+| `BBoxHeightLocker` | `stabilization.use_bbox_locker` (**true** dans la référence) | test unitaire niveau 1 + `test_bbox_locker_integration.py` (clé `person_id`, purge, chute signalée, parcours complet) |
 | `AnchorStabilizer` | `stabilization.use_anchor_stabilizer` | test unitaire niveau 1 |
 | Extracteur d'apparence profond (ex-`reid.py`) | `reid.external_reid.enabled` | test unitaire niveau 1 (embedding normalisé, déterministe) |
 | ReID long terme lui-même | `reid.long_term.enabled` | niveaux 2 et 3 (baseline 1 vs variante 1) |
 
 ### 3.3 Conservé tel quel
 
-- `AnchorStabilizer` et `BBoxHeightLocker` : logique interne inchangée.
+- `AnchorStabilizer` et `BBoxHeightLocker` : logique interne inchangée (seul le câblage de ce dernier a été corrigé, cf. §2.11).
 - Persistance BoT-SORT (`persist=True`, `custom_botsort.yaml`) : correct, conforme §3.2.
 - Lecture YAML de la configuration du tracker : conservée, déplacée derrière le chargeur de configuration.
 - `compute_anchor` : conservée, déménagée dans `geometry.py` (suppression du paramètre `is_zenithal` mort).

@@ -83,12 +83,13 @@ variants:
     cli: ["--no-spatial-constraint"]
 
   variant_4:
-    description: "Variante 1 + stabilisation (verrouillage de hauteur et ancre)"
+    # Le verrouillage de hauteur est désormais dans la configuration de référence :
+    # cette variante n'isole donc plus que la stabilisation d'ancre.
+    description: "Variante 1 + stabilisation d'ancre (le verrouillage de hauteur est déjà dans la référence)"
     config:
       stabilization:
-        use_bbox_locker: true
         use_anchor_stabilizer: true
-    cli: ["--use-bbox-locker", "--use-anchor-stabilizer"]
+    cli: ["--use-anchor-stabilizer"]
 
   variant_5:
     description: "Variante 1 + ReID externe (comparaison d'extracteur d'apparence)"

@@ -1,9 +1,15 @@
-"""Composants expérimentaux (spec 7) : désactivés par défaut, prouvés si activés.
+"""Composants de stabilisation (spec 7) : ``BBoxHeightLocker`` actif, prouvé.
 
-Le ``BBoxHeightLocker`` et l'``AnchorStabilizer`` ne sont pas des chemins
-parallèles : ils sont neutralisés par ``stabilization.use_*: false`` et couverts
-ici, avec la traçabilité exigée par la spec 7 (boîte brute, boîte corrigée,
-raison, seuil).
+Le ``BBoxHeightLocker`` n'est pas un chemin parallèle : il est appliqué sur la
+boîte de chaque piste à chaque frame, **après** BoT-SORT et **avant** tout calcul
+de zone, avec la traçabilité exigée par la spec 7 (boîte brute, boîte corrigée,
+raison, seuil). Il est actif dans la configuration livrée
+(``stabilization.use_bbox_locker: true``) ; l'``AnchorStabilizer`` reste
+neutralisé par défaut et n'est couvert ici que pour être prouvé activable.
+
+L'indexation de l'historique et la survie du profil à une occultation / à un
+changement d'identifiant technique sont couvertes par
+``tests/test_bbox_locker_integration.py``.
 """
 
 from __future__ import annotations
@@ -65,11 +71,11 @@ def det(track_id, y, x=300.0, height=200.0):
 # ---------------------------------------------------------------------------
 # Désactivation par défaut
 # ---------------------------------------------------------------------------
-def test_default_configuration_disables_stabilization():
+def test_default_configuration_enables_the_bbox_locker():
     from config import load_config
 
     config = load_config()
-    assert config.stabilization.use_bbox_locker is False
+    assert config.stabilization.use_bbox_locker is True
     assert config.stabilization.use_anchor_stabilizer is False
 
 
@@ -114,8 +120,11 @@ def test_bbox_locker_changes_the_crossing_decision(test_config, sink, frame):
     sim = Sim(manager, frame).steps(5)
     sim.steps(4, [det(1, OUTSIDE_Y, height=200.0)])
     # Boîte tronquée dont l'ancre brute (280) est dans la zone morte :
-    # l'ancre corrigée (380) est franchement à l'intérieur.
-    sim.steps(2, [Detection(1, person_box(300.0, 280.0, height=100.0), 0.9)])
+    # l'ancre corrigée (380) est franchement à l'intérieur. Les deux premières
+    # frames de la chute suspendent la décision (surveillance de chute alimentée
+    # par la hauteur BRUTE) ; la troisième confirme la chute, réadapte
+    # l'historique, puis le franchissement est décidé sur l'ancre **corrigée**.
+    sim.steps(3, [Detection(1, person_box(300.0, 280.0, height=100.0), 0.9)])
 
     assert manager.total_in == 1
     event = sink.of_type("STABILIZATION")[-1]
@@ -124,16 +133,22 @@ def test_bbox_locker_changes_the_crossing_decision(test_config, sink, frame):
     assert manager.tracks[1].anchor[1] == pytest.approx(380.0)
 
 
-def test_stabilization_does_not_change_the_local_scale(test_config, sink, frame):
-    """L'échelle locale reste mesurée sur les boîtes **brutes**."""
+def test_local_scale_is_fed_with_the_stabilized_height(test_config, sink, frame):
+    """L'échelle locale (et donc la zone morte) suit la hauteur **stabilisée**.
+
+    La boîte brute reste journalisée et sert à détecter la chute ; c'est la
+    hauteur lissée par ``person_id`` qui fixe l'échelle locale, pour que la zone
+    morte ne suive pas le bruit de détection frame par frame.
+    """
     locker = BBoxHeightLocker(min_height_ratio=0.70)
     manager = build(test_config, sink, locker=locker)
     sim = Sim(manager, frame).steps(5)
-    sim.steps(6, [det(1, OUTSIDE_Y, height=200.0)])
-    sim.step([det(1, 280.0, height=100.0)])
-    # La hauteur brute (100) entre dans l'échelle locale : la médiane glisse.
+    sim.steps(10, [det(1, OUTSIDE_Y, height=200.0)])
+    sim.steps(2, [det(1, 280.0, height=100.0)])
+
     assert manager.scale.samples > 0
-    assert manager.scale.median_height is not None
+    assert manager.scale.median_height == pytest.approx(200.0, abs=1.0)
+    assert sink.count("STABILIZATION") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +182,13 @@ def test_stabilizer_caches_are_purged_with_the_frame(test_config, sink, frame):
     stabilizer = AnchorStabilizer()
     manager = build(test_config, sink, locker=locker, stabilizer=stabilizer)
     sim = Sim(manager, frame).steps(5)
+    # 1re frame de la piste : ``IdentityManager`` ne connaît pas encore
+    # l'identifiant technique, donc la clé de repli (négative) est utilisée ; la
+    # frame suivante bascule sur le ``person_id`` résolu.
     sim.step([det(1, OUTSIDE_Y)])
-    assert 1 in locker.tracks_profile
+    assert -2 in locker.tracks_profile  # clé de repli : ``-1 - track_id``
+    sim.step([det(1, OUTSIDE_Y)])
+    assert 1 in locker.tracks_profile  # clé stable : ``person_id``
     assert 1 in stabilizer.tracks_history
     locker.purge_lost_tracks(set())
     stabilizer.purge_lost_tracks(set())

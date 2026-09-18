@@ -120,7 +120,7 @@ Déclarées dans `config/protocol.yaml`, exécutables sans intervention manuelle
 | `variant_1` | configuration de référence : YOLO11n + BoT-SORT + ReID long terme |
 | `variant_2` | variante 1 avec `safety_margin = 0` (apport de la marge de sécurité) |
 | `variant_3` | variante 1 sans contrainte spatio-temporelle |
-| `variant_4` | variante 1 + stabilisation (verrouillage de hauteur, ancre) |
+| `variant_4` | variante 1 + stabilisation d'ancre (le verrouillage de hauteur est **dans** la référence) |
 | `variant_5` | variante 1 + ReID externe (comparaison d'extracteur d'apparence) |
 | `variant_6` | YOLO11s + ReID long terme (justification du choix du modèle) |
 

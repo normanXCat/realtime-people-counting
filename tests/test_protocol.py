@@ -71,8 +71,8 @@ def test_config_de_variante_est_revalidee(tmp_path: Path, variant_name: str):
     ).get("path", "models/yolo11n.pt")
     # La variante écrite doit différer de la base exactement par le facteur étudié.
     overrides = protocol["variants"][variant_name].get("config") or {}
-    if "stabilization" in overrides:
-        assert reloaded.stabilization.use_bbox_locker is True
+    if overrides.get("stabilization", {}).get("use_anchor_stabilizer") is True:
+        assert reloaded.stabilization.use_anchor_stabilizer is True
     if overrides.get("reid", {}).get("long_term", {}).get("enabled") is False:
         assert reloaded.reid.long_term.enabled is False
 
@@ -93,8 +93,11 @@ def test_baseline_1_desactive_le_reid_long_terme():
 
 
 def test_variante_4_active_la_stabilisation():
+    """Le verrouillage de hauteur est dans la référence : variant_4 isole l'ancre."""
     protocol = load_protocol(PROTOCOL_PATH)
-    variant = override_config(load_config(), protocol["variants"]["variant_4"]["config"])
+    base = load_config()
+    assert base.stabilization.use_bbox_locker is True
+    variant = override_config(base, protocol["variants"]["variant_4"]["config"])
     assert variant.stabilization.use_bbox_locker is True
     assert variant.stabilization.use_anchor_stabilizer is True
 

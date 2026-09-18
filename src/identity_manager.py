@@ -29,13 +29,14 @@ déclenchement « à l'occlusion imminente », l'assignation hongroise, l'état
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence
 
 import cv2
 import numpy as np
 
-from config import ExternalReidConfig, LongTermReidConfig
+from config import AppearanceContinuityConfig, ExternalReidConfig, LongTermReidConfig
 from events import EventSink
 
 
@@ -252,6 +253,7 @@ class IdentityManager:
         self,
         long_term: LongTermReidConfig | None = None,
         external_reid: ExternalReidConfig | None = None,
+        appearance_continuity: AppearanceContinuityConfig | None = None,
         grace_period_seconds: float = 5.0,
         appearance: AppearanceExtractor | None = None,
         event_sink: EventSink | None = None,
@@ -259,13 +261,30 @@ class IdentityManager:
     ) -> None:
         self.long_term = long_term or LongTermReidConfig()
         self.external_reid = external_reid or ExternalReidConfig()
+        #: Garde-fou « inversement d'identifiant » (swap interne au tracker) :
+        #: diagnostic seul, aucune réaffectation automatique.
+        self.appearance_continuity = (
+            appearance_continuity or AppearanceContinuityConfig()
+        )
         self.grace_period_seconds = float(grace_period_seconds)
         #: Durée de rétention d'une identité **purgée** dans la galerie, pour
         #: permettre une réassociation « récemment purgée » (spec 3.3), puis
         #: libération silencieuse de la mémoire : c'est une mémoire cache, pas
         #: une identité comptée — la purge du ``person_id`` a déjà été
         #: journalisée au moment de son passage à ``ABSENTE`` (spec 3.4).
-        self.purge_retention_seconds = self.grace_period_seconds
+        #:
+        #: Par défaut, elle est **alignée** sur la grâce d'occupation : la
+        #: mémoire d'apparence n'est jamais libérée avant que la personne n'ait
+        #: eu une chance réaliste de réapparaître (fenêtre totale = grâce +
+        #: rétention). ``reid.long_term.gallery_retention_seconds`` permet de
+        #: découpler explicitement les deux durées, au prix d'une justification
+        #: dans la configuration.
+        configured_retention = self.long_term.gallery_retention_seconds
+        self.purge_retention_seconds = (
+            self.grace_period_seconds
+            if configured_retention is None
+            else float(configured_retention)
+        )
         self.appearance: AppearanceExtractor = appearance or (
             DeepAppearanceExtractor(self.external_reid)
             if self.external_reid.enabled
@@ -283,6 +302,23 @@ class IdentityManager:
         #: Diagnostics (compteurs publiés dans le résumé de session).
         self.descriptor_rejections = 0
         self.technical_id_changes = 0
+        self.appearance_discontinuities = 0
+        #: Dernier descripteur observé **par identifiant technique** — et non par
+        #: ``person_id`` : c'est la seule vue qui permette de détecter un swap
+        #: interne au tracker, où la personne suit un identifiant technique qui
+        #: garde sa cible « logique » et change pourtant d'apparence.
+        #: ``(descripteur, frame_index, timestamp_s)``.
+        self._track_appearance: dict[int, tuple[np.ndarray, int, float]] = {}
+        #: Pistes actuellement signalées : évite une ligne par frame tant que la
+        #: discontinuité n'est pas refermée par un retour à la continuité.
+        self._discontinuity_active: set[int] = set()
+        self._last_continuity_emit_s: dict[int, float] = {}
+        #: Échantillon borné des similarités d'apparence **mesurées entre deux
+        #: frames consécutives d'une même piste continue**. C'est ce qui permet de
+        #: régler ``similarity_threshold`` sur des valeurs observées plutôt que
+        #: sur une intuition : un seuil calé sur le p1 des mesures ne déclenche
+        #: aucun faux diagnostic, un seuil plus haut en déclenche.
+        self.continuity_similarities: deque[float] = deque(maxlen=4000)
 
     # -- API de lecture ----------------------------------------------------
     @property
@@ -384,6 +420,7 @@ class IdentityManager:
         et qui rend le filtre spatio-temporel utilisable dès la frame suivante.
         """
         self._claimed = set()
+        self._prune_track_appearance(frame_index)
         for record in self.records.values():
             record.live = False
         assignments: list[Assignment] = []
@@ -405,6 +442,11 @@ class IdentityManager:
         feature = observation.feature
         if feature is None:
             feature = self.describe(frame, observation.bbox)
+
+        # Indépendant du chemin d'affectation : la continuité d'apparence d'une
+        # piste technique est vérifiée même quand elle est verrouillée sur une
+        # identité (cas même le plus fréquent d'un swap, où rien ne « disparaît »).
+        self._check_appearance_continuity(technical_id, feature, timestamp_s, frame_index)
 
         known_person = self.technical_to_person.get(technical_id)
         if known_person is not None and known_person in self.records:
@@ -480,7 +522,12 @@ class IdentityManager:
 
         best_similarity, best_person, allowed, distance = scored[0]
         runner_up = scored[1][0] if len(scored) > 1 else None
-        threshold = self.long_term.similarity_threshold
+        # Le seuil dépend de la durée d'absence du meilleur candidat : une longue
+        # occultation change légèrement l'apparence, un seuil rigoureusement
+        # constant rejetterait alors une réapparition légitime. Il n'est jamais
+        # assoupli sans plancher explicite (voir ``effective_similarity_threshold``).
+        absence_s = float(timestamp_s - self.records[best_person].last_seen_s)
+        threshold = self.effective_similarity_threshold(absence_s)
         margin = self.long_term.safety_margin
 
         if best_similarity < threshold:
@@ -510,7 +557,122 @@ class IdentityManager:
             reason="reid_match",
             frame_index=frame_index,
             frame=frame,
+            threshold_applied=threshold,
+            absence_s=absence_s,
         )
+
+    # -- Garde-fou de swap (continuité d'apparence par piste technique) ----
+    def _prune_track_appearance(self, frame_index: int) -> None:
+        """Oublie les descripteurs des pistes absentes au-delà de la tolérance.
+
+        Un écart supérieur à ``max_gap_frames`` signifie que la piste a été
+        perdue : la comparaison de continuité n'a plus de sens (le chemin de
+        réassociation normale s'applique) et le descripteur ne sert plus. La
+        mémoire reste donc bornée par la tolérance, pas par l'historique complet
+        de la session.
+        """
+        if not self.appearance_continuity.enabled:
+            return
+        horizon = int(frame_index) - int(self.appearance_continuity.max_gap_frames)
+        stale = [
+            technical_id
+            for technical_id, (_feature, seen_frame, _seen_s) in self._track_appearance.items()
+            if seen_frame < horizon
+        ]
+        for technical_id in stale:
+            del self._track_appearance[technical_id]
+            self._discontinuity_active.discard(technical_id)
+
+    def _check_appearance_continuity(
+        self,
+        technical_id: int,
+        feature: np.ndarray | None,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        """Journalise un saut d'apparence sur une piste **jamais perdue**.
+
+        Le swap est détecté ici uniquement si la piste technique était présente
+        à une frame suffisamment proche (``max_gap_frames``) : une piste absente
+        entre-temps a suivi le chemin de réassociation normal, où la marge de
+        sécurité et le seuil de galerie s'appliquent déjà — ce n'est plus un
+        swap interne au tracker.
+
+        Aucune identité n'est réaffectée : l'événement sert à mesurer l'ampleur
+        réelle du phénomène avant d'envisager une correction automatique plus
+        risquée.
+        """
+        config = self.appearance_continuity
+        if not config.enabled or feature is None:
+            return
+        current = np.asarray(feature, dtype=np.float32)
+        previous = self._track_appearance.get(int(technical_id))
+        self._track_appearance[int(technical_id)] = (current, int(frame_index), float(timestamp_s))
+        if previous is None:
+            return
+        previous_feature, previous_frame, previous_s = previous
+        gap = int(frame_index) - int(previous_frame)
+        if gap <= 0 or gap > int(config.max_gap_frames):
+            self._discontinuity_active.discard(int(technical_id))
+            return
+        if previous_feature.shape != current.shape:
+            return
+        similarity = self.cosine_similarity(previous_feature, current)
+        self.continuity_similarities.append(similarity)
+        if similarity >= float(config.similarity_threshold):
+            # Continuité rétablie : la piste peut être signalée à nouveau plus tard.
+            self._discontinuity_active.discard(int(technical_id))
+            return
+        if int(technical_id) in self._discontinuity_active:
+            return
+        last_emit = self._last_continuity_emit_s.get(int(technical_id))
+        if last_emit is not None and (
+            float(timestamp_s) - last_emit
+        ) < float(config.min_interval_seconds):
+            self._discontinuity_active.add(int(technical_id))
+            return
+        self._discontinuity_active.add(int(technical_id))
+        self._last_continuity_emit_s[int(technical_id)] = float(timestamp_s)
+        self.appearance_discontinuities += 1
+        self._emit(
+            "TRACK_ID_APPEARANCE_DISCONTINUITY",
+            timestamp_s,
+            frame_index,
+            technical_track_id=int(technical_id),
+            person_id_before=self.technical_to_person.get(int(technical_id)),
+            similarity_to_previous_descriptor=round(similarity, 4),
+            previous_descriptor_frame_index=int(previous_frame),
+            descriptor_age_s=round(float(timestamp_s) - previous_s, 4),
+            gap_frames=gap,
+            threshold=round(float(config.similarity_threshold), 4),
+            reason="possible_internal_swap",
+        )
+
+    def continuity_similarity_summary(self) -> dict[str, float | int | None]:
+        """Distribution des similarités de continuité observées (calibration).
+
+        Returns:
+            ``samples``, ``min``, ``p1``, ``p5``, ``median`` et
+            ``below_threshold`` (nombre d'échantillons sous le seuil configuré).
+            ``samples = 0`` signifie qu'aucune comparaison n'a été possible
+            (aucune piste n'a été vue deux frames de suite).
+        """
+        values = list(self.continuity_similarities)
+        if not values:
+            return {
+                "samples": 0, "min": None, "p1": None, "p5": None,
+                "median": None, "below_threshold": 0,
+            }
+        array = np.asarray(values, dtype=np.float64)
+        threshold = float(self.appearance_continuity.similarity_threshold)
+        return {
+            "samples": int(array.size),
+            "min": float(array.min()),
+            "p1": float(np.percentile(array, 1)),
+            "p5": float(np.percentile(array, 5)),
+            "median": float(np.median(array)),
+            "below_threshold": int((array < threshold).sum()),
+        }
 
     # -- Mise en relation --------------------------------------------------
     def _attach_existing(
@@ -527,6 +689,8 @@ class IdentityManager:
         reason: str,
         frame_index: int,
         frame: np.ndarray | None = None,
+        threshold_applied: float | None = None,
+        absence_s: float | None = None,
     ) -> Assignment:
         record = self.records[person_id]
         new_technical_id = int(observation.technical_track_id)
@@ -564,6 +728,12 @@ class IdentityManager:
                 distance=None if distance is None else round(distance, 2),
                 allowed_distance=None if allowed is None else round(allowed, 2),
                 winner_margin=None if runner_up is None else round(similarity - runner_up, 4),
+                # Seuil réellement appliqué et durée d'absence : sans eux, un
+                # assouplissement progressif serait invisible dans le journal.
+                threshold_applied=(
+                    None if threshold_applied is None else round(threshold_applied, 4)
+                ),
+                absence_s=None if absence_s is None else round(absence_s, 3),
             )
         return Assignment(
             technical_track_id=int(observation.technical_track_id),
@@ -707,6 +877,31 @@ class IdentityManager:
         )
 
     # -- Filtre spatio-temporel (spec 3.3 étape 1) -------------------------
+    def effective_similarity_threshold(self, absence_s: float) -> float:
+        """Seuil d'apparence applicable pour une durée d'absence donnée.
+
+        Par défaut (``long_absence_similarity_floor`` non déclaré), le seuil est
+        **constant** : ``similarity_threshold``. Aucun assouplissement n'est
+        subi par défaut, précisément parce que baisser un seuil de similarité
+        augmente le risque de réassocier deux personnes différentes.
+
+        Si un plancher est déclaré, le seuil descend **linéairement** de
+        ``similarity_threshold`` vers ce plancher au bout de
+        ``long_absence_seconds`` d'absence, et ne descend **jamais** plus bas.
+        Le plancher borne donc l'assouplissement, et la marge de sécurité
+        vis-à-vis du second candidat reste appliquée inchangée.
+        """
+        base = float(self.long_term.similarity_threshold)
+        floor = self.long_term.long_absence_similarity_floor
+        if floor is None:
+            return base
+        floor = float(floor)
+        if floor >= base:
+            return base
+        span = max(float(self.long_term.long_absence_seconds), 1e-9)
+        progress = min(1.0, max(0.0, float(absence_s)) / span)
+        return base + (floor - base) * progress
+
     def _plausible_candidates(
         self, observation: Observation, timestamp_s: float
     ) -> list[tuple[int, IdentityRecord, float, float]]:
