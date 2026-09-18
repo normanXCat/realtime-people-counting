@@ -89,6 +89,7 @@ class ModelConfig:
     nms_iou: float = 0.55
     image_size: int = 960
     classes: tuple[int, ...] = (0,)
+    device: str = "cpu"
 
 
 @dataclass(frozen=True)
@@ -462,6 +463,30 @@ class LoggingConfig:
     print_state_transitions: bool = False
 
 
+ALLOWED_HEAD_KEYPOINTS: tuple[str, ...] = (
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+)
+
+
+@dataclass(frozen=True)
+class HeadAssistConfig:
+    """Assistance par détection de la tête lors des occultations de pieds (additif)."""
+
+    enabled: bool = False
+    pose_model_path: str = "models/yolo11s-pose.pt"
+    pose_model_expected_sha256: str | None = None
+    min_keypoint_confidence: float = 0.5  # PROVISOIRE
+    keypoints_used: tuple[str, ...] = ("nose", "left_eye", "right_eye")
+    max_presence_extension_seconds: float = 10.0  # PROVISOIRE
+
+
+@dataclass(frozen=True)
+class PresenceConfig:
+    """Configuration du suivi de présence et de ses assistances."""
+
+    head_assist: HeadAssistConfig = field(default_factory=HeadAssistConfig)
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     """Configuration résolue et validée du pipeline."""
@@ -481,6 +506,7 @@ class PipelineConfig:
     logging: LoggingConfig
     diagnostics: DiagnosticsConfig
     anchor: AnchorConfig = field(default_factory=AnchorConfig)
+    presence: PresenceConfig = field(default_factory=PresenceConfig)
     config_path: Path = DEFAULT_CONFIG_PATH
 
     # -- Accès pratiques ---------------------------------------------------
@@ -499,6 +525,8 @@ class PipelineConfig:
         """
         data = asdict(self)
         data.pop("config_path", None)
+        if not self.presence.head_assist.enabled:
+            data.pop("presence", None)
         return data
 
 
@@ -521,7 +549,11 @@ def override_config(
             raise ConfigError(f"Surcharge invalide pour la section {section!r}")
         current = raw.get(section)
         if current is None:
-            raise ConfigError(f"Surcharge invalide : section inconnue {section!r}")
+            if section == "presence":
+                raw["presence"] = asdict(PresenceConfig())
+                current = raw["presence"]
+            else:
+                raise ConfigError(f"Surcharge invalide : section inconnue {section!r}")
         if not isinstance(current, Mapping):
             raise ConfigError(
                 f"Surcharge invalide : la section {section!r} n'est pas un mapping"
@@ -566,7 +598,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     known = {
         "schema_version", "source", "model", "tracker", "reid", "line", "geometry",
         "timing", "occupancy", "output", "stabilization", "display", "logging",
-        "diagnostics", "anchor",
+        "diagnostics", "anchor", "presence",
     }
     for key in raw:
         if key not in known:
@@ -617,6 +649,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             f"model.image_size doit être un multiple de 32 (reçu {image_size})"
         )
     classes = tuple(int(c) for c in model_raw.get("classes", (0,)) or ())
+    device = str(model_raw.get("device", "cpu"))
 
     geometry_raw = _section(raw, "geometry")
     dead_zone_ratio = _positive(
@@ -947,6 +980,37 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     if not window_name.strip():
         problems.append("display.window_name est vide : un nom de fenêtre est requis")
 
+    # -- Assistance tête (additif, désactivé par défaut) -------------------
+    presence_raw = _section(raw, "presence")
+    head_assist_raw = _section(presence_raw, "head_assist")
+    head_assist_enabled = bool(head_assist_raw.get("enabled", False))
+    ha_min_kp_conf = _bounded(
+        head_assist_raw.get("min_keypoint_confidence", 0.5),
+        "presence.head_assist.min_keypoint_confidence",
+        problems,
+        low=0.0,
+        high=1.0,
+    )
+    ha_max_ext_s = _positive(
+        head_assist_raw.get("max_presence_extension_seconds", 10.0),
+        "presence.head_assist.max_presence_extension_seconds",
+        problems,
+    )
+    ha_keypoints_used = tuple(
+        str(k) for k in (head_assist_raw.get("keypoints_used", ("nose", "left_eye", "right_eye")) or ())
+    )
+    if not ha_keypoints_used:
+        problems.append(
+            "presence.head_assist.keypoints_used ne peut pas être vide : au moins un "
+            "point-clé COCO doit être spécifié"
+        )
+    unknown_kps = [k for k in ha_keypoints_used if k not in ALLOWED_HEAD_KEYPOINTS]
+    if unknown_kps:
+        problems.append(
+            f"presence.head_assist.keypoints_used contient des noms de points-clés "
+            f"inconnus {unknown_kps} (autorisés : {ALLOWED_HEAD_KEYPOINTS})"
+        )
+
     if problems:
         raise ConfigError(
             "Configuration invalide :\n  - " + "\n  - ".join(problems)
@@ -983,6 +1047,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             nms_iou=float(nms_iou or 0.55),
             image_size=int(image_size or 960),
             classes=classes,
+            device=device,
         ),
         tracker=TrackerConfig(
             config_path=str(tracker_raw.get("config_path", "src/configs/custom_botsort.yaml")),
@@ -1117,6 +1182,23 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             height_history_window_frames=int(anchor_window or 30),
             max_height_drop_ratio=float(anchor_drop_ratio or 0.35),
             height_drop_confirm_frames=int(anchor_confirm_frames or 3),
+        ),
+        presence=PresenceConfig(
+            head_assist=HeadAssistConfig(
+                enabled=head_assist_enabled,
+                pose_model_path=str(head_assist_raw.get("pose_model_path", "models/yolo11s-pose.pt")),
+                pose_model_expected_sha256=(
+                    None if head_assist_raw.get("pose_model_expected_sha256") is None
+                    else str(head_assist_raw["pose_model_expected_sha256"])
+                ),
+                min_keypoint_confidence=float(
+                    ha_min_kp_conf if ha_min_kp_conf is not None else 0.5
+                ),
+                keypoints_used=ha_keypoints_used,
+                max_presence_extension_seconds=float(
+                    ha_max_ext_s if ha_max_ext_s is not None else 10.0
+                ),
+            ),
         ),
         config_path=config_path or DEFAULT_CONFIG_PATH,
     )

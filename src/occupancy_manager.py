@@ -87,6 +87,8 @@ class Detection:
     technical_track_id: int
     bbox: np.ndarray | tuple[float, float, float, float]
     confidence: float = 1.0
+    head_point: tuple[float, float] | None = None
+    head_confidence: float | None = None
 
 
 @dataclass
@@ -492,6 +494,8 @@ class OccupancyManager:
                 possible_multi_person=(
                     int(detection.technical_track_id) in multi_person_detected
                 ),
+                head_point=detection.head_point,
+                head_confidence=detection.head_confidence,
             )
             for detection in detections
         ]
@@ -794,7 +798,10 @@ class OccupancyManager:
             track.drop_previous_height = ref_h
             track.drop_current_height = float(raw_height)
             track.drop_ratio = drop_ratio
-            if track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames:
+            if (
+                not self.config.presence.head_assist.enabled
+                and track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames
+            ):
                 # La chute s'est stabilisée (personne assise et restée assise) :
                 # réadaptation de l'historique de hauteur et réactivation de la fiabilité.
                 track.height_history = [float(raw_height)]
@@ -815,9 +822,107 @@ class OccupancyManager:
             if len(track.height_history) > anchor_cfg.height_history_window_frames:
                 track.height_history.pop(0)
             reliable = bool(assignment.anchor_reliable)
+        if getattr(assignment, "feet_anchor_status", None) == "no_detection":
+            reliable = False
+            track.anchor_unreliable_reason = "no_detection"
+
+        track.current_head_point = getattr(assignment, "head_point", None)
+        track.current_head_confidence = getattr(assignment, "head_confidence", None)
 
         if reliable:
             track.last_reliable_anchor = effective_anchor
+            track.head_presence_first_s = None
+            track.head_presence_expired = False
+        elif self.config.presence.head_assist.enabled and track.state is TrackState.PRESENTE:
+            ha_cfg = self.config.presence.head_assist
+            head_pt = assignment.head_point
+            head_conf = assignment.head_confidence
+            head_ok = (
+                head_pt is not None
+                and head_conf is not None
+                and head_conf >= ha_cfg.min_keypoint_confidence
+            )
+            if head_ok:
+                if track.head_presence_first_s is None:
+                    track.head_presence_first_s = timestamp_s
+                elapsed = timestamp_s - track.head_presence_first_s
+                if elapsed <= ha_cfg.max_presence_extension_seconds:
+                    status = track.anchor_unreliable_reason or "edge"
+                    self._emit(
+                        "PRESENCE_MAINTAINED_BY_HEAD",
+                        timestamp_s,
+                        frame_index,
+                        person_id=track.person_id,
+                        reason="feet_anchor_unreliable_head_confident",
+                        head_confidence=round(float(head_conf), 4),
+                        feet_anchor_status=status,
+                        frame=frame_index,
+                        head_point=[round(float(head_pt[0]), 2), round(float(head_pt[1]), 2)],
+                    )
+                else:
+                    if not track.head_presence_expired:
+                        track.head_presence_expired = True
+                        self._emit(
+                            "PRESENCE_EXTENSION_EXPIRED",
+                            timestamp_s,
+                            frame_index,
+                            person_id=track.person_id,
+                            duration_s=round(elapsed, 3),
+                            max_extension_seconds=float(ha_cfg.max_presence_extension_seconds),
+                            frame=frame_index,
+                            reason="max_extension_exceeded",
+                        )
+                    self._mark_occluded(track, timestamp_s, frame_index)
+                    track.state = TrackState.OCCULTEE
+                    track.anchor = effective_anchor
+                    track.bbox = np.asarray(assignment.bbox, dtype=float)
+                    track.bbox_height = assignment.bbox_height
+                    track.technical_track_id = assignment.technical_track_id
+                    track.confidence = assignment.confidence
+                    track.last_seen_frame = frame_index
+                    track.last_seen_s = timestamp_s
+                    track.aliases.add(assignment.technical_track_id)
+                    self._emit_transition_if_changed(
+                        track,
+                        previous_state,
+                        Decision(
+                            rule="head_assist_extension_expired",
+                            state_to=TrackState.OCCULTEE,
+                            action=Action.MARQUE_OCCULTEE,
+                            state_changed=True,
+                        ),
+                        None,
+                        None,
+                        timestamp_s,
+                        frame_index,
+                    )
+                    return
+            else:
+                self._mark_occluded(track, timestamp_s, frame_index)
+                track.state = TrackState.OCCULTEE
+                track.anchor = effective_anchor
+                track.bbox = np.asarray(assignment.bbox, dtype=float)
+                track.bbox_height = assignment.bbox_height
+                track.technical_track_id = assignment.technical_track_id
+                track.confidence = assignment.confidence
+                track.last_seen_frame = frame_index
+                track.last_seen_s = timestamp_s
+                track.aliases.add(assignment.technical_track_id)
+                self._emit_transition_if_changed(
+                    track,
+                    previous_state,
+                    Decision(
+                        rule="head_assist_unreliable_head",
+                        state_to=TrackState.OCCULTEE,
+                        action=Action.MARQUE_OCCULTEE,
+                        state_changed=True,
+                    ),
+                    None,
+                    None,
+                    timestamp_s,
+                    frame_index,
+                )
+                return
 
         distance = self.line.distance(effective_anchor, width, height)
         side = side_of(distance, self.line.inside_side, self.line.on_line_policy)
@@ -908,6 +1013,60 @@ class OccupancyManager:
         if track.state is TrackState.ABSENTE:
             return
         previous_state = track.state
+        if (
+            self.config.presence.head_assist.enabled
+            and track.state is TrackState.PRESENTE
+            and track.current_head_point is not None
+            and track.current_head_confidence is not None
+            and track.current_head_confidence >= self.config.presence.head_assist.min_keypoint_confidence
+        ):
+            ha_cfg = self.config.presence.head_assist
+            if track.head_presence_first_s is None:
+                track.head_presence_first_s = timestamp_s
+            elapsed = timestamp_s - track.head_presence_first_s
+            if elapsed <= ha_cfg.max_presence_extension_seconds:
+                self._emit(
+                    "PRESENCE_MAINTAINED_BY_HEAD",
+                    timestamp_s,
+                    frame_index,
+                    person_id=track.person_id,
+                    reason="feet_anchor_unreliable_head_confident",
+                    head_confidence=round(float(track.current_head_confidence), 4),
+                    feet_anchor_status="no_detection",
+                    frame=frame_index,
+                    head_point=[round(float(track.current_head_point[0]), 2), round(float(track.current_head_point[1]), 2)],
+                )
+                return
+            else:
+                if not track.head_presence_expired:
+                    track.head_presence_expired = True
+                    self._emit(
+                        "PRESENCE_EXTENSION_EXPIRED",
+                        timestamp_s,
+                        frame_index,
+                        person_id=track.person_id,
+                        duration_s=round(elapsed, 3),
+                        max_extension_seconds=float(ha_cfg.max_presence_extension_seconds),
+                        frame=frame_index,
+                        reason="max_extension_exceeded",
+                    )
+                self._mark_occluded(track, timestamp_s, frame_index)
+                track.state = TrackState.OCCULTEE
+                self._emit_transition_if_changed(
+                    track,
+                    previous_state,
+                    Decision(
+                        rule="head_assist_extension_expired",
+                        state_to=TrackState.OCCULTEE,
+                        action=Action.MARQUE_OCCULTEE,
+                        state_changed=True,
+                    ),
+                    None,
+                    None,
+                    timestamp_s,
+                    frame_index,
+                )
+                return
         context = FsmContext(
             observed=False,
             zone=None,

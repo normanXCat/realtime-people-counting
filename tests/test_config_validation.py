@@ -471,3 +471,58 @@ def test_paths_are_resolved_against_repository_root():
     config = load_config()
     assert config.resolve_path(config.model.path).is_absolute()
     assert config.resolve_path("models/yolo11n.pt").name == "yolo11n.pt"
+
+
+def test_default_config_has_head_assist_disabled():
+    config = load_config()
+    assert hasattr(config, "presence")
+    assert config.presence.head_assist.enabled is False
+    assert config.presence.head_assist.pose_model_path == "models/yolo11s-pose.pt"
+    assert config.presence.head_assist.min_keypoint_confidence == pytest.approx(0.5)
+    assert config.presence.head_assist.max_presence_extension_seconds == pytest.approx(10.0)
+    assert config.model.device == "cpu"
+
+
+def test_head_assist_invalid_confidence_rejected():
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["min_keypoint_confidence"] = 1.5
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.min_keypoint_confidence" in str(exc_info.value)
+
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["min_keypoint_confidence"] = -0.1
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.min_keypoint_confidence" in str(exc_info.value)
+
+
+def test_head_assist_invalid_extension_duration_rejected():
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["max_presence_extension_seconds"] = 0.0
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.max_presence_extension_seconds" in str(exc_info.value)
+
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["max_presence_extension_seconds"] = -5.0
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.max_presence_extension_seconds" in str(exc_info.value)
+
+
+def test_head_assist_unknown_keypoints_rejected():
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["keypoints_used"] = ["nose", "wrist"]
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.keypoints_used" in str(exc_info.value)
+
+
+def test_head_assist_empty_keypoints_rejected():
+    raw = _raw()
+    raw.setdefault("presence", {}).setdefault("head_assist", {})["keypoints_used"] = []
+    with pytest.raises(ConfigError) as exc_info:
+        build_config(raw)
+    assert "presence.head_assist.keypoints_used" in str(exc_info.value)
+

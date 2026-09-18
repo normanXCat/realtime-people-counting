@@ -59,6 +59,12 @@ compromis dans `docs/rapport_final.md` § 4.6) :
   galerie d'apparence sur la grâce d'occupation (la mémoire n'est jamais libérée
   avant que la personne n'ait eu une chance de réapparaître). Une tolérance
   progressive du seuil, bornée, reste disponible mais désactivée par défaut.
+- **Assistance par détection de tête (additif, désactivé par défaut)** :
+  `presence.head_assist.enabled: false`. Conçu pour les amphithéâtres où les pieds
+  sont masqués par les tables : utilise `yolo11s-pose.pt` (17 points-clés COCO) pour
+  maintenir la présence d'une personne sans basculer à tort en `OCCULTEE`.
+  Le point tête ne participe **jamais** au calcul de franchissement de ligne ni aux
+  décisions IN/OUT.
 
 ## Installation
 

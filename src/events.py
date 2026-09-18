@@ -277,6 +277,15 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
         required=("person_id", "raw_bbox", "corrected_bbox", "reason", "threshold"),
         optional=("component", "frame_index_source"),
     ),
+    # -- Assistance tête (présence uniquement, jamais franchissement) -------
+    "PRESENCE_MAINTAINED_BY_HEAD": EventSpec(
+        required=("person_id", "reason", "head_confidence", "feet_anchor_status"),
+        optional=("frame", "head_point"),
+    ),
+    "PRESENCE_EXTENSION_EXPIRED": EventSpec(
+        required=("person_id", "duration_s", "max_extension_seconds"),
+        optional=("frame", "reason"),
+    ),
 }
 
 

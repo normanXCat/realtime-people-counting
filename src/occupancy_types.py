@@ -101,6 +101,11 @@ class PersonTrack:
     last_rule: str = ""
     last_zone: str = ""
     last_distance: float = 0.0
+    #: Assistance tête (présence uniquement)
+    head_presence_first_s: float | None = None
+    head_presence_expired: bool = False
+    current_head_point: tuple[float, float] | None = None
+    current_head_confidence: float | None = None
     #: Diagnostic : ensemble des track_id techniques ayant porté ce person_id.
     aliases: set[int] = field(default_factory=set)
 

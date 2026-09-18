@@ -192,6 +192,8 @@ class Observation:
     feature: np.ndarray | None = None
     anchor_reliable: bool = True
     possible_multi_person: bool = False
+    head_point: tuple[float, float] | None = None
+    head_confidence: float | None = None
 
 
 @dataclass
@@ -213,6 +215,8 @@ class Assignment:
     distance: float | None = None
     reason: str = ""
     anchor_reliable: bool = True
+    head_point: tuple[float, float] | None = None
+    head_confidence: float | None = None
 
 
 @dataclass
@@ -595,6 +599,8 @@ class IdentityManager:
                 provisional=record.provisional,
                 reason="technical_track_locked",
                 anchor_reliable=observation.anchor_reliable,
+                head_point=observation.head_point,
+                head_confidence=observation.head_confidence,
             )
 
         if not self.long_term.enabled:
@@ -868,6 +874,8 @@ class IdentityManager:
             distance=distance,
             reason=reason,
             anchor_reliable=observation.anchor_reliable,
+            head_point=observation.head_point,
+            head_confidence=observation.head_confidence,
         )
 
     def _resolve_ambiguous(
@@ -914,6 +922,8 @@ class IdentityManager:
                 distance=distance,
                 reason="reid_ambiguous_deferred",
                 anchor_reliable=observation.anchor_reliable,
+                head_point=observation.head_point,
+                head_confidence=observation.head_confidence,
             )
         assignment = self._create_new(
             observation, feature, timestamp_s, frame_index,
@@ -991,6 +1001,8 @@ class IdentityManager:
             candidates_evaluated=candidates_evaluated,
             reason=reason,
             anchor_reliable=observation.anchor_reliable,
+            head_point=observation.head_point,
+            head_confidence=observation.head_confidence,
         )
 
     # -- Filtre spatio-temporel (spec 3.3 étape 1) -------------------------

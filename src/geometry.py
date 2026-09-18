@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Iterable, Sequence
 
+import numpy as np
+
 Point = tuple[float, float]
 BBox = Sequence[float]
 
@@ -500,4 +502,56 @@ def check_box_width_growth(
                     is_abnormal = False
 
     return is_abnormal, float(current_ratio), float(max_growth_ratio)
+
+
+# ---------------------------------------------------------------------------
+# Assistance tête : extraction des points-clés COCO (additif)
+# ---------------------------------------------------------------------------
+#: Index COCO des cinq points-clés de la tête exploitables pour l'assistance
+#: de présence. Les 12 points restants (épaules, coudes, poignets, hanches,
+#: genoux, chevilles) ne sont pas utilisés ici.
+COCO_HEAD_KEYPOINTS: dict[str, int] = {
+    "nose": 0,
+    "left_eye": 1,
+    "right_eye": 2,
+    "left_ear": 3,
+    "right_ear": 4,
+}
+
+
+def extract_head_point(
+    keypoints_xy: np.ndarray,
+    keypoints_conf: np.ndarray,
+    keypoints_used: tuple[str, ...],
+    min_confidence: float,
+) -> tuple[tuple[float, float] | None, float | None]:
+    """Renvoie le point moyen des points-clés fiables et la confiance minimale.
+
+    Args:
+        keypoints_xy: coordonnées ``(17, 2)`` des points-clés COCO.
+        keypoints_conf: confiances ``(17,)`` associées.
+        keypoints_used: noms des points-clés à considérer (ex. ``("nose", "left_eye", "right_eye")``).
+        min_confidence: seuil en dessous duquel un point-clé est ignoré.
+
+    Returns:
+        ``((mean_x, mean_y), min_conf)`` si au moins un point-clé est fiable,
+        ``(None, None)`` sinon.
+    """
+    valid_xs: list[float] = []
+    valid_ys: list[float] = []
+    confs: list[float] = []
+    for name in keypoints_used:
+        idx = COCO_HEAD_KEYPOINTS.get(name)
+        if idx is None:
+            continue
+        conf = float(keypoints_conf[idx])
+        if conf >= min_confidence:
+            valid_xs.append(float(keypoints_xy[idx, 0]))
+            valid_ys.append(float(keypoints_xy[idx, 1]))
+            confs.append(conf)
+    if not confs:
+        return None, None
+    mean_x = sum(valid_xs) / len(valid_xs)
+    mean_y = sum(valid_ys) / len(valid_ys)
+    return (mean_x, mean_y), min(confs)
 

@@ -33,6 +33,7 @@ model:
   nms_iou: 0.55             # PROVISOIRE — à calibrer
   image_size: 960           # PROVISOIRE — à calibrer
   classes: [0]              # classe COCO « person »
+  device: cpu               # « cpu » (machine de référence) | « auto » | « cuda:0 »
 
 tracker:
   config_path: src/configs/custom_botsort.yaml
@@ -234,3 +235,16 @@ diagnostics:
   # montant est toujours écrit, puis au plus un événement par intervalle.
   enabled: true
   min_interval_seconds: 1.0
+
+# -- Assistance par détection de tête (additif, désactivé par défaut) ------
+# Utilise yolo11s-pose.pt (17 points-clés COCO) pour maintenir la présence
+# d'une personne dont les pieds sont occultés (tables, chaises). Le point
+# tête ne participe JAMAIS au calcul de franchissement de ligne.
+presence:
+  head_assist:
+    enabled: false                       # additif, désactivé par défaut
+    pose_model_path: models/yolo11s-pose.pt
+    pose_model_expected_sha256: null      # à renseigner une fois le poids téléchargé
+    min_keypoint_confidence: 0.5          # PROVISOIRE — à calibrer
+    keypoints_used: [nose, left_eye, right_eye]
+    max_presence_extension_seconds: 10.0  # PROVISOIRE — borne de sécurité

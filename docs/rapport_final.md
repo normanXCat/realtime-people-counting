@@ -16,6 +16,7 @@ faire. Il complète `docs/audit_livrable0.md` (état des lieux initial et décis
 | 6 | Suite de tests niveaux 1–3, une commande, couverture | fait | `tests/`, `pytest.ini` |
 | 7 | Rapport d'évaluation (protocole section 9) | outillé, non mesuré | `config/protocol.yaml`, `scripts/run_protocol.py`, `evaluate_system.py`, `docs/protocole_evaluation.md` |
 | 8 | Politique de confidentialité | fait | `docs/politique_confidentialite.md` |
+| 9 | Assistance tête en cas d'occlusion des pieds (additif) | fait et testé | `src/geometry.py`, `src/occupancy_manager.py`, `src/config.py`, `docs/handoff_head_assist.md` |
 
 Niveau 4 (vidéos réelles annotées) : **outillé mais non exécuté**, faute de corpus
 annoté et d'ensemble de test tenu à l'écart. Les métriques de la section 9.3 ne
@@ -273,6 +274,25 @@ Tests ajoutés ou étendus : `tests/test_dead_zone_stability.py`,
 `tests/test_config_validation.py` (synchronisation BoT-SORT, validation des
 nouveaux paramètres), `tests/test_bbox_locker_integration.py` (câblage du
 verrouillage depuis la configuration), `tests/test_stabilization_flags.py`.
+
+### 4.7 Assistance par détection de tête en cas d'occlusion des pieds (additif)
+
+Dans les scènes d'amphithéâtre et de salle de cours, les pieds des personnes sont fréquemment occultés par les tables et les chaises alors que le haut du corps et la tête restent parfaitement visibles.
+
+1. **Architecture et séparation stricte des responsabilités** :
+   - Un modèle d'estimation de pose (`yolo11s-pose.pt`, 17 points-clés COCO) remplace le modèle de détection standard lorsque `presence.head_assist.enabled: true`.
+   - Seuls 5 points-clés de la tête sont considérés : `nose`, `left_eye`, `right_eye`, `left_ear`, `right_ear` (indices COCO 0 à 4).
+   - **Garde-fou fondamental** : le point tête ne participe **jamais** au calcul de distance signée, à la détection de franchissement de ligne (`line.crossing`) ni aux décisions `IN` / `OUT` / `NEW`. Le comptage des flux reste à 100 % adossé à l'ancre pieds.
+   - Le point tête intervient uniquement comme signal de maintien de présence pour empêcher un basculement prématuré vers l'état `OCCULTEE` lorsque les pieds sont occultés.
+
+2. **Garde-fou temporel et traçabilité** :
+   - Paramètre `max_presence_extension_seconds` (défaut 10,0 s) : si l'ancre pieds reste indisponible au-delà de cette durée continue, l'extension expire, l'événement `PRESENCE_EXTENSION_EXPIRED` est émis, et la piste bascule vers `OCCULTEE` (fenêtre de grâce normale puis purge).
+   - Événement `PRESENCE_MAINTAINED_BY_HEAD` émis à chaque maintien avec la confiance tête et le statut d'indisponibilité des pieds (`edge`, `height_drop`, `no_detection`).
+
+3. **Garantie de non-régression** :
+   - Le flag `presence.head_assist.enabled` est `false` par défaut.
+   - Tant qu'il est désactivé, aucun calcul de pose ni extraction de points-clés n'a lieu, et les 564 tests initiaux passent sans modification.
+   - 21 nouveaux tests dédiés ont été ajoutés (`tests/test_extract_head_point.py`, `tests/test_head_assist_disabled_by_default.py`, `tests/test_head_assist_presence.py`, et compléments dans `tests/test_config_validation.py`), portant la suite à 585 tests réussis.
 
 ## 5. Limites et reste à faire
 

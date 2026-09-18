@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import cv2
+import numpy as np
 import yaml
 
 from anchor_stabilizer import AnchorStabilizer
@@ -75,7 +76,7 @@ from config import (
     override_config,
 )
 from events import EventLogger
-from geometry import LineError, VirtualLine
+from geometry import LineError, VirtualLine, extract_head_point
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
 from track_diagnostics import (
@@ -224,7 +225,7 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_weights(path: Path, expected_sha256: str) -> str:
+def verify_weights(path: Path, expected_sha256: str | None = None) -> str:
     """Vérifie l'existence et le hash des poids (spec 0.5, règle de déterminisme)."""
     if not path.exists():
         raise FileNotFoundError(
@@ -470,7 +471,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     start_s = time.perf_counter()
 
     try:
-        model_sha256 = verify_weights(model_path, config.model.expected_sha256)
+        if config.presence.head_assist.enabled:
+            model_path = config.resolve_path(config.presence.head_assist.pose_model_path)
+            model_sha256 = verify_weights(
+                model_path, config.presence.head_assist.pose_model_expected_sha256
+            )
+        else:
+            model_path = config.resolve_path(config.model.path)
+            model_sha256 = verify_weights(model_path, config.model.expected_sha256)
     except (FileNotFoundError, ConfigError) as error:
         print(f"[MODEL] {error}", file=sys.stderr)
         logger.close()
@@ -616,6 +624,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             conf=config.model.confidence,
             iou=config.model.nms_iou,
             imgsz=config.model.image_size,
+            device=config.model.device,
             show=False,
             stream=True,
             verbose=False,
@@ -695,12 +704,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 confidences = (
                     boxes.conf.cpu().numpy() if boxes.conf is not None else [1.0] * len(ids)
                 )
-                for box, track_id, confidence in zip(xyxy, ids, confidences):
+                kpts_xy = None
+                kpts_conf = None
+                if config.presence.head_assist.enabled:
+                    keypoints = getattr(result, "keypoints", None)
+                    if keypoints is not None:
+                        if hasattr(keypoints, "xy") and keypoints.xy is not None:
+                            kpts_xy = keypoints.xy.cpu().numpy()
+                        if hasattr(keypoints, "conf") and keypoints.conf is not None:
+                            kpts_conf = keypoints.conf.cpu().numpy()
+
+                for i, (box, track_id, confidence) in enumerate(zip(xyxy, ids, confidences)):
+                    head_pt = None
+                    head_conf = None
+                    if config.presence.head_assist.enabled and kpts_xy is not None and i < len(kpts_xy):
+                        ki_xy = kpts_xy[i]
+                        ki_conf = (
+                            kpts_conf[i]
+                            if (kpts_conf is not None and i < len(kpts_conf))
+                            else np.ones(17, dtype=float)
+                        )
+                        head_pt, head_conf = extract_head_point(
+                            ki_xy,
+                            ki_conf,
+                            config.presence.head_assist.keypoints_used,
+                            config.presence.head_assist.min_keypoint_confidence,
+                        )
                     detections.append(
                         Detection(
                             technical_track_id=int(track_id),
                             bbox=box,
                             confidence=float(confidence),
+                            head_point=head_pt,
+                            head_confidence=head_conf,
                         )
                     )
                     observed_confidences.append(float(confidence))
