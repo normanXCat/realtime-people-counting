@@ -18,6 +18,7 @@ from geometry import (
     Zone,
     anchor_reliability,
     bbox_height,
+    check_box_width_growth,
     compute_anchor,
     crossing_direction,
     edge_margin_px,
@@ -247,3 +248,50 @@ def test_oblique_line_zones():
     assert line.side((400.0, 100.0), W, H) is Side.EXTERIEURE
     # À 10 px de la diagonale (distance -192 -> point proche de la ligne en y).
     assert line.zone((400.0, 305.0), W, H, 40.0) is Zone.MORTE
+
+
+# ---------------------------------------------------------------------------
+# Détection de boîte multi-personnes (croissance anormale de largeur)
+# ---------------------------------------------------------------------------
+def test_check_box_width_growth_largeur_stable():
+    history = [50.0, 52.0, 48.0, 51.0, 50.0]
+    is_abnormal, ratio, thresh = check_box_width_growth(51.0, history, max_growth_ratio=1.6)
+    assert is_abnormal is False
+    assert ratio == pytest.approx(51.0 / 50.0)
+    assert thresh == pytest.approx(1.6)
+
+
+def test_check_box_width_growth_double_brutalement():
+    history = [50.0, 50.0, 50.0]
+    is_abnormal, ratio, thresh = check_box_width_growth(
+        100.0,
+        history,
+        max_growth_ratio=1.6,
+        current_height=200.0,
+        height_history=[200.0, 200.0, 200.0],
+    )
+    assert is_abnormal is True
+    assert ratio == pytest.approx(2.0)
+    assert thresh == pytest.approx(1.6)
+
+
+def test_check_box_width_growth_croissance_progressive():
+    history_w = [50.0, 55.0, 60.0, 65.0]
+    history_h = [150.0, 165.0, 180.0, 195.0]
+    is_abnormal, ratio, thresh = check_box_width_growth(
+        70.0,
+        history_w,
+        max_growth_ratio=1.6,
+        current_height=210.0,
+        height_history=history_h,
+    )
+    assert is_abnormal is False
+
+    is_abnormal, ratio, thresh = check_box_width_growth(
+        100.0,
+        [50.0],
+        max_growth_ratio=1.6,
+        current_height=380.0,
+        height_history=[200.0],
+    )
+    assert is_abnormal is False

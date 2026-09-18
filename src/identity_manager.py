@@ -36,7 +36,12 @@ from typing import Any, Protocol, Sequence
 import cv2
 import numpy as np
 
-from config import AppearanceContinuityConfig, ExternalReidConfig, LongTermReidConfig
+from config import (
+    AppearanceContinuityConfig,
+    ExternalReidConfig,
+    LongTermReidConfig,
+    SwapCorrectionConfig,
+)
 from events import EventSink
 
 
@@ -186,6 +191,7 @@ class Observation:
     bbox_height: float
     feature: np.ndarray | None = None
     anchor_reliable: bool = True
+    possible_multi_person: bool = False
 
 
 @dataclass
@@ -254,6 +260,7 @@ class IdentityManager:
         long_term: LongTermReidConfig | None = None,
         external_reid: ExternalReidConfig | None = None,
         appearance_continuity: AppearanceContinuityConfig | None = None,
+        swap_correction: SwapCorrectionConfig | None = None,
         grace_period_seconds: float = 5.0,
         appearance: AppearanceExtractor | None = None,
         event_sink: EventSink | None = None,
@@ -266,6 +273,8 @@ class IdentityManager:
         self.appearance_continuity = (
             appearance_continuity or AppearanceContinuityConfig()
         )
+        #: Correction active des inversions d'identité (swap)
+        self.swap_correction = swap_correction or SwapCorrectionConfig()
         self.grace_period_seconds = float(grace_period_seconds)
         #: Durée de rétention d'une identité **purgée** dans la galerie, pour
         #: permettre une réassociation « récemment purgée » (spec 3.3), puis
@@ -303,6 +312,7 @@ class IdentityManager:
         self.descriptor_rejections = 0
         self.technical_id_changes = 0
         self.appearance_discontinuities = 0
+        self.swap_corrections_applied = 0
         #: Dernier descripteur observé **par identifiant technique** — et non par
         #: ``person_id`` : c'est la seule vue qui permette de détecter un swap
         #: interne au tracker, où la personne suit un identifiant technique qui
@@ -394,6 +404,8 @@ class IdentityManager:
             or box_width < limits.gallery_min_crop_width_px
         ):
             return "tiny_crop", float(limits.gallery_min_crop_height_px), box_height
+        if getattr(observation, "possible_multi_person", False):
+            return "possible_multi_person_crop", None, None
         if not observation.anchor_reliable:
             return "edge_truncated", None, None
         if feature is None:
@@ -403,6 +415,106 @@ class IdentityManager:
             if measured is not None and measured < limits.gallery_min_sharpness:
                 return "blurred_or_unreliable", float(limits.gallery_min_sharpness), measured
         return None, None, None
+
+    def _extract_valid_feature(
+        self,
+        observation: Observation,
+        frame: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Extrait le descripteur d'une observation s'il respecte les critères de qualité."""
+        feature = observation.feature
+        if feature is None and frame is not None:
+            feature = self.describe(frame, observation.bbox)
+            if feature is not None:
+                observation.feature = feature
+        if feature is None:
+            return None
+        rejection, _, _ = self._gallery_rejection(observation, feature, frame)
+        if rejection is not None:
+            return None
+        return feature
+
+    def _correct_cross_swaps(
+        self,
+        observations: Sequence[Observation],
+        frame_index: int,
+        timestamp_s: float,
+        frame: np.ndarray | None = None,
+    ) -> None:
+        """Corrige activement les inversions d'identité (swap) entre paires de pistes connues.
+
+        Pour chaque paire de pistes techniques présentes sur la frame courante et déjà
+        mappées à deux identités distinctes et vivantes/non purgées, compare la similarité
+        directe (A↔A, B↔B) contre la similarité croisée (A↔B, B↔A). Si le croisement
+        l'emporte d'au moins la marge configurée, le mapping technical_to_person est échangé
+        et un événement IDENTITY_SWAP_CORRECTED est émis.
+        """
+        if not self.swap_correction.enabled or len(observations) < 2:
+            return
+
+        corrected_tracks: set[int] = set()
+
+        for i in range(len(observations)):
+            obs_a = observations[i]
+            tech_a = int(obs_a.technical_track_id)
+            if tech_a in corrected_tracks:
+                continue
+
+            person_a = self.technical_to_person.get(tech_a)
+            if person_a is None or person_a not in self.records:
+                continue
+            rec_a = self.records[person_a]
+            if rec_a.purged_at_s is not None or rec_a.feature is None:
+                continue
+
+            for j in range(i + 1, len(observations)):
+                obs_b = observations[j]
+                tech_b = int(obs_b.technical_track_id)
+                if tech_b in corrected_tracks:
+                    continue
+
+                person_b = self.technical_to_person.get(tech_b)
+                if person_b is None or person_b not in self.records or person_b == person_a:
+                    continue
+                rec_b = self.records[person_b]
+                if rec_b.purged_at_s is not None or rec_b.feature is None:
+                    continue
+
+                feat_a = self._extract_valid_feature(obs_a, frame)
+                feat_b = self._extract_valid_feature(obs_b, frame)
+                if feat_a is None or feat_b is None:
+                    continue
+
+                ref_a = rec_a.feature
+                ref_b = rec_b.feature
+                direct = self.cosine_similarity(feat_a, ref_a) + self.cosine_similarity(feat_b, ref_b)
+                crossed = self.cosine_similarity(feat_a, ref_b) + self.cosine_similarity(feat_b, ref_a)
+
+                if crossed > (direct + self.swap_correction.margin):
+                    # Inversion confirmée avec marge nette
+                    self.technical_to_person[tech_a] = person_b
+                    self.technical_to_person[tech_b] = person_a
+                    corrected_tracks.add(tech_a)
+                    corrected_tracks.add(tech_b)
+                    self.swap_corrections_applied += 1
+
+                    self._emit(
+                        "IDENTITY_SWAP_CORRECTED",
+                        timestamp_s,
+                        frame_index,
+                        frame=int(frame_index),
+                        technical_track_id_a=tech_a,
+                        technical_track_id_b=tech_b,
+                        person_id_a_before=person_a,
+                        person_id_a_after=person_b,
+                        person_id_b_before=person_b,
+                        person_id_b_after=person_a,
+                        similarity_direct=round(float(direct), 4),
+                        similarity_crossed=round(float(crossed), 4),
+                        margin_applied=round(float(self.swap_correction.margin), 4),
+                        reason="cross_appearance_correction",
+                    )
+                    break
 
     # -- Affectation -------------------------------------------------------
     def assign(
@@ -421,6 +533,11 @@ class IdentityManager:
         """
         self._claimed = set()
         self._prune_track_appearance(frame_index)
+
+        # Correction active des inversions d'identité (swap)
+        if self.swap_correction.enabled:
+            self._correct_cross_swaps(observations, frame_index, timestamp_s, frame=frame)
+
         for record in self.records.values():
             record.live = False
         assignments: list[Assignment] = []

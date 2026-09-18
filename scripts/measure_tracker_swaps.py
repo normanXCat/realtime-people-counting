@@ -120,6 +120,17 @@ def measure(args: argparse.Namespace) -> dict:
                 }
             },
         )
+    if args.swap_correction is not None:
+        config = override_config(
+            config,
+            {
+                "reid": {
+                    "swap_correction": {
+                        "enabled": bool(args.swap_correction)
+                    }
+                }
+            },
+        )
     tracker_path = build_tracker_variant(
         config,
         track_buffer=config.tracker.track_buffer,
@@ -131,6 +142,7 @@ def measure(args: argparse.Namespace) -> dict:
         long_term=config.reid.long_term,
         external_reid=config.reid.external_reid,
         appearance_continuity=config.reid.appearance_continuity,
+        swap_correction=config.reid.swap_correction,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
     model = YOLO(str(config.resolve_path(config.model.path)))
@@ -200,11 +212,17 @@ def measure(args: argparse.Namespace) -> dict:
             # Distribution mesurée : c'est elle qui justifie le seuil retenu.
             "similarity_distribution": identities.continuity_similarity_summary(),
         },
+        "swap_correction": {
+            "enabled": bool(config.reid.swap_correction.enabled),
+            "margin": float(config.reid.swap_correction.margin),
+            "swap_corrections_applied": int(identities.swap_corrections_applied),
+        },
         "identity": {
             "technical_ids": len({*identities.technical_to_person}),
             "persons_created": int(identities._next_person_id - 1),
             "technical_id_changes": int(identities.technical_id_changes),
             "descriptor_rejections": int(identities.descriptor_rejections),
+            "swap_corrections_applied": int(identities.swap_corrections_applied),
         },
     }
 
@@ -221,6 +239,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--continuity-threshold", type=float, default=None,
         help="Seuil de similarité du garde-fou de swap (permet de balayer les seuils)",
+    )
+    parser.add_argument(
+        "--swap-correction",
+        dest="swap_correction",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Active ou désactive la correction active de swap (défaut : valeur de configuration)",
     )
     parser.add_argument("--out", default=None, help="JSON Lines de sortie (défaut : results/swap_measurements.jsonl)")
     args = parser.parse_args(argv)

@@ -208,6 +208,39 @@ def diagnose(args: argparse.Namespace) -> dict:
         assignments = identities.assign(observations, frame, timestamp_s, frame_index)
         observed_person_ids = {a.person_id for a in assignments if a.person_id}
 
+        # Un box candidat ne prouve une détection ignorée que si elle n'appartient
+        # pas à une autre personne actuellement suivie : dans une scène dense, la
+        # boîte d'un voisin très proche déborde naturellement sur la zone dilatée
+        # (et son ancre peut y pénétrer) sans rien dire de la personne absente.
+        # Ces boxes-là sont écartées du verdict, sinon tout voisin proches est
+        # interprété comme une détection perdue de la personne occultée.
+        boxes_of_other_tracked_people: list[np.ndarray] = []
+        for assignment in assignments:
+            if assignment.person_id and assignment.person_id not in episodes:
+                boxes_of_other_tracked_people.append(
+                    np.asarray(assignment.bbox, dtype=float)
+                )
+
+        def belongs_to_other_tracked_person(
+            candidate: np.ndarray, track_id: int | None, person_id: int
+        ) -> bool:
+            if any(
+                iou(candidate, other) > args.neighbor_iou
+                for other in boxes_of_other_tracked_people
+            ):
+                return True
+            # Une boîte non assignée à cette frame compte comme « trafic » si
+            # son identifiant technique est celui d'une personne suivie dont la
+            # boîte courante couvre la même zone (association de la frame
+            # précédente encore valable), ou si le gestionnaire d'identités
+            # rattache déjà cet identifiant à une autre personne.
+            if track_id is None:
+                return False
+            owner = identities.person_of(track_id)
+            if owner is not None and owner != person_id and owner in identities.records:
+                return True
+            return False
+
         # Une boîte (n'importe quel identifiant, même absent) dans la zone d'une
         # personne actuellement absente est la preuve recherchée.
         for person_id, episode in episodes.items():
@@ -215,6 +248,8 @@ def diagnose(args: argparse.Namespace) -> dict:
                 continue
             for box, track_id in zip(raw_boxes, raw_ids):
                 if not overlaps_area(box, episode.last_bbox, args.margin_ratio):
+                    continue
+                if belongs_to_other_tracked_person(box, track_id, person_id):
                     continue
                 episode.box_frames.append(frame_index)
                 if track_id is not None:
@@ -277,6 +312,7 @@ def diagnose(args: argparse.Namespace) -> dict:
         "frames_processed": frame_index,
         "min_absence_frames": int(args.min_absence_frames),
         "overlap_margin_ratio": float(args.margin_ratio),
+        "neighbor_iou_exclusion": float(args.neighbor_iou),
         "detector": {
             "model": str(config.model.path),
             "confidence": float(config.model.confidence),
@@ -314,6 +350,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--margin-ratio", type=float, default=0.25,
         help="Dilatation de la boîte de référence (fraction de sa hauteur)",
+    )
+    parser.add_argument(
+        "--neighbor-iou", type=float, default=0.4,
+        help=(
+            "IoU au-delà de laquelle une box candidate est attribuée à une autre "
+            "personne suivie (voisinage), donc écartée du verdict"
+        ),
     )
     parser.add_argument("--out", default=None, help="Rapport JSON (défaut : results/diagnostic_occlusion.json)")
     args = parser.parse_args(argv)

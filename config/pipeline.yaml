@@ -133,6 +133,14 @@ reid:
     # intervalle.
     min_interval_seconds: 1.0
 
+  # -- Correction active des inversions d'identité (swap) ------------------
+  # Réintroduit le comportement [RE-ID-LOCK] de l'ancien IDManager : compare
+  # l'apparence directe vs croisée entre paires de pistes connues et corrige
+  # le mapping si le croisement dépasse la marge.
+  swap_correction:
+    enabled: true              # PROVISOIRE — comparer avec/sans sur les vidéos de test
+    margin: 0.12               # même valeur que l'ancien [RE-ID-LOCK], à recalibrer
+
 # Ligne virtuelle : les deux points ne sont PAS configurables. Ils sont
 # obligatoirement définis par l'opérateur au démarrage (première image affichée,
 # deux clics, « C » pour confirmer, « G » pour recommencer, « Échap » pour
@@ -158,6 +166,9 @@ geometry:
   max_aspect_ratio_wh: 2.5       # ratio W/H maximum plausible (personne assise tolérée)
   min_box_height_px: 10.0        # hauteur minimale de bounding box
   min_box_width_px: 10.0         # largeur minimale de bounding box
+  multi_person_box:
+    enabled: true
+    max_growth_ratio: 1.6      # PROVISOIRE — à calibrer sur des cas confirmés de fusion
 
 anchor:
   height_history_window_frames: 30      # fenêtre pour estimer la hauteur "normale" de la piste

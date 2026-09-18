@@ -46,12 +46,15 @@ class BBoxHeightLocker:
         """
         x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
         current_h = y2 - y1
+        current_w = max(0.0, x2 - x1)
 
-        # 1. Enregistrement initial de la hauteur de la personne
+        # 1. Enregistrement initial de la hauteur et de la largeur de la personne
         if track_id not in self.tracks_profile:
             self.tracks_profile[track_id] = {
                 "h_stable": current_h,
                 "history_h": [current_h],
+                "w_stable": current_w,
+                "history_w": [current_w],
             }
             if isinstance(bbox, np.ndarray):
                 return np.array([x1, y1, x2, y2], dtype=bbox.dtype)
@@ -75,6 +78,16 @@ class BBoxHeightLocker:
                 profile["history_h"].pop(0)
             profile["h_stable"] = sum(profile["history_h"]) / len(profile["history_h"])
 
+        # 3. Mise à jour progressive de la largeur de référence
+        if "history_w" not in profile:
+            profile["history_w"] = [current_w]
+            profile["w_stable"] = current_w
+        else:
+            profile["history_w"].append(current_w)
+            if len(profile["history_w"]) > self.history_window:
+                profile["history_w"].pop(0)
+            profile["w_stable"] = sum(profile["history_w"]) / len(profile["history_w"])
+
         if isinstance(bbox, np.ndarray):
             return np.array([x1, y1, x2, y2_corrected], dtype=bbox.dtype)
         return (x1, y1, x2, y2_corrected)
@@ -92,6 +105,14 @@ class BBoxHeightLocker:
             return None
         height = float(profile["h_stable"])
         return height if height > 0 else None
+
+    def stable_width(self, track_id: int) -> float | None:
+        """Largeur de référence **lissée** d'une piste, ou ``None`` si inconnue."""
+        profile = self.tracks_profile.get(track_id)
+        if profile is None:
+            return None
+        width = float(profile.get("w_stable", 0.0))
+        return width if width > 0 else None
 
     def purge_lost_tracks(self, active_ids: set[int]) -> None:
         """Libère les profils des pistes techniques absentes de la frame courante.

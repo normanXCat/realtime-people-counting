@@ -460,3 +460,44 @@ def check_anchor_height_drop(
     is_drop = drop_ratio >= max_drop_ratio
     return is_drop, float(drop_ratio), float(ref_height)
 
+
+def check_box_width_growth(
+    current_width: float,
+    width_history: Sequence[float],
+    max_growth_ratio: float = 1.6,
+    current_height: float | None = None,
+    height_history: Sequence[float] | None = None,
+) -> tuple[bool, float, float]:
+    """Détecte une croissance anormale et brutale de la largeur de boîte
+    par rapport à l'historique stabilisé — signal possible de fusion de
+    deux personnes proches dans une même détection.
+
+    Returns:
+        (is_abnormal, current_ratio, threshold)
+    """
+    if not width_history:
+        return False, 1.0, float(max_growth_ratio)
+    valid_history = [float(w) for w in width_history if float(w) > 0]
+    if not valid_history:
+        return False, 1.0, float(max_growth_ratio)
+    from statistics import median
+
+    ref_width = float(median(valid_history))
+    if ref_width <= 0:
+        return False, 1.0, float(max_growth_ratio)
+    current_ratio = float(current_width) / ref_width
+    is_abnormal = current_ratio >= float(max_growth_ratio)
+
+    if is_abnormal and current_height is not None and height_history is not None:
+        valid_heights = [float(h) for h in height_history if float(h) > 0]
+        if valid_heights:
+            ref_height = float(median(valid_heights))
+            if ref_height > 0:
+                height_ratio = float(current_height) / ref_height
+                # Si la hauteur augmente également de manière proportionnelle (rapprochement caméra),
+                # la croissance est cohérente et ne constitue pas une fusion.
+                if height_ratio >= float(max_growth_ratio) * 0.8 and (current_ratio / height_ratio) < 1.3:
+                    is_abnormal = False
+
+    return is_abnormal, float(current_ratio), float(max_growth_ratio)
+

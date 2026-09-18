@@ -67,6 +67,7 @@ from geometry import (
     Zone,
     anchor_reliability,
     check_anchor_height_drop,
+    check_box_width_growth,
     check_detection_geometry,
     compute_anchor,
     side_of,
@@ -408,11 +409,39 @@ class OccupancyManager:
         # la correction est journalisée avec sa raison et son seuil.
         raw_boxes: dict[int, np.ndarray] = {}
         corrected: dict[int, tuple[np.ndarray, tuple[float, float]]] = {}
+        multi_person_detected: dict[int, tuple[float, float, float, float]] = {}
         self._raw_heights.clear()
         self._fallback_keys.clear()
         for detection in detections:
             technical_id = int(detection.technical_track_id)
             raw = np.asarray(detection.bbox, dtype=float)
+            stab_key = self.stabilization_key(technical_id)
+            current_w = max(0.0, float(raw[2] - raw[0]))
+            current_h = max(0.0, float(raw[3] - raw[1]))
+
+            # Détection éventuelle d'une boîte multi-personnes (croissance anormale de la largeur)
+            if (
+                self.config.geometry.multi_person_box.enabled
+                and self.bbox_locker is not None
+            ):
+                stable_w = self.bbox_locker.stable_width(stab_key)
+                stable_h = self.bbox_locker.stable_height(stab_key)
+                if stable_w is not None and stable_w > 0:
+                    is_multi, ratio, thresh = check_box_width_growth(
+                        current_w,
+                        [stable_w],
+                        self.config.geometry.multi_person_box.max_growth_ratio,
+                        current_height=current_h,
+                        height_history=[stable_h] if stable_h else None,
+                    )
+                    if is_multi:
+                        multi_person_detected[technical_id] = (
+                            current_w,
+                            stable_w,
+                            ratio,
+                            thresh,
+                        )
+
             bbox = raw
             if self.bbox_locker is not None:
                 # Historique indexé par ``person_id`` : une occultation ou un
@@ -421,7 +450,7 @@ class OccupancyManager:
                 # précisément sur la frame où la hauteur chute.
                 bbox = np.asarray(
                     self.bbox_locker.process_bbox(
-                        self.stabilization_key(technical_id), raw
+                        stab_key, raw
                     ),
                     dtype=float,
                 )
@@ -429,11 +458,11 @@ class OccupancyManager:
             if self.anchor_stabilizer is not None:
                 anchor = tuple(
                     self.anchor_stabilizer.get_stabilized_anchor(
-                        self.stabilization_key(technical_id), bbox
+                        stab_key, bbox
                     )
                 )
             raw_boxes[technical_id] = raw
-            self._raw_heights[technical_id] = float(raw[3] - raw[1])
+            self._raw_heights[technical_id] = current_h
             corrected[technical_id] = (bbox, anchor)
 
         # Échelle locale (zone morte, rayon d'ambiguïté) : alimentée par la
@@ -460,6 +489,9 @@ class OccupancyManager:
                     anchor_reliability(detection.bbox, width, height, margin_ratio)
                     is AnchorReliability.FIABLE
                 ),
+                possible_multi_person=(
+                    int(detection.technical_track_id) in multi_person_detected
+                ),
             )
             for detection in detections
         ]
@@ -470,6 +502,25 @@ class OccupancyManager:
             )
         if self.profiler is not None:
             self.profiler.record("reid", reid_timer.ms)
+
+        # Signalement explicite des boîtes suspectées de contenir plusieurs personnes
+        for assignment in assignments:
+            tech_id = int(assignment.technical_track_id)
+            if tech_id in multi_person_detected and assignment.person_id:
+                curr_w, stab_w, r, th = multi_person_detected[tech_id]
+                self._emit(
+                    "POSSIBLE_MULTI_PERSON_BOX",
+                    timestamp_s,
+                    frame_index,
+                    person_id=int(assignment.person_id),
+                    frame=int(frame_index),
+                    current_width=round(float(curr_w), 2),
+                    stable_width=round(float(stab_w), 2),
+                    ratio=round(float(r), 4),
+                    threshold=round(float(th), 4),
+                    technical_track_id=tech_id,
+                    bbox=[round(float(v), 2) for v in assignment.bbox],
+                )
 
         ambiguity_radius_px = self.scale.ratio_to_px(
             self.config.geometry.occlusion_ambiguity_ratio

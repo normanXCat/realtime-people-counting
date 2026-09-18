@@ -227,6 +227,33 @@ class AppearanceContinuityConfig:
 
 
 @dataclass(frozen=True)
+class SwapCorrectionConfig:
+    """Correction active des inversions d'identité (swap) entre paires de pistes.
+
+    Réintroduit le comportement de l'ancien ``[RE-ID-LOCK]`` de ``IDManager`` :
+    pour chaque paire de pistes techniques connues, la similarité directe
+    (``A↔A``, ``B↔B``) est comparée à la similarité croisée (``A↔B``, ``B↔A``).
+    Si le croisement est nettement meilleur (marge ``margin``), le mapping
+    ``technical_to_person`` est corrigé et un événement
+    ``IDENTITY_SWAP_CORRECTED`` est émis — jamais une correction silencieuse.
+
+    Ce mécanisme est **additionnel** au diagnostic existant
+    (``TRACK_ID_APPEARANCE_DISCONTINUITY``) : le diagnostic continue de mesurer,
+    la correction agit.
+
+    - ``enabled`` : flag d'ablation (``false`` = comportement V2 actuel,
+      diagnostic seul) ;
+    - ``margin`` : écart minimal ``crossed - direct`` pour déclencher la
+      correction. Valeur initiale identique à l'ancien ``[RE-ID-LOCK]``, à
+      recalibrer sur l'ensemble de calibration.
+    """
+
+    enabled: bool = True
+    #: PROVISOIRE — même valeur que l'ancien [RE-ID-LOCK], à recalibrer.
+    margin: float = 0.12
+
+
+@dataclass(frozen=True)
 class ExternalReidConfig:
     enabled: bool = False
     model_path: str = "osnet_x0_25_msmt17.pt"
@@ -241,6 +268,9 @@ class ReidConfig:
     external_reid: ExternalReidConfig = field(default_factory=ExternalReidConfig)
     appearance_continuity: AppearanceContinuityConfig = field(
         default_factory=AppearanceContinuityConfig
+    )
+    swap_correction: SwapCorrectionConfig = field(
+        default_factory=SwapCorrectionConfig
     )
 
 
@@ -262,6 +292,26 @@ class LineConfig:
 
 
 @dataclass(frozen=True)
+class MultiPersonBoxConfig:
+    """Détection d'une boîte contenant probablement deux personnes.
+
+    Une seule bounding box regroupant deux silhouettes proches se reconnaît à
+    une **croissance anormale de la largeur** par rapport à l'historique
+    stabilisé de la même personne, à hauteur constante ou quasi constante (une
+    personne seule ne s'élargit pas brutalement sans bouger en profondeur).
+
+    - ``enabled`` : flag d'ablation ;
+    - ``max_growth_ratio`` : ratio ``largeur_courante / largeur_stabilisée``
+      au-delà duquel le signal est déclenché. Valeur initiale à calibrer sur
+      des cas confirmés de fusion.
+    """
+
+    enabled: bool = True
+    #: PROVISOIRE — à calibrer sur des cas confirmés de fusion.
+    max_growth_ratio: float = 1.6
+
+
+@dataclass(frozen=True)
 class GeometryConfig:
     """Géométrie relative à l'échelle locale, en fractions (règle 0.3).
 
@@ -280,6 +330,9 @@ class GeometryConfig:
     max_aspect_ratio_wh: float = 2.5
     min_box_height_px: float = 10.0
     min_box_width_px: float = 10.0
+    multi_person_box: MultiPersonBoxConfig = field(
+        default_factory=MultiPersonBoxConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -617,6 +670,13 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             f"geometry.max_aspect_ratio_wh ({max_aspect_ratio_wh})"
         )
 
+    multi_person_raw = _section(geometry_raw, "multi_person_box")
+    max_growth_ratio = _positive(
+        multi_person_raw.get("max_growth_ratio", 1.6),
+        "geometry.multi_person_box.max_growth_ratio",
+        problems,
+    )
+
     anchor_raw = _section(raw, "anchor")
     anchor_window = _positive_int(
         anchor_raw.get("height_history_window_frames", 30),
@@ -747,6 +807,14 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     continuity_min_interval = _non_negative(
         continuity_raw.get("min_interval_seconds", 1.0),
         "reid.appearance_continuity.min_interval_seconds",
+        problems,
+    )
+
+    # -- Correction active des inversions d'identité (swap) ----------------
+    swap_correction_raw = _section(reid_raw, "swap_correction")
+    swap_margin = _positive(
+        swap_correction_raw.get("margin", 0.12),
+        "reid.swap_correction.margin",
         problems,
     )
 
@@ -899,6 +967,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     assert min_aspect_ratio_wh is not None and max_aspect_ratio_wh is not None
     assert min_box_height_px is not None and min_box_width_px is not None
     assert long_absence_seconds is not None
+    assert swap_margin is not None and max_growth_ratio is not None
 
     return PipelineConfig(
         schema_version=1,
@@ -976,6 +1045,10 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                     continuity_min_interval if continuity_min_interval is not None else 1.0
                 ),
             ),
+            swap_correction=SwapCorrectionConfig(
+                enabled=bool(swap_correction_raw.get("enabled", True)),
+                margin=float(swap_margin if swap_margin is not None else 0.12),
+            ),
         ),
         line=LineConfig(
             inside_side=inside_side,
@@ -991,6 +1064,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             max_aspect_ratio_wh=float(max_aspect_ratio_wh or 2.5),
             min_box_height_px=float(min_box_height_px or 10.0),
             min_box_width_px=float(min_box_width_px or 10.0),
+            multi_person_box=MultiPersonBoxConfig(
+                enabled=bool(multi_person_raw.get("enabled", True)),
+                max_growth_ratio=float(
+                    max_growth_ratio if max_growth_ratio is not None else 1.6
+                ),
+            ),
         ),
         timing=TimingConfig(
             fps_source=fps_source,

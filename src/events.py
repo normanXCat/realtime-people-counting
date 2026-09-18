@@ -190,6 +190,23 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "descriptor_age_s", "threshold", "consecutive_frames",
         ),
     ),
+    # Correction active des inversions d'identité (swap) : le croisement
+    # d'apparence entre deux pistes connues dépasse la marge de sécurité.
+    "IDENTITY_SWAP_CORRECTED": EventSpec(
+        required=(
+            "technical_track_id_a",
+            "technical_track_id_b",
+            "person_id_a_before",
+            "person_id_a_after",
+            "person_id_b_before",
+            "person_id_b_after",
+            "similarity_direct",
+            "similarity_crossed",
+            "margin_applied",
+            "reason",
+        ),
+        optional=("frame",),
+    ),
     # Apparence refusée pour la galerie (jamais remplacée en silence).
     "REID_DESCRIPTOR_REJECTED": EventSpec(
         required=("person_id", "reason"),
@@ -214,6 +231,17 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "bbox_wh_ratio", "confidence", "frame", "bbox", "min_ratio", "max_ratio",
             "technical_track_id",
         ),
+    ),
+    # Détection d'une boîte contenant probablement deux personnes (fusion de silhouettes).
+    "POSSIBLE_MULTI_PERSON_BOX": EventSpec(
+        required=(
+            "person_id",
+            "current_width",
+            "stable_width",
+            "ratio",
+            "threshold",
+        ),
+        optional=("frame", "technical_track_id", "bbox"),
     ),
     # -- Cohérence ---------------------------------------------------------
     "INCONSISTENT_STATE": EventSpec(
