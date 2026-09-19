@@ -58,13 +58,35 @@ class AppearanceExtractor(Protocol):
 
 
 class HistogramAppearanceExtractor:
-    """Descripteur léger couleur (HSV), sans dépendance à torch.
+    """Descripteur léger couleur (HSV) **par bandes horizontales**, sans torch.
 
     C'est l'extracteur par défaut : rapide, déterministe, sans téléchargement de
     poids. Il reprend la signature de ``IDManager.appearance`` (audit §2.1 a).
+
+    Le descripteur global précédent (histogramme teinte × saturation sur le crop
+    **complet**) encodait principalement le fond — chaises, tables, mur — et
+    accessoirement le haut du vêtement. En salle de cours, deux personnes de la
+    même rangée y atteignaient couramment une similarité > 0.9 alors que le seuil
+    de galerie vaut 0.40 : l'écart inter-personnes était **inférieur au bruit du
+    descripteur**, ce qui produisait les réassociations croisées.
+
+    Trois changements :
+
+    1. le crop est **érodé** de ``horizontal_crop_ratio`` de chaque côté (le
+       descripteur avalait le fond et les voisins) ;
+    2. le crop rogné est découpé en ``bands`` bandes horizontales (tête / torse /
+       bas), chacune **normalisée séparément** avant concaténation : la tête ne
+       peut plus être noyée par la couleur d'une table ;
+    3. chaque bande est pondérée (``band_weights``) — la bande basse est la plus
+       souvent occultée par une table, donc la moins fiable.
+
+    La dimension du descripteur change donc (``bands × bins_hue ×
+    bins_saturation``) — ``_blend`` gère déjà le cas
+    ``previous.shape != current.shape`` en repartant du descripteur courant, et
+    aucun descripteur n'est persisté entre deux sessions.
     """
 
-    name = "histogram_hsv"
+    name = "histogram_hsv_bands"
 
     def __init__(
         self,
@@ -72,11 +94,34 @@ class HistogramAppearanceExtractor:
         bins_saturation: int = 8,
         min_width: int = 8,
         min_height: int = 16,
+        horizontal_crop_ratio: float = 0.15,
+        bands: int = 3,
+        band_weights: Sequence[float] | None = None,
     ) -> None:
         self.bins_hue = int(bins_hue)
         self.bins_saturation = int(bins_saturation)
         self.min_width = int(min_width)
         self.min_height = int(min_height)
+        self.horizontal_crop_ratio = float(horizontal_crop_ratio)
+        self.bands = max(1, int(bands))
+        weights = list(band_weights) if band_weights else [1.0] * self.bands
+        # Poids manquants comblés à 1.0 plutôt que refusés : la construction
+        # directe (tests, scripts) ne doit pas dupliquer la validation stricte de
+        # ``config.py``, qui exige exactement ``bands`` poids.
+        while len(weights) < self.bands:
+            weights.append(1.0)
+        self.band_weights = [float(w) for w in weights[: self.bands]]
+
+    @classmethod
+    def from_config(cls, descriptor: Any) -> "HistogramAppearanceExtractor":
+        """Construit l'extracteur depuis ``reid.long_term.descriptor``."""
+        return cls(
+            bins_hue=descriptor.bins_hue,
+            bins_saturation=descriptor.bins_saturation,
+            horizontal_crop_ratio=descriptor.horizontal_crop_ratio,
+            bands=descriptor.bands,
+            band_weights=descriptor.band_weights,
+        )
 
     def describe(self, frame: np.ndarray, bbox: Sequence[float]) -> np.ndarray | None:
         height, width = frame.shape[:2]
@@ -85,13 +130,38 @@ class HistogramAppearanceExtractor:
         x2, y2 = min(width, x2), min(height, y2)
         if x2 - x1 < self.min_width or y2 - y1 < self.min_height:
             return None
-        crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        histogram = cv2.calcHist(
-            [hsv], [0, 1], None,
-            [self.bins_hue, self.bins_saturation], [0, 180, 0, 256],
-        )
-        flat = histogram.flatten().astype(np.float32)
+        # Érosion horizontale : le crop d'origine avalait le fond et les voisins.
+        margin = int(round(self.horizontal_crop_ratio * (x2 - x1)))
+        ex1, ex2 = x1 + margin, x2 - margin
+        if ex2 - ex1 < self.min_width:
+            # Crop devenu inexploitable après rognage : refusé plutôt que dégradé.
+            return None
+        hsv = cv2.cvtColor(frame[y1:y2, ex1:ex2], cv2.COLOR_BGR2HSV)
+        crop_height = hsv.shape[0]
+        parts: list[np.ndarray] = []
+        for index in range(self.bands):
+            top = int(round(index * crop_height / self.bands))
+            bottom = (
+                int(round((index + 1) * crop_height / self.bands))
+                if index < self.bands - 1
+                else crop_height
+            )
+            if bottom <= top:
+                parts.append(
+                    np.zeros(self.bins_hue * self.bins_saturation, dtype=np.float32)
+                )
+                continue
+            histogram = cv2.calcHist(
+                [hsv[top:bottom]], [0, 1], None,
+                [self.bins_hue, self.bins_saturation], [0, 180, 0, 256],
+            )
+            flat = histogram.flatten().astype(np.float32)
+            # Normalisation PAR BANDE : sans elle, la bande la plus colorée
+            # écraserait les autres et le découpage n'apporterait rien.
+            norm = float(np.linalg.norm(flat))
+            band_vector = flat / norm if norm > 1e-8 else np.zeros_like(flat)
+            parts.append(band_vector * self.band_weights[index])
+        flat = np.concatenate(parts)
         norm = float(np.linalg.norm(flat))
         return None if norm < 1e-8 else flat / norm
 
@@ -240,6 +310,13 @@ class IdentityRecord:
     #: Dernière raison de rejet d'apparence (`REID_DESCRIPTOR_REJECTED`). Sert à
     #: ne journaliser qu'un changement de situation, jamais une ligne par frame.
     last_rejection: str | None = None
+    #: Frame jusqu'à laquelle le descripteur de cette identité est **gelé**
+    #: (aucun ``_blend``) parce qu'une discontinuité d'apparence a été détectée
+    #: sur sa piste technique. Sans gel, un swap non détecté fait dériver la
+    #: référence vers l'apparence de l'autre personne et rend la correction
+    #: croisée aveugle. Seul le descripteur est gelé : position, hauteur et
+    #: ``last_seen_s`` continuent d'être mis à jour.
+    appearance_suspect_until_frame: int | None = None
 
     @property
     def age_s(self) -> float:
@@ -298,10 +375,13 @@ class IdentityManager:
             if configured_retention is None
             else float(configured_retention)
         )
+        # Le descripteur HSV par bandes est construit depuis
+        # ``reid.long_term.descriptor`` : aucun paramètre de descripteur n'est
+        # codé en dur ici (règle « aucune valeur métier en dur »).
         self.appearance: AppearanceExtractor = appearance or (
             DeepAppearanceExtractor(self.external_reid)
             if self.external_reid.enabled
-            else HistogramAppearanceExtractor()
+            else HistogramAppearanceExtractor.from_config(self.long_term.descriptor)
         )
         self.event_sink = event_sink
         self.feature_momentum = float(feature_momentum)
@@ -746,6 +826,11 @@ class IdentityManager:
             # Continuité rétablie : la piste peut être signalée à nouveau plus tard.
             self._discontinuity_active.discard(int(technical_id))
             return
+        # Drapeau de gel (B.3.b) : posé dès qu'une discontinuité est observée,
+        # même si l'événement a déjà été journalisé (le débit est limité, pas la
+        # détection). La référence d'apparence de l'identité concernée cesse
+        # d'être mise à jour pendant ``freeze_gallery_frames`` frames.
+        self._mark_appearance_suspect(int(technical_id), frame_index)
         if int(technical_id) in self._discontinuity_active:
             return
         last_emit = self._last_continuity_emit_s.get(int(technical_id))
@@ -770,6 +855,32 @@ class IdentityManager:
             threshold=round(float(config.similarity_threshold), 4),
             reason="possible_internal_swap",
         )
+
+    def _mark_appearance_suspect(self, technical_id: int, frame_index: int) -> None:
+        """Gèle le descripteur de l'identité liée à ``technical_id`` (B.3.b).
+
+        La discontinuité est constatée **avant** la mise à jour du descripteur
+        par ``_touch`` sur la même frame : le gel couvre donc aussi la frame de
+        détection, qui porte déjà l'apparence de l'autre personne.
+        """
+        person_id = self.technical_to_person.get(int(technical_id))
+        if person_id is None:
+            return
+        record = self.records.get(person_id)
+        if record is None:
+            return
+        freeze = max(0, int(self.appearance_continuity.freeze_gallery_frames))
+        until = int(frame_index) + freeze
+        if (
+            record.appearance_suspect_until_frame is None
+            or until > record.appearance_suspect_until_frame
+        ):
+            record.appearance_suspect_until_frame = until
+
+    def descriptor_frozen(self, record: IdentityRecord, frame_index: int) -> bool:
+        """Le descripteur de ``record`` est-il actuellement gelé ?"""
+        until = record.appearance_suspect_until_frame
+        return until is not None and int(frame_index) <= int(until)
 
     def continuity_similarity_summary(self) -> dict[str, float | int | None]:
         """Distribution des similarités de continuité observées (calibration).
@@ -1108,6 +1219,14 @@ class IdentityManager:
         record.purge_reason = None
         rejection, threshold, measured = self._gallery_rejection(observation, feature, frame)
         if rejection is None:
+            if self.descriptor_frozen(record, frame_index):
+                # Discontinuité d'apparence en cours : la référence reste
+                # inchangée. La mettre à jour ici absorberait l'apparence de
+                # l'AUTRE personne (1 − 0.85⁵ ≈ 56 % en 5 frames) et rendrait
+                # ``_correct_cross_swaps`` aveugle au moment où le swap
+                # s'installe. Position, hauteur et ``last_seen_s`` ont déjà été
+                # mis à jour plus haut, avant ce bloc.
+                return
             record.feature = _blend(record.feature, feature, self.feature_momentum)
             record.last_rejection = None
             return

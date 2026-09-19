@@ -70,6 +70,22 @@ Required test coverage of 85% reached. Total coverage: 92.75%
 $ python -m py_compile src/*.py     # compilation vérifiée
 ```
 
+> **Mise à jour (correctif occlusion/assistance tête, `docs/correctif_occlusion.md`).**
+> Les chiffres ci-dessus sont un **état antérieur** du dépôt, tout comme les
+> « 585 tests » cités au §4.7 : les deux chiffres coexistaient dans ce document
+> alors qu'ils décrivent deux états différents (352 après la refonte, 585 après
+> l'assistance tête). État courant :
+>
+> ```
+> $ python -m pytest
+> 606 passed
+> Required test coverage of 85% reached. Total coverage: 93.54%
+> ```
+>
+> Les corrections de seuils et de comportement du correctif occlusion sont
+> documentées dans `docs/correctif_occlusion.md` ; le présent rapport est mis à
+> jour en §4.7 et une section §4.8 est ajoutée.
+
 Couverture du cœur métier (le seuil de 85 % porte sur ces modules) :
 
 | Module | Couverture |
@@ -292,7 +308,44 @@ Dans les scènes d'amphithéâtre et de salle de cours, les pieds des personnes 
 3. **Garantie de non-régression** :
    - Le flag `presence.head_assist.enabled` est `false` par défaut.
    - Tant qu'il est désactivé, aucun calcul de pose ni extraction de points-clés n'a lieu, et les 564 tests initiaux passent sans modification.
-   - 21 nouveaux tests dédiés ont été ajoutés (`tests/test_extract_head_point.py`, `tests/test_head_assist_disabled_by_default.py`, `tests/test_head_assist_presence.py`, et compléments dans `tests/test_config_validation.py`), portant la suite à 585 tests réussis.
+   - 21 nouveaux tests dédiés ont été ajoutés (`tests/test_extract_head_point.py`, `tests/test_head_assist_disabled_by_default.py`, `tests/test_head_assist_presence.py`, et compléments dans `tests/test_config_validation.py`), portant la suite à 585 tests réussis — devenus **606** après le correctif occlusion.
+
+> **Corrections rapport ↔ code (à lire avec ce paragraphe) :**
+>
+> - ce §4.7 annonçait **5 points-clés** de tête alors que
+>   `config/pipeline.yaml` n'en déclarait que **3** (`nose`, `left_eye`,
+>   `right_eye`). La configuration a été alignée sur 5 points (oreilles
+>   incluses), qui sont les seuls points survivant à une vue de profil ;
+> - « fait et testé » couvrait la **logique de décision**, pas l'intégration du
+>   **modèle pose** : les 4 tests de `tests/test_head_assist_presence.py`
+>   injectaient `head_point` à la main. Un test d'intégration sur tenseur
+>   `keypoints` réel `(N, 17, 2)` / `(N, 17)` a été ajouté
+>   (`tests/test_correctif_occlusion.py`), mais le chemin complet
+>   (`models/yolo11s-pose.pt` absent du dépôt, `pose_model_expected_sha256`
+>   `null`) **n'a jamais tourné sur une vidéo réelle** : il reste à valider
+>   (lot C.2 du prompt correctif).
+
+### 4.8 Correctif occlusion dense et assistance tête (lots A et B)
+
+Un prompt correctif a été appliqué partiellement : **lots A (réglages) et B
+(retouches locales)**, **lot C non exécuté** (décision d'architecture — ancre
+tête — laissée à validation humaine). Détail complet, mesures avant/après et
+réserves dans `docs/correctif_occlusion.md`. Points saillants :
+
+- seuils BoT-SORT modifiés (`match_thresh` 0,9 → 0,75 ; `proximity_thresh`
+  0,5 → 0,8 ; `new_track_thresh` 0,7 → 0,45), rétention de galerie rendue
+  explicite (12 s), points-clés de tête portés à 5 ;
+- corrections de code : la réadaptation de hauteur d'une personne assise n'est
+  plus neutralisée par l'activation de l'assistance tête ; le maintien par la
+  tête exige un point frais ; le descripteur d'apparence est gelé pendant une
+  discontinuité (il dérivait vers l'autre personne après un swap) ; descripteur
+  HSV par bandes sur crop érodé ; second signal multi-personnes par **nombre de
+  têtes dans la boîte** ;
+- **la mesure ne valide pas le lot A** : sur un clip de salle de classe
+  (300 frames), les identifiants techniques créés passent de 11 à 15 et les
+  changements d'identifiant technique de 2 à 6, sans qu'aucun swap n'ait été
+  observé dans les deux cas. Les seuils restent PROVISOIRE ; cf. §1.2 et §2 de
+  `docs/correctif_occlusion.md` pour la recommandation.
 
 ## 5. Limites et reste à faire
 
@@ -325,3 +378,19 @@ Dans les scènes d'amphithéâtre et de salle de cours, les pieds des personnes 
    mêle capture et inférence, la latence de capture mesurée inclut donc
    l'attente de l'inférence précédente. Une mesure séparée exigerait de sortir du
    mode `stream` ; le point est signalé plutôt que masqué.
+7. **Lot A non validé par la mesure** : les seuils BoT-SORT (`match_thresh`
+   0,75, `proximity_thresh` 0,8, `new_track_thresh` 0,45) restent PROVISOIRE.
+   Sur le clip de salle de classe mesuré, la stabilité des identifiants
+   techniques se dégrade (11 → 15 identifiants créés, 2 → 6 changements) sans
+   qu'aucun swap n'ait été observé. Aucune valeur ne doit être figée avant une
+   mesure sur un clip où le swap se produit réellement, et les trois paramètres
+   doivent être testés séparément.
+8. **Assistance tête jamais exercée sur vidéo réelle** : `models/yolo11s-pose.pt`
+   est absent du dépôt et `pose_model_expected_sha256` vaut `null`. Le chemin
+   réel (chargement du modèle pose, lecture de `result.keypoints`, coût CPU) n'a
+   pas été mesuré ; un test d'intégration sur tenseur couvre désormais la forme
+   des données, pas l'exécution du modèle. Voir lot C.2 du prompt correctif.
+9. **Histogrammes de similarité inter-identités indisponibles** : sans vérité
+   terrain MOT annotée, `reid.long_term.similarity_threshold` ne peut pas être
+   recalibré (il reste à 0,40 et PROVISOIRE). Le descripteur par bandes est
+   livré, mais sa discrimination n'est pas quantifiée.

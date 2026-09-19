@@ -146,6 +146,30 @@ class TrackerConfig:
 
 
 @dataclass(frozen=True)
+class DescriptorConfig:
+    """Descripteur d'apparence HSV par bandes (extracteur par défaut).
+
+    Le descripteur global (histogramme teinte × saturation calculé sur le crop
+    **complet**) encode principalement la couleur du fond (chaises, tables, mur) :
+    en salle de cours, deux personnes de la même rangée y atteignent couramment
+    une similarité > 0.9 alors que ``similarity_threshold`` vaut 0.40. L'écart
+    inter-personnes était donc inférieur au bruit du descripteur.
+
+    Le crop est ici **érodé** de ``horizontal_crop_ratio`` de chaque côté (le
+    descripteur absorbait le fond et les voisins), puis découpé en ``bands``
+    bandes horizontales (tête / torse / bas). Chaque bande est normalisée
+    **séparément** avant concaténation, et pondérée par ``band_weights`` : la
+    bande basse est la plus souvent occultée par une table, donc la moins fiable.
+    """
+
+    horizontal_crop_ratio: float = 0.15
+    bands: int = 3
+    band_weights: tuple[float, ...] = (1.0, 1.0, 0.5)
+    bins_hue: int = 24
+    bins_saturation: int = 8
+
+
+@dataclass(frozen=True)
 class LongTermReidConfig:
     """Galerie long terme et **qualité des descripteurs écrits en galerie**.
 
@@ -184,6 +208,13 @@ class LongTermReidConfig:
     #: explicitement, jamais subi, pour éviter les fausses réassociations.
     long_absence_seconds: float = 2.0
     long_absence_similarity_floor: float | None = None
+    #: Momentum de la moyenne glissante qui met à jour le descripteur d'une
+    #: identité observée (``feature = momentum × précédent + (1 − momentum) ×
+    #: courant``). Était codé en dur à 0.85 dans ``IdentityManager``. Borne
+    #: exigée : ``0.0 <= x < 1.0``.
+    feature_momentum: float = 0.85
+    #: Paramètres du descripteur HSV par bandes (extracteur par défaut).
+    descriptor: DescriptorConfig = field(default_factory=DescriptorConfig)
 
 
 @dataclass(frozen=True)
@@ -225,6 +256,14 @@ class AppearanceContinuityConfig:
     similarity_threshold: float = 0.50
     max_gap_frames: int = 2
     min_interval_seconds: float = 1.0
+    #: Nombre de frames pendant lesquelles le descripteur de galerie d'une
+    #: identité est **gelé** après une discontinuité d'apparence sur sa piste.
+    #: Sans gel, ``_blend`` absorbe ~56 % de l'apparence de l'autre personne en
+    #: 5 frames après un swap non détecté, et ``_correct_cross_swaps`` devient
+    #: aveugle au moment précis où la correction servirait. Seul le descripteur
+    #: est gelé : position, hauteur et ``last_seen_s`` continuent d'être mis à
+    #: jour. Borne minimale : 3 frames.
+    freeze_gallery_frames: int = 3
 
 
 @dataclass(frozen=True)
@@ -310,6 +349,19 @@ class MultiPersonBoxConfig:
     enabled: bool = True
     #: PROVISOIRE — à calibrer sur des cas confirmés de fusion.
     max_growth_ratio: float = 1.6
+    #: -- Second signal, indépendant de l'historique de largeur ------------
+    #: Le détecteur par croissance de largeur exige un historique d'AVANT la
+    #: fusion : deux personnes assises côte à côte dès la première frame ne le
+    #: déclenchent jamais, leur largeur fusionnée étant la référence. Le comptage
+    #: des têtes à l'intérieur d'une boîte comble cet angle mort, dès la première
+    #: frame, et n'existe que si ``presence.head_assist.enabled`` est vrai (le
+    #: modèle pose doit tourner). Désactivé/indisponible ⇒ le détecteur par
+    #: largeur reste seul actif, comportement inchangé.
+    head_count_enabled: bool = True
+    #: Séparation horizontale minimale entre deux têtes d'une même boîte,
+    #: exprimée en fraction de la largeur de boîte, pour conclure à une fusion.
+    #: PROVISOIRE — à calibrer.
+    head_separation_ratio: float = 0.4
 
 
 @dataclass(frozen=True)
@@ -476,8 +528,15 @@ class HeadAssistConfig:
     pose_model_path: str = "models/yolo11s-pose.pt"
     pose_model_expected_sha256: str | None = None
     min_keypoint_confidence: float = 0.5  # PROVISOIRE
-    keypoints_used: tuple[str, ...] = ("nose", "left_eye", "right_eye")
+    keypoints_used: tuple[str, ...] = (
+        "nose", "left_eye", "right_eye", "left_ear", "right_ear"
+    )
     max_presence_extension_seconds: float = 10.0  # PROVISOIRE
+    #: Péremption du point tête utilisé par ``_handle_missing`` : la piste n'est
+    #: pas observée sur la frame courante, le point tête datant de la dernière
+    #: frame vue. Au-delà de cette tolérance (en frames), il n'a plus de lien
+    #: avec l'image courante et ne doit plus maintenir la présence.
+    max_head_staleness_frames: int = 1
 
 
 @dataclass(frozen=True)
@@ -709,6 +768,14 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "geometry.multi_person_box.max_growth_ratio",
         problems,
     )
+    multi_person_head_count_enabled = bool(
+        multi_person_raw.get("head_count_enabled", True)
+    )
+    multi_person_head_separation_ratio = _unit_interval(
+        multi_person_raw.get("head_separation_ratio", 0.4),
+        "geometry.multi_person_box.head_separation_ratio",
+        problems,
+    )
 
     anchor_raw = _section(raw, "anchor")
     anchor_window = _positive_int(
@@ -825,6 +892,69 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             f"({similarity_threshold}) : une tolérance progressive ne peut que "
             "descendre sous le seuil nominal, jamais le relever."
         )
+    # -- Momentum du descripteur d'apparence (était codé en dur à 0.85) ----
+    feature_momentum = _bounded(
+        long_term_raw.get("feature_momentum", 0.85),
+        "reid.long_term.feature_momentum",
+        problems,
+        low=0.0,
+        high=1.0,
+    )
+    if feature_momentum is not None and feature_momentum >= 1.0:
+        problems.append(
+            "reid.long_term.feature_momentum doit être strictement < 1.0 (reçu "
+            f"{feature_momentum}) : à 1.0 la galerie ne se mettrait plus jamais à "
+            "jour et ignorerait tout changement réel d'apparence."
+        )
+    # -- Descripteur HSV par bandes ---------------------------------------
+    descriptor_raw = _section(long_term_raw, "descriptor")
+    descriptor_crop_ratio = _bounded(
+        descriptor_raw.get("horizontal_crop_ratio", 0.15),
+        "reid.long_term.descriptor.horizontal_crop_ratio",
+        problems,
+        low=0.0,
+        high=0.49,
+    )
+    descriptor_bands = _positive_int(
+        descriptor_raw.get("bands", 3),
+        "reid.long_term.descriptor.bands",
+        problems,
+    )
+    descriptor_weights_raw = descriptor_raw.get("band_weights", (1.0, 1.0, 0.5))
+    descriptor_weights: tuple[float, ...] = ()
+    try:
+        descriptor_weights = tuple(float(w) for w in descriptor_weights_raw)
+    except (TypeError, ValueError):
+        problems.append(
+            "reid.long_term.descriptor.band_weights doit être une liste de nombres "
+            f"(reçu {descriptor_weights_raw!r})"
+        )
+    if descriptor_weights and any(w < 0 for w in descriptor_weights):
+        problems.append(
+            "reid.long_term.descriptor.band_weights ne peut contenir de poids négatif"
+        )
+    if descriptor_bands is not None and descriptor_weights and (
+        len(descriptor_weights) != descriptor_bands
+    ):
+        problems.append(
+            "reid.long_term.descriptor.band_weights doit avoir autant d'éléments que "
+            f"descriptor.bands (reçu {len(descriptor_weights)} poids pour "
+            f"{descriptor_bands} bandes)"
+        )
+    if descriptor_weights and not any(w > 0 for w in descriptor_weights):
+        problems.append(
+            "reid.long_term.descriptor.band_weights doit contenir au moins un poids > 0"
+        )
+    descriptor_bins_hue = _positive_int(
+        descriptor_raw.get("bins_hue", 24),
+        "reid.long_term.descriptor.bins_hue",
+        problems,
+    )
+    descriptor_bins_saturation = _positive_int(
+        descriptor_raw.get("bins_saturation", 8),
+        "reid.long_term.descriptor.bins_saturation",
+        problems,
+    )
     # -- Garde-fou de swap (continuité d'apparence d'une piste non perdue) --
     continuity_raw = _section(reid_raw, "appearance_continuity")
     continuity_threshold = _cosine(
@@ -842,6 +972,18 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "reid.appearance_continuity.min_interval_seconds",
         problems,
     )
+    continuity_freeze_frames = _non_negative_int(
+        continuity_raw.get("freeze_gallery_frames", 3),
+        "reid.appearance_continuity.freeze_gallery_frames",
+        problems,
+    )
+    if continuity_freeze_frames is not None and continuity_freeze_frames < 3:
+        problems.append(
+            "reid.appearance_continuity.freeze_gallery_frames doit être >= 3 "
+            f"(reçu {continuity_freeze_frames}) : en dessous, le descripteur de la "
+            "piste absorbée a déjà dérivé (≈ 56 % de l'autre apparence en 5 frames) "
+            "et la correction croisée ne peut plus fonctionner."
+        )
 
     # -- Correction active des inversions d'identité (swap) ----------------
     swap_correction_raw = _section(reid_raw, "swap_correction")
@@ -911,7 +1053,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         tracker_raw.get("track_low_thresh", 0.1), "tracker.track_low_thresh", problems
     )
     new_track_thresh = _unit_interval(
-        tracker_raw.get("new_track_thresh", 0.7), "tracker.new_track_thresh", problems
+        tracker_raw.get("new_track_thresh", 0.45), "tracker.new_track_thresh", problems
     )
     if (
         track_low_thresh is not None
@@ -939,10 +1081,10 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         tracker_raw.get("track_buffer", 150), "tracker.track_buffer", problems
     )
     match_thresh = _unit_interval_inclusive(
-        tracker_raw.get("match_thresh", 0.9), "tracker.match_thresh", problems
+        tracker_raw.get("match_thresh", 0.75), "tracker.match_thresh", problems
     )
     proximity_thresh = _unit_interval_inclusive(
-        tracker_raw.get("proximity_thresh", 0.5), "tracker.proximity_thresh", problems
+        tracker_raw.get("proximity_thresh", 0.8), "tracker.proximity_thresh", problems
     )
     appearance_thresh = _unit_interval_inclusive(
         tracker_raw.get("appearance_thresh", 0.25), "tracker.appearance_thresh", problems
@@ -996,8 +1138,20 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "presence.head_assist.max_presence_extension_seconds",
         problems,
     )
+    ha_max_staleness = _non_negative_int(
+        head_assist_raw.get("max_head_staleness_frames", 1),
+        "presence.head_assist.max_head_staleness_frames",
+        problems,
+    )
     ha_keypoints_used = tuple(
-        str(k) for k in (head_assist_raw.get("keypoints_used", ("nose", "left_eye", "right_eye")) or ())
+        str(k)
+        for k in (
+            head_assist_raw.get(
+                "keypoints_used",
+                ("nose", "left_eye", "right_eye", "left_ear", "right_ear"),
+            )
+            or ()
+        )
     )
     if not ha_keypoints_used:
         problems.append(
@@ -1057,9 +1211,9 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             new_track_thresh=float(new_track_thresh if new_track_thresh is not None else 0.7),
             track_buffer=int(track_buffer if track_buffer is not None else 150),
             with_reid=bool(tracker_raw.get("with_reid", True)),
-            match_thresh=float(match_thresh if match_thresh is not None else 0.9),
+            match_thresh=float(match_thresh if match_thresh is not None else 0.75),
             proximity_thresh=float(
-                proximity_thresh if proximity_thresh is not None else 0.5
+                proximity_thresh if proximity_thresh is not None else 0.8
             ),
             appearance_thresh=float(
                 appearance_thresh if appearance_thresh is not None else 0.25
@@ -1091,6 +1245,26 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 long_absence_similarity_floor=(
                     None if long_absence_floor is None else float(long_absence_floor)
                 ),
+                feature_momentum=float(
+                    feature_momentum if feature_momentum is not None else 0.85
+                ),
+                descriptor=DescriptorConfig(
+                    horizontal_crop_ratio=float(
+                        descriptor_crop_ratio if descriptor_crop_ratio is not None else 0.15
+                    ),
+                    bands=int(descriptor_bands if descriptor_bands is not None else 3),
+                    band_weights=(
+                        descriptor_weights if descriptor_weights else (1.0, 1.0, 0.5)
+                    ),
+                    bins_hue=int(
+                        descriptor_bins_hue if descriptor_bins_hue is not None else 24
+                    ),
+                    bins_saturation=int(
+                        descriptor_bins_saturation
+                        if descriptor_bins_saturation is not None
+                        else 8
+                    ),
+                ),
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
@@ -1108,6 +1282,9 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 ),
                 min_interval_seconds=float(
                     continuity_min_interval if continuity_min_interval is not None else 1.0
+                ),
+                freeze_gallery_frames=int(
+                    continuity_freeze_frames if continuity_freeze_frames is not None else 3
                 ),
             ),
             swap_correction=SwapCorrectionConfig(
@@ -1133,6 +1310,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 enabled=bool(multi_person_raw.get("enabled", True)),
                 max_growth_ratio=float(
                     max_growth_ratio if max_growth_ratio is not None else 1.6
+                ),
+                head_count_enabled=multi_person_head_count_enabled,
+                head_separation_ratio=float(
+                    multi_person_head_separation_ratio
+                    if multi_person_head_separation_ratio is not None
+                    else 0.4
                 ),
             ),
         ),
@@ -1197,6 +1380,9 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 keypoints_used=ha_keypoints_used,
                 max_presence_extension_seconds=float(
                     ha_max_ext_s if ha_max_ext_s is not None else 10.0
+                ),
+                max_head_staleness_frames=int(
+                    ha_max_staleness if ha_max_staleness is not None else 1
                 ),
             ),
         ),

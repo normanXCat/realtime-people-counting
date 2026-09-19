@@ -105,7 +105,16 @@ def test_head_assist_transitions_to_occluded_when_head_not_confident(make_config
 
 
 def test_head_assist_extension_expires_after_max_seconds(make_config, sink):
-    """3. Au-delà de max_presence_extension_seconds -> PRESENCE_EXTENSION_EXPIRED émis, bascule vers OCCULTEE."""
+    """3. Au-delà de max_presence_extension_seconds -> PRESENCE_EXTENSION_EXPIRED émis, bascule vers OCCULTEE.
+
+    Note (lot B.1) : la cause d'ancrage non fiable est ici un **bord d'image**
+    (boîte touchant ``x=0``), et non une chute de hauteur *stabilisée*. Depuis
+    B.1, une chute confirmée sur ``height_drop_confirm_frames`` frames n'est
+    plus un motif permanent d'ancrage non fiable : l'historique de hauteur est
+    réadapté (personne assise et restée assise) et l'ancre redevient fiable.
+    Le chemin de maintien par la tête reste donc celui des ancres réellement
+    indisponibles (bord, absence de détection) — c'est ce que ce test vérifie.
+    """
     max_extension = 0.5  # 5 frames à 10 ips
     manager, _ = _make_head_assist_manager(make_config, sink, max_extension=max_extension)
     frame = np.zeros((600, 600, 3), dtype=np.uint8)
@@ -118,9 +127,10 @@ def test_head_assist_extension_expires_after_max_seconds(make_config, sink):
     track = manager.tracks[1]
     assert track.state is TrackState.PRESENTE
 
-    # Chute de hauteur continue pendant 1.0 s (> 0.5 s) avec tête confiante
-    drop_box = np.array([260.0, 350.0, 340.0, 450.0])
-    head_pt = (300.0, 360.0)
+    # Ancre pieds non fiable (boîte au bord de l'image) pendant 1.0 s (> 0.5 s),
+    # tête confiante.
+    drop_box = np.array([0.0, 250.0, 80.0, 450.0])
+    head_pt = (40.0, 300.0)
     for f in range(10, 25):
         t = f * 0.1
         manager.process_frame(

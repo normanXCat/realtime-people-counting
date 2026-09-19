@@ -70,6 +70,7 @@ from geometry import (
     check_box_width_growth,
     check_detection_geometry,
     compute_anchor,
+    detect_multi_person_by_head_count,
     side_of,
     zone_of,
 )
@@ -151,8 +152,12 @@ class OccupancyManager:
             long_term=config.reid.long_term,
             external_reid=config.reid.external_reid,
             appearance_continuity=config.reid.appearance_continuity,
+            swap_correction=config.reid.swap_correction,
             grace_period_seconds=config.timing.grace_period_seconds,
             event_sink=event_sink,
+            # Momentum du descripteur : lu depuis la configuration (il était
+            # codé en dur à 0.85 dans le constructeur de IdentityManager).
+            feature_momentum=config.reid.long_term.feature_momentum,
         )
         self.bbox_locker = bbox_locker
         self.anchor_stabilizer = anchor_stabilizer
@@ -185,6 +190,10 @@ class OccupancyManager:
         #: encore résolu par ``IdentityManager``) : elles ne doivent pas être
         #: conservées, contrairement aux profils indexés par ``person_id``.
         self._fallback_keys: set[int] = set()
+        #: Boîtes multi-personnes détectées sur la frame courante, indexées par
+        #: ``person_id`` : sert au signal B.5(a) — une identité perdue absorbée
+        #: par une boîte fusionnée ne doit pas être purgée silencieusement.
+        self._multi_person_frame: dict[int, dict[str, float | str]] = {}
 
     # ------------------------------------------------------------------
     # Clés de stabilisation : indexées par person_id, jamais par ID technique
@@ -411,7 +420,7 @@ class OccupancyManager:
         # la correction est journalisée avec sa raison et son seuil.
         raw_boxes: dict[int, np.ndarray] = {}
         corrected: dict[int, tuple[np.ndarray, tuple[float, float]]] = {}
-        multi_person_detected: dict[int, tuple[float, float, float, float]] = {}
+        multi_person_detected: dict[int, dict[str, float | str]] = {}
         self._raw_heights.clear()
         self._fallback_keys.clear()
         for detection in detections:
@@ -437,12 +446,13 @@ class OccupancyManager:
                         height_history=[stable_h] if stable_h else None,
                     )
                     if is_multi:
-                        multi_person_detected[technical_id] = (
-                            current_w,
-                            stable_w,
-                            ratio,
-                            thresh,
-                        )
+                        multi_person_detected[technical_id] = {
+                            "signal": "width_growth",
+                            "current_width": float(current_w),
+                            "stable_width": float(stable_w),
+                            "ratio": float(ratio),
+                            "threshold": float(thresh),
+                        }
 
             bbox = raw
             if self.bbox_locker is not None:
@@ -466,6 +476,49 @@ class OccupancyManager:
             raw_boxes[technical_id] = raw
             self._raw_heights[technical_id] = current_h
             corrected[technical_id] = (bbox, anchor)
+
+        # -- Second signal multi-personnes : le NOMBRE DE TÊTES DANS LA BOÎTE --
+        # Indépendant de tout historique : deux personnes assises côte à côte dès
+        # la première frame ne déclenchent jamais le signal de largeur (leur
+        # largeur fusionnée EST la référence). Ce signal n'existe que si le
+        # modèle pose tourne (``presence.head_assist.enabled``) et si au moins
+        # deux points de tête fiables tombent dans une même boîte. Quand
+        # l'assistance est désactivée, ce bloc ne s'exécute pas : le détecteur
+        # par largeur reste seul actif, exactement comme avant.
+        multi_head_cfg = self.config.geometry.multi_person_box
+        if (
+            self.config.presence.head_assist.enabled
+            and multi_head_cfg.enabled
+            and multi_head_cfg.head_count_enabled
+        ):
+            head_flags = detect_multi_person_by_head_count(
+                [detection.bbox for detection in detections],
+                [
+                    detection.head_point
+                    if (
+                        detection.head_confidence is not None
+                        and detection.head_confidence
+                        >= self.config.presence.head_assist.min_keypoint_confidence
+                    )
+                    else None
+                    for detection in detections
+                ],
+                multi_head_cfg.head_separation_ratio,
+            )
+            for head_index, info in head_flags.items():
+                head_tech_id = int(detections[head_index].technical_track_id)
+                multi_person_detected.setdefault(
+                    head_tech_id,
+                    {
+                        "signal": "head_count",
+                        "current_width": float(info["box_width"]),
+                        "stable_width": float(info["box_width"]),
+                        "ratio": 1.0,
+                        "threshold": float(multi_head_cfg.head_separation_ratio),
+                        "head_count": float(info["heads"]),
+                        "head_separation": float(info["separation"]),
+                    },
+                )
 
         # Échelle locale (zone morte, rayon d'ambiguïté) : alimentée par la
         # hauteur **stabilisée** de chaque personne (BBoxHeightLocker, clé
@@ -508,22 +561,33 @@ class OccupancyManager:
             self.profiler.record("reid", reid_timer.ms)
 
         # Signalement explicite des boîtes suspectées de contenir plusieurs personnes
+        self._multi_person_frame = {}
         for assignment in assignments:
             tech_id = int(assignment.technical_track_id)
             if tech_id in multi_person_detected and assignment.person_id:
-                curr_w, stab_w, r, th = multi_person_detected[tech_id]
+                info = multi_person_detected[tech_id]
+                self._multi_person_frame[int(assignment.person_id)] = info
                 self._emit(
                     "POSSIBLE_MULTI_PERSON_BOX",
                     timestamp_s,
                     frame_index,
                     person_id=int(assignment.person_id),
                     frame=int(frame_index),
-                    current_width=round(float(curr_w), 2),
-                    stable_width=round(float(stab_w), 2),
-                    ratio=round(float(r), 4),
-                    threshold=round(float(th), 4),
+                    current_width=round(float(info["current_width"]), 2),
+                    stable_width=round(float(info["stable_width"]), 2),
+                    ratio=round(float(info["ratio"]), 4),
+                    threshold=round(float(info["threshold"]), 4),
+                    signal=str(info["signal"]),
                     technical_track_id=tech_id,
                     bbox=[round(float(v), 2) for v in assignment.bbox],
+                    **(
+                        {
+                            "head_count": int(info["head_count"]),
+                            "head_separation": round(float(info["head_separation"]), 2),
+                        }
+                        if "head_count" in info
+                        else {}
+                    ),
                 )
 
         ambiguity_radius_px = self.scale.ratio_to_px(
@@ -736,6 +800,35 @@ class OccupancyManager:
                 neighbours.append(person_id)
         return sorted(neighbours)
 
+    def multi_person_neighbours(
+        self, track: PersonTrack, radius_px: float | None
+    ) -> list[int]:
+        """``person_id`` porteurs d'une boîte multi-personnes dans le rayon d'ambiguïté.
+
+        Réutilise exactement le même rayon que
+        :meth:`occluded_counted_neighbours` (``geometry.occlusion_ambiguity_ratio``)
+        au lieu d'introduire un second seuil de proximité : une identité perdue
+        à cet endroit précis est très probablement la personne **absorbée** par
+        la fusion, pas une personne réellement sortie.
+        """
+        if radius_px is None or not self._multi_person_frame:
+            return []
+        neighbours: list[int] = []
+        for person_id in self._multi_person_frame:
+            if person_id == track.person_id:
+                continue
+            other = self.tracks.get(person_id)
+            if other is None:
+                continue
+            distance = float(
+                np.hypot(
+                    track.anchor[0] - other.anchor[0], track.anchor[1] - other.anchor[1]
+                )
+            )
+            if distance <= radius_px:
+                neighbours.append(person_id)
+        return sorted(neighbours)
+
     # ------------------------------------------------------------------
     # Suivi d'une personne observée
     # ------------------------------------------------------------------
@@ -798,12 +891,19 @@ class OccupancyManager:
             track.drop_previous_height = ref_h
             track.drop_current_height = float(raw_height)
             track.drop_ratio = drop_ratio
-            if (
-                not self.config.presence.head_assist.enabled
-                and track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames
-            ):
+            if track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames:
                 # La chute s'est stabilisée (personne assise et restée assise) :
                 # réadaptation de l'historique de hauteur et réactivation de la fiabilité.
+                #
+                # Le terme « not head_assist.enabled » qui gardait cette branche a
+                # été retiré : dès que l'assistance tête était activée, une
+                # personne assise n'était PLUS jamais réadaptée, restait
+                # ``anchor_unreliable`` indéfiniment, sa coordonnée verticale
+                # gelée sur ``last_reliable_anchor``, et basculait en OCCULTEE à
+                # l'expiration de ``max_presence_extension_seconds``. La
+                # fonctionnalité censée gérer les personnes assises dégradait
+                # donc exactement ce cas. Les deux mécanismes coexistent :
+                # réadaptation de hauteur ET maintien par la tête.
                 track.height_history = [float(raw_height)]
                 track.height_drop_streak = 0
                 track.anchor_unreliable_reason = None
@@ -828,6 +928,10 @@ class OccupancyManager:
 
         track.current_head_point = getattr(assignment, "head_point", None)
         track.current_head_confidence = getattr(assignment, "head_confidence", None)
+        if track.current_head_point is not None:
+            # Fraîcheur du point tête (B.2) : « observé sur la frame courante ».
+            # ``_handle_missing`` comparera cet index à la frame courante.
+            track.head_point_frame_index = frame_index
 
         if reliable:
             track.last_reliable_anchor = effective_anchor
@@ -1013,14 +1117,55 @@ class OccupancyManager:
         if track.state is TrackState.ABSENTE:
             return
         previous_state = track.state
+
+        # -- B.5(a) Conséquence d'une boîte multi-personnes sur l'occupation --
+        # Une identité perdue dans le voisinage d'une boîte détectée comme
+        # contenant deux personnes est très probablement la personne ABSORBÉE par
+        # la fusion, pas une personne sortie. Elle ne doit donc pas être purgée
+        # silencieusement : elle reste dans le bilan (borne haute de
+        # l'encadrement, ``[observée, opérationnelle]``) et son absorption est
+        # journalisée explicitement. Aucune écriture dans ``_uncertain`` ici : la
+        # piste est encore présente, l'invariant ``opérationnel == observable +
+        # incertain`` serait rompu ; la purge éventuelle reste en ``uncertain``.
+        multi_neighbours = self.multi_person_neighbours(
+            track, self._occlusion_ambiguity_radius_px()
+        )
+        if multi_neighbours:
+            if not track.multi_person_absorption_reported:
+                track.multi_person_absorption_reported = True
+                self._emit(
+                    "INCONSISTENT_STATE",
+                    timestamp_s,
+                    frame_index,
+                    kind="identity_absorbed_by_multi_person_box",
+                    person_id=track.person_id,
+                    technical_track_id=track.technical_track_id,
+                    details=(
+                        "Identité perdue dans le rayon d'ambiguïté d'une boîte "
+                        f"détectée multi-personnes (person_id {multi_neighbours})"
+                    ),
+                    resolution=(
+                        "identité conservée dans la borne haute de l'occupation "
+                        "(opérationnelle), jamais purgée silencieusement"
+                    ),
+                )
+        else:
+            track.multi_person_absorption_reported = False
+
+        ha_cfg = self.config.presence.head_assist
+        head_fresh = (
+            track.head_point_frame_index is not None
+            and (frame_index - track.head_point_frame_index)
+            <= ha_cfg.max_head_staleness_frames
+        )
         if (
-            self.config.presence.head_assist.enabled
+            ha_cfg.enabled
             and track.state is TrackState.PRESENTE
             and track.current_head_point is not None
             and track.current_head_confidence is not None
-            and track.current_head_confidence >= self.config.presence.head_assist.min_keypoint_confidence
+            and track.current_head_confidence >= ha_cfg.min_keypoint_confidence
+            and head_fresh
         ):
-            ha_cfg = self.config.presence.head_assist
             if track.head_presence_first_s is None:
                 track.head_presence_first_s = timestamp_s
             elapsed = timestamp_s - track.head_presence_first_s
@@ -1455,11 +1600,19 @@ class OccupancyManager:
             # de l'occupation (spec 4.4), elle n'est jamais retirée en silence.
             self._uncertain.add(track.person_id)
             impact = "uncertain"
+        # B.5(a) : une purge consécutive à une absorption par une boîte
+        # multi-personnes porte une raison distincte — l'audit doit pouvoir
+        # séparer « personne peut-être encore là, absorbée » d'une simple
+        # expiration de grâce.
+        if track.multi_person_absorption_reported:
+            reason = "absorbed_by_multi_person_box"
+        else:
+            reason = "grace_expired_in_progress" if ambiguous else "grace_expired"
         self.identities.mark_purged(
             track.person_id,
             timestamp_s,
             frame_index,
-            reason="grace_expired_in_progress" if ambiguous else "grace_expired",
+            reason=reason,
             last_state=track.state.name,
             occupancy_impact=impact,
             grace_period_frames=None if self.budget is None else self.budget.grace_period_frames,

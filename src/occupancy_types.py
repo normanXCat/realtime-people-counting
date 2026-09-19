@@ -106,6 +106,15 @@ class PersonTrack:
     head_presence_expired: bool = False
     current_head_point: tuple[float, float] | None = None
     current_head_confidence: float | None = None
+    #: Index de la frame où ``current_head_point`` a été observé pour la
+    #: dernière fois. ``_handle_missing`` ne peut maintenir la présence que si ce
+    #: point a été vu sur la frame courante ou la précédente : au-delà, il ne
+    #: décrit plus l'image courante et maintiendrait une personne réellement
+    #: sortie du champ (paramètre ``presence.head_assist.max_head_staleness_frames``).
+    head_point_frame_index: int | None = None
+    #: Diagnostic (B.5) : l'absorption par une boîte multi-personnes a déjà été
+    #: journalisée pour cette piste — évite une ligne par frame.
+    multi_person_absorption_reported: bool = False
     #: Diagnostic : ensemble des track_id techniques ayant porté ce person_id.
     aliases: set[int] = field(default_factory=set)
 

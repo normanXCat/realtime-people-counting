@@ -183,7 +183,17 @@ def test_the_profile_is_released_once_the_person_is_gone(test_config, sink, fram
     sim.steps(6, [det(77, INSIDE_Y)])
     assert 1 in locker.tracks_profile
 
-    sim.steps(22)   # au-delà de la grâce : purge de la personne
+    # La personne n'est libérée du suivi qu'après la FENÊTRE de galerie réelle
+    # (grâce + rétention, dérivée de la configuration) : depuis le lot A.2 la
+    # rétention vaut 12 s et non plus la grâce — un littéral de frames mentirait.
+    window_frames = int(
+        (
+            manager.identities.grace_period_seconds
+            + manager.identities.purge_retention_seconds
+        )
+        * TEST_FPS
+    ) + 2
+    sim.steps(window_frames)
 
     assert manager.stabilization_keys() == set()
     assert locker.tracks_profile == {}

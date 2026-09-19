@@ -241,7 +241,10 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "ratio",
             "threshold",
         ),
-        optional=("frame", "technical_track_id", "bbox"),
+        optional=(
+            "frame", "technical_track_id", "bbox", "signal", "head_count",
+            "head_separation",
+        ),
     ),
     # -- Cohérence ---------------------------------------------------------
     "INCONSISTENT_STATE": EventSpec(

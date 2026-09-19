@@ -3,10 +3,12 @@
 Symptôme corrigé : une personne cachée longtemps, dont la piste technique a
 expiré, n'était plus jamais réassociée. Trois exigences sont vérifiées ici :
 
-1. la durée de rétention de la galerie d'apparence est **alignée** sur la période
-   de grâce d'occupation (``reid.long_term.gallery_retention_seconds: null``) :
-   la mémoire n'est jamais libérée avant que la personne n'ait eu une chance
-   réaliste de réapparaître ; un découplage explicite reste possible ;
+1. la durée de rétention de la galerie est **explicite**
+   (``reid.long_term.gallery_retention_seconds: 12.0``) : elle n'est plus alignée
+   sur la grâce d'occupation, car la fenêtre ``grâce + rétention`` de l'ancienne
+   valeur ``null`` (10 s) était INFÉRIEURE au maximum d'occlusion mesuré
+   (13,5 s). La mémoire n'est jamais libérée avant que la personne n'ait eu une
+   chance réaliste de réapparaître ;
 2. le seuil d'apparence peut être assoupli de façon **progressive** selon la
    durée d'absence — mais uniquement si un plancher est déclaré, et jamais en
    dessous de ce plancher (aucun assouplissement subi par défaut) ;
@@ -127,15 +129,17 @@ def enter(sim, track_id=1, x=150.0):
 # ---------------------------------------------------------------------------
 # 1. Durée de rétention : alignée sur la grâce, découplable explicitement
 # ---------------------------------------------------------------------------
-def test_retention_is_aligned_on_the_occupancy_grace_by_default(config):
+def test_retention_is_explicit_and_covers_the_longest_measured_occlusion(config):
+    """Lot A.2 : ``null`` -> 12,0 s (fenêtre totale 17 s > maximum mesuré 13,5 s)."""
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert config.reid.long_term.gallery_retention_seconds is None
-    assert manager.purge_retention_seconds == pytest.approx(
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(12.0)
+    assert manager.purge_retention_seconds == pytest.approx(12.0)
+    assert manager.purge_retention_seconds != pytest.approx(
         config.timing.grace_period_seconds
-    )
+    ), "la rétention est désormais découplée de la grâce d'occupation"
 
 
 def test_explicit_retention_decouples_the_memory_from_the_occupancy_grace():
@@ -283,8 +287,17 @@ def test_occlusion_beyond_retention_is_explicit_and_never_silent(long_config):
     enter(sim)
     assert manager.occupancy_operational == 1
 
-    # Fenêtre de galerie = grâce (3 s) + rétention (3 s) : 70 frames = 7 s.
-    sim.steps(70)
+    # Fenêtre de galerie = grâce (3 s) + rétention (12 s) = 15 s : il faut la
+    # dépasser réellement (le nombre de frames est dérivé de la configuration,
+    # pas codé en dur, sinon il mentirait dès que la rétention change).
+    window_frames = int(
+        (
+            long_config.timing.grace_period_seconds
+            + long_config.reid.long_term.gallery_retention_seconds
+        )
+        * TEST_FPS
+    ) + 2
+    sim.steps(window_frames)
     assert manager.occupancy_operational == 1
     assert manager.occupancy_observed == 0
     assert manager.occupancy_uncertain == 1

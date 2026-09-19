@@ -80,7 +80,11 @@ def test_yolo_threshold_is_low_enough_for_the_tracker_low_stage():
     assert config.model.confidence == pytest.approx(0.10)
     assert config.tracker.track_low_thresh == pytest.approx(0.1)
     assert config.tracker.track_high_thresh == pytest.approx(0.4)
-    assert config.tracker.new_track_thresh == pytest.approx(0.7)
+    # Lot A.1 : 0.7 -> 0.45. Une personne assise détectée à 0.35–0.6 était
+    # détectée mais ne pouvait jamais créer de piste après expiration de
+    # track_buffer. Le garde-fou faux positifs est reporté sur le filtre
+    # géométrique et sur timing.confirmation_seconds (testé dédié).
+    assert config.tracker.new_track_thresh == pytest.approx(0.45)
     assert config.model.confidence <= config.tracker.track_low_thresh
     assert coherence_warnings(config) == []
 
@@ -193,19 +197,27 @@ def test_diagnostics_section_is_exposed_and_configurable():
     assert "diagnostics" in config.to_dict()
 
 
-def test_gallery_retention_defaults_to_the_occupancy_grace_period():
-    """Par défaut, la mémoire d'apparence n'est pas libérée avant la grâce."""
+def test_gallery_retention_is_explicit_and_covers_the_longest_measured_occlusion():
+    """Lot A.2 : la rétention était ``null`` (= grâce = 5 s).
+
+    L'ancienne fenêtre totale ``grâce + rétention`` valait 10 s alors que les
+    occlusions mesurées sur les sessions réelles atteignent 13,5 s : les
+    occultations longues — celles qui posent problème — tombaient hors mémoire
+    par construction. Elle est désormais explicite (12 s), donc découplée de la
+    grâce d'occupation, et la fenêtre totale (17 s) couvre le maximum mesuré.
+    """
     config = load_config()
-    assert config.reid.long_term.gallery_retention_seconds is None
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(12.0)
     from identity_manager import IdentityManager
 
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert manager.purge_retention_seconds == pytest.approx(
-        config.timing.grace_period_seconds
-    )
+    assert manager.purge_retention_seconds == pytest.approx(12.0)
+    assert (
+        config.timing.grace_period_seconds + manager.purge_retention_seconds
+    ) >= 13.5, "la fenêtre totale doit couvrir le maximum d'occlusion mesuré"
 
 
 def test_gallery_retention_can_be_decoupled_explicitly():
