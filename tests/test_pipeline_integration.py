@@ -217,7 +217,17 @@ def test_reappearance_too_late_is_rejected(sim, sink):
     sim.warmup()
     sim.steps(2, [det(1, OUTSIDE_Y, x=150.0)])
     sim.steps(3, [det(1, INSIDE_Y, x=150.0)])
-    sim.steps(50)
+    # Fenêtre de galerie = grâce + rétention (1 s + 12 s = 13 s à 10 fps) :
+    # il faut la dépasser, sinon la réassociation est légitime et le test
+    # mesurerait autre chose que « trop tard ».
+    window_frames = int(
+        (
+            manager.config.timing.grace_period_seconds
+            + manager.config.reid.long_term.gallery_retention_seconds
+        )
+        * TEST_FPS
+    )
+    sim.steps(window_frames + 10)
     sink.events.clear()
     sim.steps(5, [det(99, INSIDE_Y, x=150.0)])
     assert sink.count("REID_MATCH") == 0, "hors fenêtre de galerie : pas de réassociation"

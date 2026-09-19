@@ -55,16 +55,32 @@ compromis dans `docs/rapport_final.md` § 4.6) :
   condition ; le compteur de stabilité est indexé par `person_id`, donc un
   changement d'identifiant technique réassocié ne le remet pas à zéro.
 - **Réidentification après occultation longue** :
-  `reid.long_term.gallery_retention_seconds: null` aligne la rétention de la
-  galerie d'apparence sur la grâce d'occupation (la mémoire n'est jamais libérée
-  avant que la personne n'ait eu une chance de réapparaître). Une tolérance
-  progressive du seuil, bornée, reste disponible mais désactivée par défaut.
+  `reid.long_term.gallery_retention_seconds: 12.0` (était `null`) **découple** la
+  rétention de la galerie d'apparence de la grâce d'occupation : la fenêtre totale
+  passe de 10 s à 17 s, ce qui couvre l'occlusion maximale mesurée (13,5 s) que
+  l'ancienne valeur alignée laissait sortir de mémoire par construction.
+  Une tolérance progressive du seuil, bornée, reste disponible mais désactivée par
+  défaut. Le descripteur d'apparence est un histogramme HSV **par bandes** sur crop
+  érodé (`reid.long_term.descriptor`), et le gel du descripteur pendant une
+  discontinuité d'apparence (`reid.appearance_continuity.freeze_gallery_frames`)
+  empêche la référence de dériver vers l'autre personne après un swap.
 - **Assistance par détection de tête (additif, désactivé par défaut)** :
   `presence.head_assist.enabled: false`. Conçu pour les amphithéâtres où les pieds
   sont masqués par les tables : utilise `yolo11s-pose.pt` (17 points-clés COCO) pour
   maintenir la présence d'une personne sans basculer à tort en `OCCULTEE`.
   Le point tête ne participe **jamais** au calcul de franchissement de ligne ni aux
-  décisions IN/OUT.
+  décisions IN/OUT. `keypoints_used` retient les 5 points-clés de tête (oreilles
+  incluses, elles seules survivent à une vue de profil) et
+  `max_head_staleness_frames` exige un point tête **frais** (frame courante ou
+  précédente) : les directions « poids du modèle pose », « SHA-256 du poids » et le
+  détail des correctifs occlusion sont dans `docs/correctif_occlusion.md`.
+
+> **`models/yolo11s-pose.pt` n'est pas versionné** (poids binaire). Il doit être
+> téléchargé depuis les releases officielles Ultralytics
+> (`https://github.com/ultralytics/assets/releases`), placé dans `models/`, et son
+> SHA-256 renseigné dans `presence.head_assist.pose_model_expected_sha256`. Sans ce
+> fichier, activer `presence.head_assist.enabled` fait échouer `verify_weights`
+> (`FileNotFoundError`, `main` retourne 3).
 
 ## Installation
 

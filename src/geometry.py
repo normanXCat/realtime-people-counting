@@ -463,6 +463,71 @@ def check_anchor_height_drop(
     return is_drop, float(drop_ratio), float(ref_height)
 
 
+def confident_head_points(
+    keypoints_xy: np.ndarray,
+    keypoints_conf: np.ndarray,
+    keypoints_used: tuple[str, ...],
+    min_confidence: float,
+) -> tuple[tuple[float, float], ...]:
+    """Tous les points-clés de tête **individuellement** fiables d'une détection.
+
+    Distinct de :func:`extract_head_point`, qui agrège ces points en **un** point
+    moyen : c'est ici leur multiplicité qui porte l'information. Deux têtes
+    distinctes dans une seule boîte se manifestent par deux points-clés de tête
+    éloignés, pas par un point moyen qui se situe entre les deux personnes.
+    """
+    points: list[tuple[float, float]] = []
+    for name in keypoints_used:
+        index = COCO_HEAD_KEYPOINTS.get(name)
+        if index is None:
+            continue
+        if float(keypoints_conf[index]) < min_confidence:
+            continue
+        points.append(
+            (float(keypoints_xy[index, 0]), float(keypoints_xy[index, 1]))
+        )
+    return tuple(points)
+
+
+def heads_suggest_merge(
+    head_points: Sequence[Point],
+    box_width: float,
+    min_separation_ratio: float = 0.4,
+) -> tuple[bool, float]:
+    """Deux têtes séparées dans une seule boîte : signal de fusion de personnes.
+
+    Combler l'angle mort du détecteur par largeur : celui-ci exige un historique
+    de largeur d'**avant** la fusion, donc deux personnes assises côte à côte dès
+    la première frame ne produisent jamais le signal (leur largeur fusionnée
+    *est* la référence). Le nombre de têtes détectées à l'intérieur de la boîte
+    ne dépend d'aucun historique : dès la première frame où le modèle pose pose
+    les points-clés, deux têtes séparées de plus de
+    ``min_separation_ratio × largeur_boîte`` valent fusion.
+
+    Args:
+        head_points: points-clés de tête **confiants** de cette détection.
+        box_width: largeur de la boîte englobante, en pixels.
+        min_separation_ratio: séparation relative minimale (fraction de la
+            largeur) entre deux têtes pour conclure à une fusion.
+
+    Returns:
+        ``(fusion, separation_max)`` — ``separation_max`` est la plus grande
+        distance horizontale observée entre deux têtes, en pixels (``0.0`` si
+        moins de deux têtes). Elle est journalisée pour permettre la calibration
+        sans réexécuter le pipeline.
+    """
+    width = float(box_width)
+    if width <= 0 or len(head_points) < 2:
+        return False, 0.0
+    separation_max = 0.0
+    for index, first in enumerate(head_points):
+        for second in head_points[index + 1:]:
+            separation = abs(float(first[0]) - float(second[0]))
+            if separation > separation_max:
+                separation_max = separation
+    return separation_max > float(min_separation_ratio) * width, float(separation_max)
+
+
 def check_box_width_growth(
     current_width: float,
     width_history: Sequence[float],

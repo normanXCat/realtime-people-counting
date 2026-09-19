@@ -241,7 +241,20 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "ratio",
             "threshold",
         ),
-        optional=("frame", "technical_track_id", "bbox"),
+        optional=(
+            "frame", "technical_track_id", "bbox",
+            # ``signal`` : signal PRINCIPAL retenu — "width_growth" (historique
+            # de largeur) ou "multiple_heads" (deux têtes séparées dans la
+            # boîte, seul signal disponible dès la première frame).
+            # ``head_separation_px`` est renseigné dès que le signal de têtes a
+            # été mesuré, même quand le signal par largeur est le principal : les
+            # deux preuves restent ainsi lisibles dans le journal.
+            "signal", "head_separation_px",
+            # Arbitrage d'occupation : rayon d'ambiguïté appliqué et personnes
+            # déjà comptées, perdues dans ce rayon — celles-ci doivent rester
+            # comptées en borne haute, jamais purgées comme une sortie.
+            "ambiguity_radius_px", "lost_counted_neighbours",
+        ),
     ),
     # -- Cohérence ---------------------------------------------------------
     "INCONSISTENT_STATE": EventSpec(

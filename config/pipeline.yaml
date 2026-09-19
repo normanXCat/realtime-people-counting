@@ -44,6 +44,31 @@ tracker:
   track_high_thresh: 0.4    # plancher de l'association principale
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
   new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
+  # -- Mesure des trois seuils BoT-SORT : AUCUN n'est modifié ----------------
+  # Le correctif « occlusion dense » proposait match_thresh 0,9 -> 0,75,
+  # proximity_thresh 0,5 -> 0,8 et new_track_thresh 0,7 -> 0,45 (justification :
+  # match_thresh est un seuil de COÛT, `linear_assignment(dists, thresh=...)`
+  # avec dists = 1 - IoU, donc 0,9 accepte un appariement à IoU 0,1 ; et
+  # proximity_thresh neutralise le ReID natif exactement quand la personne
+  # ressort d'une occlusion). La mesure isolée de chaque seuil a été refaite
+  # (scripts/measure_tracker_swaps.py, 300 frames de
+  # test/5121204_School_Classroom_1280x720.mp4, un seuil à la fois puis les
+  # trois ensemble) ; résultat « identifiants techniques créés / changements
+  # d'identifiant », l'objectif étant de MINIMISER les deux :
+  #   0,9 / 0,5 / 0,7 (production)   -> 11 / 4
+  #   match_thresh 0,75 seul         -> 12 / 5   (dégradation)
+  #   proximity_thresh 0,8 seul      -> 11 / 4   (aucun effet mesurable)
+  #   new_track_thresh 0,45 seul     -> 13 / 4   (+2 identités créées)
+  #   les trois ensemble             -> 15 / 8   (dégradation nette)
+  # Aucun des trois n'est retenu : le seul effet net mesuré est défavorable à la
+  # stabilité d'identité, et le correctif groupé qui les avait appliqués a été
+  # annulé pour cette raison (git d4915b5). Le compromis de new_track_thresh
+  # 0,45 est réel — il autorise une personne partiellement masquée à recréer une
+  # piste (symptôme 2, new_track_thresh 0,7 l'en empêche) — mais il crée 2
+  # identités supplémentaires sur 12 s sans réduire les changements
+  # d'identifiant : il reste PROVISOIRE et NON appliqué, faute d'un corpus
+  # annoté où l'on peut vérifier qu'une réapparition réelle devient la même
+  # personne. Voir docs/correctif_occlusion.md pour le tableau complet.
 
   # -- Persistance de piste et ré-identification native -------------------
   # track_buffer : nombre de frames pendant lesquelles une piste perdue reste
@@ -54,7 +79,19 @@ tracker:
   # relais. Compromis : plus long = moins de changements d'identifiant technique,
   # mais plus de mémoire/calcul et un risque légèrement accru de réassociation
   # erronée en forte densité de personnes d'apparence similaire.
-  track_buffer: 150
+  track_buffer: 150   # EN FRAMES — voir l'avertissement de base de temps ci-dessous
+  # -- Incohérence de base de temps (documentée, PAS corrigée) --------------
+  # `track_buffer` ci-dessus est en FRAMES, alors que la galerie ReID de la
+  # section `reid` est en SECONDES : les deux mécanismes de mémoire ne couvrent
+  # donc pas la même durée selon la source. Sur fichier vidéo à 30 ips, 150
+  # frames ≈ 5 s de contenu ; sur caméra live à ~3,5 FPS traités, 150 frames
+  # ≈ 43 s de temps réel — bien plus que la fenêtre de galerie
+  # (grâce 5 s + rétention 12 s = 17 s). Aucune conversion automatique n'est
+  # appliquée : elle supposerait un FPS connu à l'avance, ce que
+  # `timing.fps_source: measured` interdit. Un avertissement est émis au
+  # démarrage quand la source est une caméra live (src/main.py), une fois le FPS
+  # réellement mesuré, pour que la divergence soit visible dans le journal
+  # plutôt que découverte après coup dans les mesures.
   # with_reid : module d'apparence de BoT-SORT. Il tente une réassociation AVANT
   # de créer un nouvel identifiant technique, en complément du ReID long terme
   # de IdentityManager (qui, lui, opère après expiration de la piste technique).
@@ -75,7 +112,18 @@ reid:
   # la piste technique (spec 3.3). Désactivable pour la baseline 1 (spec 9.4).
   long_term:
     enabled: true
-    similarity_threshold: 0.40   # PROVISOIRE — à calibrer
+    # PROVISOIRE — à calibrer. Valeur NON modifiée (0,40) : la mesure faite au
+    # lot B.4 (scripts/measure_descriptor_similarity.py, 300 frames de
+    # test/5121204_School_Classroom_1280x720.mp4, 762 paires intra / 1019 paires
+    # inter) montre que le nouveau descripteur par bandes sépare désormais les
+    # distributions — p95 inter 0,608 contre p5 intra 0,911 — là où l'ancien
+    # descripteur les faisait se recouvrir (p95 inter 0,840). À 0,40, ~25 % des
+    # paires INTER-personnes passent encore le seuil (p75 inter = 0,420).
+    # Valeur proposée : 0,65, soit juste au-dessus du p95 inter (0,608) tout en
+    # restant très en dessous du p5 intra (0,911). Elle n'est PAS appliquée ici :
+    # elle doit être calibrée sur un ensemble DISJOINT de l'ensemble de test
+    # avant d'être figée (spec 9.1). Voir docs/correctif_occlusion.md §B.4.
+    similarity_threshold: 0.40   # PROVISOIRE — proposition 0,65, non appliquée
     safety_margin: 0.10          # PROVISOIRE — écart minimal au second candidat
     v_max_ratio: 1.5             # hauteurs de bbox / seconde
     spatial_margin_ratio: 0.3    # tolérance additionnelle (fraction de hauteur)
@@ -88,13 +136,21 @@ reid:
     gallery_min_crop_height_px: 32
     gallery_min_crop_width_px: 16
     gallery_min_sharpness: 0.0   # variance du Laplacien ; 0 = contrôle désactivé
-    # Rétention de la galerie d'apparence APRÈS purge de l'identité. null =
-    # alignée sur timing.grace_period_seconds : la mémoire d'apparence n'est
-    # jamais libérée avant que la personne n'ait eu une chance réaliste de
-    # réapparaître (fenêtre totale = grâce + rétention, soit 2 × grâce par
-    # défaut). Une valeur explicite découple la mémoire ReID de la grâce
-    # d'occupation et doit être justifiée.
-    gallery_retention_seconds: null
+    # Rétention de la galerie d'apparence APRÈS purge de l'identité.
+    # 12,0 s — ÉTAIT `null` (= alignée sur grace_period_seconds = 5,0 s), donc
+    # fenêtre totale passée de grâce + grâce = 10 s à grâce + 12 = 17 s.
+    # Raison : `within_gallery_window` (src/identity_manager.py) donne une
+    # fenêtre totale `grace_period_seconds + purge_retention_seconds` ; avec
+    # `null` elle valait 10 s. Or les occultations mesurées sur les sessions
+    # réelles montent à 13,5 s (rapport final §4.6) : les occultations longues
+    # — précisément celles qui posent problème — sortaient de mémoire par
+    # construction. Compromis accepté : une identité purgée reste ré-associable
+    # plus longtemps, au prix d'un risque accru de réassociation erronée si une
+    # personne différente, d'apparence proche, réapparaît dans la même zone dans
+    # les 17 s. Le garde-fou reste `similarity_threshold` + `safety_margin`,
+    # inchangés, et la purge du person_id continue d'être journalisée
+    # explicitement.
+    gallery_retention_seconds: 12.0
     # Tolérance progressive du seuil d'apparence selon la durée d'absence (une
     # longue occultation change un peu l'apparence : angle, luminosité). Le seuil
     # descend linéairement de similarity_threshold vers ce plancher au bout de
@@ -102,6 +158,33 @@ reid:
     # est choisi explicitement pour ne pas provoquer de fausses réassociations.
     long_absence_seconds: 2.0
     long_absence_similarity_floor: null
+    # Momentum de la moyenne glissante du descripteur de galerie (`_blend`).
+    # ÉTAIT codé en dur à 0,85 dans le constructeur de IdentityManager, donc
+    # invisible et non réglable. Valeur inchangée (0,85) : élevée, elle garde une
+    # référence stable face au bruit de détection. Compromis : elle dérive vite
+    # vers l'autre personne après un swap NON détecté — c'est précisément ce que
+    # corrige le gel du descripteur ci-dessous (appearance_continuity), qui est
+    # la vraie protection ; le momentum reste PROVISOIRE, borné à [0, 1[.
+    feature_momentum: 0.85
+    # Paramètres du descripteur d'apparence léger (HSV). Le descripteur
+    # historique (histogramme H×S sur le crop COMPLET) encodait surtout la
+    # couleur des chaises, tables et du mur : deux personnes de la même rangée
+    # atteignaient une similarité > 0,9 alors que similarity_threshold vaut 0,40.
+    descriptor:
+      # Fraction rognée de CHAQUE côté en largeur (0,15 = 15 %) : c'est le bord
+      # de la boîte qui avale le fond et les voisins. Compromis : un rognage plus
+      # fort écarte mieux le fond mais ampute aussi les épaules, donc le
+      # vêtement — la seule information réellement propre à la personne.
+      horizontal_crop_ratio: 0.15
+      # 3 bandes : tête / torse / bas. Chaque bande a son propre histogramme,
+      # normalisé séparément, sinon une bande très colorée écraserait les autres.
+      bands: 3
+      # Poids par bande, de la plus haute à la plus basse. La bande basse est
+      # pondérée à 0,5 : elle est la plus souvent occultée par une table ou une
+      # chaise, donc la moins informative en salle de cours.
+      band_weights: [1.0, 1.0, 0.5]
+      bins_hue: 24
+      bins_saturation: 8
   # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
   # uniquement : si false, le descripteur léger HSV est utilisé.
   external_reid:
@@ -133,6 +216,15 @@ reid:
     # tant que la continuité n'est pas rétablie, et au plus une fois par
     # intervalle.
     min_interval_seconds: 1.0
+    # Nombre de frames pendant lesquelles le descripteur de galerie de
+    # l'identité est GELÉ après une discontinuité d'apparence sur sa piste.
+    # Sans ce gel, `_touch` mélangeait à chaque frame l'apparence courante dans
+    # `record.feature` : au bout de 5 frames (≈ 1,4 s au FPS mesuré de 3,5) la
+    # référence contenait 1 − 0,85⁵ ≈ 56 % de l'apparence de l'AUTRE personne,
+    # donc `_correct_cross_swaps` devenait aveugle exactement quand le swap
+    # s'installait. 3 frames = équivalent de min_interval_seconds (1,0 s) au FPS
+    # de traitement mesuré ; borne minimale 3, imposée par la validation.
+    freeze_gallery_frames: 3
 
   # -- Correction active des inversions d'identité (swap) ------------------
   # Réintroduit le comportement [RE-ID-LOCK] de l'ancien IDManager : compare
@@ -170,6 +262,15 @@ geometry:
   multi_person_box:
     enabled: true
     max_growth_ratio: 1.6      # PROVISOIRE — à calibrer sur des cas confirmés de fusion
+    # Second signal, INDÉPENDANT de l'historique de largeur : deux jeux de
+    # points-clés de tête confiants et séparés de plus de 0,4 × largeur de boîte
+    # dans UNE SEULE boîte valent fusion, dès la première frame. Lève l'angle
+    # mort du signal par largeur : deux personnes assises côte à côte dès la
+    # première frame ne produisent jamais celui-ci, leur largeur fusionnée étant
+    # la référence. Sans effet tant que `presence.head_assist.enabled` est faux
+    # (les points-clés proviennent du modèle pose) : le signal par largeur reste
+    # alors seul actif, comportement inchangé.
+    head_separation_ratio: 0.4  # PROVISOIRE — à calibrer sur des cas confirmés de fusion
 
 anchor:
   height_history_window_frames: 30      # fenêtre pour estimer la hauteur "normale" de la piste
@@ -246,5 +347,17 @@ presence:
     pose_model_path: models/yolo11s-pose.pt
     pose_model_expected_sha256: null      # à renseigner une fois le poids téléchargé
     min_keypoint_confidence: 0.5          # PROVISOIRE — à calibrer
-    keypoints_used: [nose, left_eye, right_eye]
+    # 5 points-clés — ÉTAIENT 3 (nez + les deux yeux), alors que le rapport
+    # §4.7 en annonçait 5. Les oreilles sont précisément les points qui
+    # survivent à une vue de profil : sans elles, une personne de trois quarts
+    # tournée n'a plus de point tête fiable et l'assistance retombe en
+    # « tête non confiante » comme si la tête était invisible.
+    keypoints_used: [nose, left_eye, right_eye, left_ear, right_ear]
     max_presence_extension_seconds: 10.0  # PROVISOIRE — borne de sécurité
+    # Écart maximal (frames) entre la frame courante et celle où le point tête a
+    # été observé, pour autoriser un maintien de présence dans _handle_missing.
+    # 1 = la frame courante ou la précédente. Sans cette borne, la piste relisait
+    # un point tête figé lors de la dernière frame OBSERVÉE (les keypoints sont
+    # extraits de la même détection que la boîte : pas de boîte, pas de point) et
+    # pouvait maintenir jusqu'à 10 s une personne réellement sortie du champ.
+    max_head_staleness_frames: 1

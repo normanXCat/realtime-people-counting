@@ -58,13 +58,38 @@ class AppearanceExtractor(Protocol):
 
 
 class HistogramAppearanceExtractor:
-    """Descripteur léger couleur (HSV), sans dépendance à torch.
+    """Descripteur léger couleur (HSV) **par bandes horizontales**, sans torch.
 
     C'est l'extracteur par défaut : rapide, déterministe, sans téléchargement de
     poids. Il reprend la signature de ``IDManager.appearance`` (audit §2.1 a).
+
+    Le descripteur historique calculait un histogramme teinte × saturation
+    (24 × 8) sur le **crop complet**. En salle de cours, il encodait donc
+    principalement la couleur des chaises, des tables et du mur derrière : deux
+    personnes différentes de la même rangée donnaient couramment une similarité
+    cosinus > 0,9 alors que ``similarity_threshold`` vaut 0,40 — l'écart
+    inter-personnes était inférieur au bruit du descripteur, ce qui est la cause
+    structurelle des réassociations croisées.
+
+    Trois changements, dans cet ordre :
+
+    1. le crop est **érodé** horizontalement (``horizontal_crop_ratio`` de chaque
+       côté) : c'est le bord de la boîte qui avale le fond et les voisins ;
+    2. le crop rogné est découpé en ``bands`` bandes horizontales (tête / torse /
+       bas), chacune décrite par son propre histogramme H×S, **normalisé
+       séparément** ;
+    3. chaque bande est pondérée (``band_weights``), la bande basse plus
+       faiblement puisqu'elle est la plus souvent occultée par une table, puis
+       les bandes sont concaténées et l'ensemble renormalisé (contrat
+       « descripteur L2-normalisé » du protocole : le poids relatif des bandes
+       est conservé).
+
+    La dimension du descripteur devient ``bands × bins_hue × bins_saturation``.
+    ``_blend`` gère déjà un changement de dimension (il repart du descripteur
+    courant) et aucun descripteur n'est persisté entre deux sessions.
     """
 
-    name = "histogram_hsv"
+    name = "histogram_hsv_bands"
 
     def __init__(
         self,
@@ -72,11 +97,33 @@ class HistogramAppearanceExtractor:
         bins_saturation: int = 8,
         min_width: int = 8,
         min_height: int = 16,
+        horizontal_crop_ratio: float = 0.15,
+        bands: int = 3,
+        band_weights: Sequence[float] | None = None,
     ) -> None:
         self.bins_hue = int(bins_hue)
         self.bins_saturation = int(bins_saturation)
         self.min_width = int(min_width)
         self.min_height = int(min_height)
+        self.horizontal_crop_ratio = float(horizontal_crop_ratio)
+        self.bands = max(1, int(bands))
+        weights = tuple(float(weight) for weight in (band_weights or ()))
+        if len(weights) < self.bands:
+            # Pondération incomplète : complétée par le poids neutre, plutôt que
+            # de laisser une bande silencieusement sans poids.
+            weights = weights + (1.0,) * (self.bands - len(weights))
+        self.band_weights = weights[: self.bands]
+
+    @classmethod
+    def from_config(cls, descriptor) -> "HistogramAppearanceExtractor":
+        """Construit l'extracteur depuis ``reid.long_term.descriptor``."""
+        return cls(
+            bins_hue=descriptor.bins_hue,
+            bins_saturation=descriptor.bins_saturation,
+            horizontal_crop_ratio=descriptor.horizontal_crop_ratio,
+            bands=descriptor.bands,
+            band_weights=descriptor.band_weights,
+        )
 
     def describe(self, frame: np.ndarray, bbox: Sequence[float]) -> np.ndarray | None:
         height, width = frame.shape[:2]
@@ -85,15 +132,41 @@ class HistogramAppearanceExtractor:
         x2, y2 = min(width, x2), min(height, y2)
         if x2 - x1 < self.min_width or y2 - y1 < self.min_height:
             return None
+
+        margin = int(round((x2 - x1) * self.horizontal_crop_ratio))
+        if margin > 0:
+            x1, x2 = x1 + margin, x2 - margin
+        if x2 - x1 < self.min_width or y2 - y1 < self.min_height:
+            return None
+
         crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        histogram = cv2.calcHist(
-            [hsv], [0, 1], None,
-            [self.bins_hue, self.bins_saturation], [0, 180, 0, 256],
-        )
-        flat = histogram.flatten().astype(np.float32)
-        norm = float(np.linalg.norm(flat))
-        return None if norm < 1e-8 else flat / norm
+        band_height = crop.shape[0] // self.bands
+        if band_height < 1:
+            return None
+
+        parts: list[np.ndarray] = []
+        for index in range(self.bands):
+            top = index * band_height
+            # La dernière bande absorbe les lignes restantes : aucune ligne du
+            # crop rogné n'est perdue par un arrondi de division.
+            bottom = crop.shape[0] if index == self.bands - 1 else top + band_height
+            band = crop[top:bottom]
+            if band.size == 0:
+                return None
+            hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+            histogram = cv2.calcHist(
+                [hsv], [0, 1], None,
+                [self.bins_hue, self.bins_saturation], [0, 180, 0, 256],
+            )
+            flat = histogram.flatten().astype(np.float32)
+            norm = float(np.linalg.norm(flat))
+            if norm < 1e-8:
+                return None
+            parts.append(flat / norm * float(self.band_weights[index]))
+
+        concatenated = np.concatenate(parts)
+        norm = float(np.linalg.norm(concatenated))
+        return None if norm < 1e-8 else concatenated / norm
 
 
 class DeepAppearanceExtractor:
@@ -237,6 +310,13 @@ class IdentityRecord:
     purge_reason: str | None = None
     observations: int = 0
     aliases: set[int] = field(default_factory=set)
+    #: Frame jusqu'à laquelle la mise à jour du descripteur d'apparence est
+    #: **gelée** sur cette identité. Armé par ``_check_appearance_continuity``
+    #: quand une discontinuité d'apparence est détectée sur la piste technique
+    #: qui porte cette identité ; honoré par ``_touch``. Sans ce gel, la
+    #: référence dérive vers l'autre personne d'un swap non détecté et la
+    #: correction croisée devient aveugle exactement quand elle servirait.
+    appearance_suspect_until_frame: int | None = None
     #: Dernière raison de rejet d'apparence (`REID_DESCRIPTOR_REJECTED`). Sert à
     #: ne journaliser qu'un changement de situation, jamais une ligne par frame.
     last_rejection: str | None = None
@@ -268,7 +348,7 @@ class IdentityManager:
         grace_period_seconds: float = 5.0,
         appearance: AppearanceExtractor | None = None,
         event_sink: EventSink | None = None,
-        feature_momentum: float = 0.85,
+        feature_momentum: float | None = None,
     ) -> None:
         self.long_term = long_term or LongTermReidConfig()
         self.external_reid = external_reid or ExternalReidConfig()
@@ -301,10 +381,20 @@ class IdentityManager:
         self.appearance: AppearanceExtractor = appearance or (
             DeepAppearanceExtractor(self.external_reid)
             if self.external_reid.enabled
-            else HistogramAppearanceExtractor()
+            else HistogramAppearanceExtractor.from_config(self.long_term.descriptor)
         )
         self.event_sink = event_sink
-        self.feature_momentum = float(feature_momentum)
+        # Le momentum vit dans la configuration (``reid.long_term.feature_momentum``)
+        # et non plus en dur ici : il était impossible de le régler sans toucher au
+        # code, alors qu'il gouverne la vitesse de dérive du descripteur de galerie
+        # après un swap. Le paramètre du constructeur reste une surcharge explicite
+        # (tests, ablations) qui prime sur la configuration.
+        self.feature_momentum = float(
+            self.long_term.feature_momentum if feature_momentum is None else feature_momentum
+        )
+        #: Durée (frames) pendant laquelle le descripteur de galerie est gelé après
+        #: une discontinuité d'apparence sur la piste.
+        self.freeze_gallery_frames = int(self.appearance_continuity.freeze_gallery_frames)
 
         self.records: dict[int, IdentityRecord] = {}
         self.technical_to_person: dict[int, int] = {}
@@ -746,6 +836,11 @@ class IdentityManager:
             # Continuité rétablie : la piste peut être signalée à nouveau plus tard.
             self._discontinuity_active.discard(int(technical_id))
             return
+        # Apparence suspecte : la référence de galerie de cette identité est gelée
+        # (ré-armé à chaque frame où la discontinuité persiste, y compris quand la
+        # limitation de débit supprime l'événement — le gel suit l'état réel de la
+        # piste, pas la journalisation).
+        self._mark_appearance_suspect(int(technical_id), frame_index)
         if int(technical_id) in self._discontinuity_active:
             return
         last_emit = self._last_continuity_emit_s.get(int(technical_id))
@@ -1108,13 +1203,41 @@ class IdentityManager:
         record.purge_reason = None
         rejection, threshold, measured = self._gallery_rejection(observation, feature, frame)
         if rejection is None:
-            record.feature = _blend(record.feature, feature, self.feature_momentum)
             record.last_rejection = None
+            if self._appearance_is_frozen(record, frame_index):
+                # Descripteur gelé le temps de la discontinuité : seul le
+                # descripteur est concerné. La position, la hauteur, `live` et
+                # `last_seen_s` ont déjà été mis à jour ci-dessus.
+                return
+            record.feature = _blend(record.feature, feature, self.feature_momentum)
             return
         # Apparence refusée : l'apparence connue est conservée telle quelle.
         self._report_descriptor_rejection(
             record, observation, rejection, threshold, measured, timestamp_s, frame_index
         )
+
+    def _appearance_is_frozen(self, record: IdentityRecord, frame_index: int) -> bool:
+        """La mise à jour du descripteur de cette identité est-elle gelée ?"""
+        deadline = record.appearance_suspect_until_frame
+        return deadline is not None and int(frame_index) <= int(deadline)
+
+    def _mark_appearance_suspect(self, technical_id: int, frame_index: int) -> None:
+        """Gèle le descripteur de l'identité portée par ``technical_id``.
+
+        Une discontinuité d'apparence sur une piste signifie que la référence
+        d'apparence n'est plus fiable pour cette piste : continuer à la mélanger
+        ferait basculer ``record.feature`` vers l'apparence de l'autre personne,
+        ce qui rendrait la correction croisée (``_correct_cross_swaps``, qui
+        compare l'apparence courante à ``record.feature``) aveugle au moment
+        précis où le swap s'installe.
+        """
+        person_id = self.technical_to_person.get(int(technical_id))
+        if person_id is None:
+            return
+        record = self.records.get(person_id)
+        if record is None:
+            return
+        record.appearance_suspect_until_frame = int(frame_index) + self.freeze_gallery_frames
 
     def _report_descriptor_rejection(
         self,

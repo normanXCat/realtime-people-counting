@@ -183,7 +183,18 @@ def test_the_profile_is_released_once_the_person_is_gone(test_config, sink, fram
     sim.steps(6, [det(77, INSIDE_Y)])
     assert 1 in locker.tracks_profile
 
-    sim.steps(22)   # au-delà de la grâce : purge de la personne
+    # La libération du profil suit celle de l'identité dans la galerie, donc la
+    # fenêtre TOTALE : grâce (1 s) + rétention d'apparence (12 s) = 13 s à
+    # 10 fps. La rétention n'est plus alignée sur la grâce depuis qu'elle couvre
+    # les occultations longues mesurées (jusqu'à 13,5 s).
+    window_frames = int(
+        (
+            manager.config.timing.grace_period_seconds
+            + manager.config.reid.long_term.gallery_retention_seconds
+        )
+        * TEST_FPS
+    )
+    sim.steps(window_frames + 10)
 
     assert manager.stabilization_keys() == set()
     assert locker.tracks_profile == {}

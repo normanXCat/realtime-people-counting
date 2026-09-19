@@ -57,13 +57,21 @@ from identity_manager import IdentityManager, Observation  # noqa: E402
 
 
 def build_tracker_variant(
-    config, *, track_buffer: int, appearance_thresh: float, proximity_thresh: float
+    config,
+    *,
+    track_buffer: int,
+    appearance_thresh: float,
+    proximity_thresh: float,
+    match_thresh: float,
+    new_track_thresh: float,
 ) -> Path:
     """Écrit un YAML BoT-SORT dérivé de la configuration de production.
 
     Une mesure ne doit jamais réécrire ``src/configs/custom_botsort.yaml`` : la
     variante est écrite dans ``results/tracker_variants/`` et le fichier de
-    référence reste la source de vérité.
+    référence reste la source de vérité. Les cinq seuils sont écrits ensemble
+    pour qu'un seuil isolé (``--match-thresh`` seul, par exemple) ne soit pas
+    silencieusement écrasé par la valeur de production des autres.
     """
     base = yaml.safe_load(
         (REPO_ROOT / config.tracker.config_path).read_text(encoding="utf-8")
@@ -71,11 +79,14 @@ def build_tracker_variant(
     base["track_buffer"] = int(track_buffer)
     base["appearance_thresh"] = float(appearance_thresh)
     base["proximity_thresh"] = float(proximity_thresh)
+    base["match_thresh"] = float(match_thresh)
+    base["new_track_thresh"] = float(new_track_thresh)
     out_dir = REPO_ROOT / config.output.session_root / "tracker_variants"
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / (
         f"botsort_b{int(track_buffer)}_a{float(appearance_thresh):.2f}"
-        f"_p{float(proximity_thresh):.2f}.yaml"
+        f"_p{float(proximity_thresh):.2f}_m{float(match_thresh):.2f}"
+        f"_n{float(new_track_thresh):.2f}.yaml"
     )
     path.write_text(yaml.safe_dump(base, allow_unicode=True, sort_keys=True), encoding="utf-8")
     return path
@@ -86,10 +97,15 @@ def measure(args: argparse.Namespace) -> dict:
     from ultralytics import YOLO
 
     config = load_config(args.config)
+    # Chaque seuil est surchargeable ISOLÉMENT : c'est ce qui permet de mesurer
+    # l'effet propre d'un seuil au lieu du paquet des trois (une mesure groupée
+    # ne peut pas distinguer un gain d'une régression compensée).
     if (
         args.track_buffer is not None
         or args.appearance_thresh is not None
         or args.proximity_thresh is not None
+        or args.match_thresh is not None
+        or args.new_track_thresh is not None
     ):
         config = override_config(
             config,
@@ -105,6 +121,16 @@ def measure(args: argparse.Namespace) -> dict:
                         args.proximity_thresh
                         if args.proximity_thresh is not None
                         else config.tracker.proximity_thresh
+                    ),
+                    "match_thresh": (
+                        args.match_thresh
+                        if args.match_thresh is not None
+                        else config.tracker.match_thresh
+                    ),
+                    "new_track_thresh": (
+                        args.new_track_thresh
+                        if args.new_track_thresh is not None
+                        else config.tracker.new_track_thresh
                     ),
                 }
             },
@@ -136,6 +162,8 @@ def measure(args: argparse.Namespace) -> dict:
         track_buffer=config.tracker.track_buffer,
         appearance_thresh=config.tracker.appearance_thresh,
         proximity_thresh=config.tracker.proximity_thresh,
+        match_thresh=config.tracker.match_thresh,
+        new_track_thresh=config.tracker.new_track_thresh,
     )
 
     identities = IdentityManager(
@@ -202,6 +230,7 @@ def measure(args: argparse.Namespace) -> dict:
             "match_thresh": float(config.tracker.match_thresh),
             "proximity_thresh": float(config.tracker.proximity_thresh),
             "appearance_thresh": float(config.tracker.appearance_thresh),
+            "new_track_thresh": float(config.tracker.new_track_thresh),
         },
         "appearance_continuity": {
             "similarity_threshold": float(
@@ -236,6 +265,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--track-buffer", type=int, default=None)
     parser.add_argument("--appearance-thresh", type=float, default=None)
     parser.add_argument("--proximity-thresh", type=float, default=None)
+    parser.add_argument(
+        "--match-thresh", type=float, default=None,
+        help="Seuil de coût de l'association IoU (1 - IoU), mesuré isolément",
+    )
+    parser.add_argument(
+        "--new-track-thresh", type=float, default=None,
+        help="Plancher de création d'une nouvelle piste (mesuré isolément)",
+    )
     parser.add_argument(
         "--continuity-threshold", type=float, default=None,
         help="Seuil de similarité du garde-fou de swap (permet de balayer les seuils)",

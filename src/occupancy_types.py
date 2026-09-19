@@ -106,6 +106,13 @@ class PersonTrack:
     head_presence_expired: bool = False
     current_head_point: tuple[float, float] | None = None
     current_head_confidence: float | None = None
+    #: Index de la frame où ``current_head_point`` a été observé. Les keypoints
+    #: sont extraits de la même détection que la boîte : sans boîte, pas de point
+    #: tête. Ce champ rend explicite la **fraîcheur** de la donnée, sans quoi une
+    #: piste non observée peut maintenir sa présence sur un point tête figé lors
+    #: de la dernière frame où la personne était vue — donnée qui n'a plus aucun
+    #: lien avec l'image courante.
+    head_point_frame_index: int | None = None
     #: Diagnostic : ensemble des track_id techniques ayant porté ce person_id.
     aliases: set[int] = field(default_factory=set)
 

@@ -125,6 +125,82 @@ def test_deux_pistes_dont_l_apparence_s_inverse_nettement_sont_corrigees(sink):
     assert ev["reason"] == "cross_appearance_correction"
 
 
+def test_la_correction_croisee_reste_possible_apres_cinq_frames_de_swap(sink):
+    """Le descripteur de galerie ne dérive pas pendant un swap (lot B.3).
+
+    ``_correct_cross_swaps`` compare l'apparence **courante** à ``record.feature``.
+    Tant que le gel n'existait pas, ``_touch`` mélangeait à chaque frame le
+    descripteur courant dans ``record.feature`` : au bout de 5 frames la
+    référence contenait 1 − 0,85⁵ ≈ 56 % de l'apparence de l'AUTRE personne, et
+    la comparaison directe/croisée devenait aveugle au moment précis où le swap
+    s'installait. Ici, cinq frames d'apparence étrangère passent sans corriger
+    (croisement nul) : si la référence dérivait, la correction de la frame 7
+    serait impossible.
+    """
+    manager = build_manager(sink, swap_margin=0.12)
+    desc_a = unit(1, 0, 0)
+    desc_b = unit(0, 1, 0)
+
+    manager.assign(
+        [
+            observation(7, anchor=(100.0, 300.0), feature=desc_a),
+            observation(9, anchor=(200.0, 300.0), feature=desc_b),
+        ],
+        FRAME,
+        0.0,
+        1,
+    )
+    assert manager.person_of(7) == 1
+    assert manager.person_of(9) == 2
+    reference_1 = manager.records[1].feature.copy()
+    reference_2 = manager.records[2].feature.copy()
+
+    # Frames 2 à 6 : apparence orthogonale à a ET b, alternée pour que la
+    # discontinuité soit ré-armée à chaque frame. Croisement nul, donc aucune
+    # correction possible pendant ces cinq frames.
+    distractors = [unit(0, 0, 1), unit(0, 0, -1)]
+    for offset in range(5):
+        manager.assign(
+            [
+                observation(7, anchor=(100.0, 300.0), feature=distractors[offset % 2]),
+                observation(9, anchor=(200.0, 300.0), feature=distractors[offset % 2]),
+            ],
+            FRAME,
+            0.1 * (offset + 2),
+            offset + 2,
+        )
+
+    assert manager.swap_corrections_applied == 0
+    assert manager.person_of(7) == 1, "la piste reste verrouillée sur son identité"
+    assert manager.person_of(9) == 2
+    # LES DEUX références sont intactes : c'est ce qui rend la correction possible.
+    assert np.allclose(manager.records[1].feature, reference_1), (
+        "la référence de galerie ne doit pas dériver pendant un swap"
+    )
+    assert np.allclose(manager.records[2].feature, reference_2)
+    assert sink.count("TRACK_ID_APPEARANCE_DISCONTINUITY") >= 1
+
+    # Frame 7 : le swap est enfin exploitable -> la correction doit encore aboutir.
+    assignments = manager.assign(
+        [
+            observation(7, anchor=(100.0, 300.0), feature=desc_b),
+            observation(9, anchor=(200.0, 300.0), feature=desc_a),
+        ],
+        FRAME,
+        0.7,
+        7,
+    )
+
+    assert manager.swap_corrections_applied == 1, (
+        "après 5 frames de swap, la correction croisée doit rester possible"
+    )
+    assert manager.person_of(7) == 2
+    assert manager.person_of(9) == 1
+    assert assignments[0].person_id == 2
+    assert assignments[1].person_id == 1
+    assert sink.count("IDENTITY_SWAP_CORRECTED") == 1
+
+
 def test_deux_personnes_qui_se_croisent_sans_echanger_d_apparence_ne_produisent_aucune_correction(sink):
     """Deux personnes qui conservent leur apparence ne déclenchent aucune correction."""
     manager = build_manager(sink)

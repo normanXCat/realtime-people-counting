@@ -68,6 +68,7 @@ from geometry import (
     anchor_reliability,
     check_anchor_height_drop,
     check_box_width_growth,
+    heads_suggest_merge,
     check_detection_geometry,
     compute_anchor,
     side_of,
@@ -89,6 +90,12 @@ class Detection:
     confidence: float = 1.0
     head_point: tuple[float, float] | None = None
     head_confidence: float | None = None
+    #: Tous les points-clés de tête **confiants** de cette détection. Distinct de
+    #: ``head_point`` (le point agrégé utilisé pour l'assistance de présence) :
+    #: c'est leur **nombre** et leur **séparation** qui signalent une fusion de
+    #: deux personnes dans une seule boîte, y compris dès la première frame.
+    #: Vide tant que le modèle pose n'est pas actif (``presence.head_assist``).
+    head_points: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass
@@ -411,7 +418,11 @@ class OccupancyManager:
         # la correction est journalisée avec sa raison et son seuil.
         raw_boxes: dict[int, np.ndarray] = {}
         corrected: dict[int, tuple[np.ndarray, tuple[float, float]]] = {}
-        multi_person_detected: dict[int, tuple[float, float, float, float]] = {}
+        #: Par identifiant technique : (largeur courante, largeur stabilisée,
+        #: ratio, seuil, signal, séparation de têtes en pixels).
+        multi_person_detected: dict[
+            int, tuple[float, float, float, float, str, float | None]
+        ] = {}
         self._raw_heights.clear()
         self._fallback_keys.clear()
         for detection in detections:
@@ -421,28 +432,53 @@ class OccupancyManager:
             current_w = max(0.0, float(raw[2] - raw[0]))
             current_h = max(0.0, float(raw[3] - raw[1]))
 
-            # Détection éventuelle d'une boîte multi-personnes (croissance anormale de la largeur)
-            if (
-                self.config.geometry.multi_person_box.enabled
-                and self.bbox_locker is not None
-            ):
-                stable_w = self.bbox_locker.stable_width(stab_key)
+            # -- Boîte multi-personnes : DEUX signaux indépendants ------------
+            # (1) croissance anormale de la largeur par rapport à l'historique
+            #     stabilisé de la même personne ;
+            # (2) deux têtes séparées dans la boîte, signal **sans historique**.
+            # Le signal (2) lève l'angle mort de (1) : deux personnes assises
+            # côte à côte dès la première frame ne produisent jamais (1), leur
+            # largeur fusionnée étant la référence. Il exige le modèle pose
+            # (``presence.head_assist.enabled``) ; sinon (1) reste seul actif et
+            # le comportement est inchangé.
+            stable_w = 0.0
+            ratio = 1.0
+            thresh = float(self.config.geometry.multi_person_box.max_growth_ratio)
+            width_signal = False
+            multi_person_enabled = self.config.geometry.multi_person_box.enabled
+            if multi_person_enabled and self.bbox_locker is not None:
+                measured_w = self.bbox_locker.stable_width(stab_key)
                 stable_h = self.bbox_locker.stable_height(stab_key)
-                if stable_w is not None and stable_w > 0:
-                    is_multi, ratio, thresh = check_box_width_growth(
+                if measured_w is not None and measured_w > 0:
+                    stable_w = float(measured_w)
+                    width_signal, ratio, thresh = check_box_width_growth(
                         current_w,
                         [stable_w],
                         self.config.geometry.multi_person_box.max_growth_ratio,
                         current_height=current_h,
                         height_history=[stable_h] if stable_h else None,
                     )
-                    if is_multi:
-                        multi_person_detected[technical_id] = (
-                            current_w,
-                            stable_w,
-                            ratio,
-                            thresh,
-                        )
+
+            head_signal = False
+            head_separation: float | None = None
+            if multi_person_enabled and self.config.presence.head_assist.enabled:
+                head_signal, head_separation = heads_suggest_merge(
+                    detection.head_points or (),
+                    current_w,
+                    self.config.geometry.multi_person_box.head_separation_ratio,
+                )
+                if not head_signal:
+                    head_separation = None
+
+            if width_signal or head_signal:
+                multi_person_detected[technical_id] = (
+                    current_w,
+                    stable_w,
+                    ratio,
+                    thresh,
+                    "width_growth" if width_signal else "multiple_heads",
+                    head_separation,
+                )
 
             bbox = raw
             if self.bbox_locker is not None:
@@ -507,28 +543,55 @@ class OccupancyManager:
         if self.profiler is not None:
             self.profiler.record("reid", reid_timer.ms)
 
-        # Signalement explicite des boîtes suspectées de contenir plusieurs personnes
-        for assignment in assignments:
-            tech_id = int(assignment.technical_track_id)
-            if tech_id in multi_person_detected and assignment.person_id:
-                curr_w, stab_w, r, th = multi_person_detected[tech_id]
-                self._emit(
-                    "POSSIBLE_MULTI_PERSON_BOX",
-                    timestamp_s,
-                    frame_index,
-                    person_id=int(assignment.person_id),
-                    frame=int(frame_index),
-                    current_width=round(float(curr_w), 2),
-                    stable_width=round(float(stab_w), 2),
-                    ratio=round(float(r), 4),
-                    threshold=round(float(th), 4),
-                    technical_track_id=tech_id,
-                    bbox=[round(float(v), 2) for v in assignment.bbox],
-                )
-
         ambiguity_radius_px = self.scale.ratio_to_px(
             self.config.geometry.occlusion_ambiguity_ratio
         )
+        observed_person_ids = {
+            int(assignment.person_id) for assignment in assignments if assignment.person_id
+        }
+
+        # Signalement explicite des boîtes suspectées de contenir plusieurs
+        # personnes. Une personne **absorbée** dans une boîte fusionnée n'a plus
+        # de détection propre : elle ne doit donc pas être purgée comme si elle
+        # était sortie. Elle est déjà maintenue en borne haute par le chemin
+        # normal (``OCCULTEE`` -> grâce -> purge incertaine, ``occupancy_impact="uncertain"``,
+        # spec 4.4) ; l'arbitrage ci-dessous le rend **explicite et traçable** en
+        # nommant les personnes déjà comptées et perdues dans le rayon
+        # d'ambiguïté, sans jamais réduire ``occupancy_operational``.
+        for assignment in assignments:
+            tech_id = int(assignment.technical_track_id)
+            if tech_id not in multi_person_detected or not assignment.person_id:
+                continue
+            curr_w, stab_w, r, th, signal, head_sep = multi_person_detected[tech_id]
+            track = self.tracks.get(int(assignment.person_id))
+            lost_neighbours = (
+                []
+                if track is None
+                else self._lost_counted_neighbours_within(
+                    track, assignment.anchor, ambiguity_radius_px, observed_person_ids
+                )
+            )
+            self._emit(
+                "POSSIBLE_MULTI_PERSON_BOX",
+                timestamp_s,
+                frame_index,
+                person_id=int(assignment.person_id),
+                frame=int(frame_index),
+                current_width=round(float(curr_w), 2),
+                stable_width=round(float(stab_w), 2),
+                ratio=round(float(r), 4),
+                threshold=round(float(th), 4),
+                technical_track_id=tech_id,
+                bbox=[round(float(v), 2) for v in assignment.bbox],
+                signal=signal,
+                head_separation_px=(
+                    None if head_sep is None else round(float(head_sep), 2)
+                ),
+                ambiguity_radius_px=(
+                    None if ambiguity_radius_px is None else round(float(ambiguity_radius_px), 2)
+                ),
+                lost_counted_neighbours=lost_neighbours,
+            )
         with Timer() as fsm_timer:
             views: list[_View] = []
             seen: set[int] = set()
@@ -739,6 +802,39 @@ class OccupancyManager:
     # ------------------------------------------------------------------
     # Suivi d'une personne observée
     # ------------------------------------------------------------------
+    def _lost_counted_neighbours_within(
+        self,
+        track: PersonTrack,
+        anchor: tuple[float, float],
+        radius_px: float | None,
+        observed: set[int] | None = None,
+    ) -> list[int]:
+        """Personnes déjà **comptées** et *perdues* dans le rayon d'ambiguïté.
+
+        Réutilise :meth:`occluded_counted_neighbours` (même rayon,
+        ``geometry.occlusion_ambiguity_ratio``, mêmes personnes comptées), en y
+        ajoutant celles qui, sur la frame courante, n'ont **aucune détection** :
+        une personne absorbée dans une boîte fusionnée perd sa détection propre
+        au moment même de la fusion, donc son état n'est pas encore ``OCCULTEE``
+        quand la boîte est signalée. Sans cette inclusion, la personne absorbée
+        ne serait identifiée qu'après coup.
+        """
+        if radius_px is None:
+            return []
+        neighbours = set(self.occluded_counted_neighbours(track, anchor, radius_px))
+        if observed:
+            for person_id, other in self.tracks.items():
+                if person_id in observed or person_id == track.person_id:
+                    continue
+                if not other.inside_occupancy:
+                    continue
+                distance = float(
+                    np.hypot(anchor[0] - other.anchor[0], anchor[1] - other.anchor[1])
+                )
+                if distance <= radius_px:
+                    neighbours.add(int(person_id))
+        return sorted(neighbours)
+
     def _get_or_create_track(self, assignment, timestamp_s: float) -> PersonTrack:
         track = self.tracks.get(assignment.person_id)
         if track is not None:
@@ -798,12 +894,20 @@ class OccupancyManager:
             track.drop_previous_height = ref_h
             track.drop_current_height = float(raw_height)
             track.drop_ratio = drop_ratio
-            if (
-                not self.config.presence.head_assist.enabled
-                and track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames
-            ):
+            if track.height_drop_streak >= anchor_cfg.height_drop_confirm_frames:
                 # La chute s'est stabilisée (personne assise et restée assise) :
                 # réadaptation de l'historique de hauteur et réactivation de la fiabilité.
+                #
+                # La condition `not presence.head_assist.enabled` a été RETIRÉE :
+                # elle neutralisait cette branche dès que l'assistance tête était
+                # activée, si bien qu'une personne assise restait marquée
+                # `anchor_unreliable` indéfiniment, sa coordonnée verticale gelée
+                # sur `last_reliable_anchor`, et basculait en OCCULTEE à
+                # l'expiration de `max_presence_extension_seconds`. La
+                # fonctionnalité censée gérer les personnes assises dégradait
+                # donc exactement le cas « personne assise ». Les deux
+                # mécanismes sont complémentaires : réadaptation de hauteur ET
+                # maintien par la tête.
                 track.height_history = [float(raw_height)]
                 track.height_drop_streak = 0
                 track.anchor_unreliable_reason = None
@@ -828,6 +932,9 @@ class OccupancyManager:
 
         track.current_head_point = getattr(assignment, "head_point", None)
         track.current_head_confidence = getattr(assignment, "head_confidence", None)
+        # La fraîcheur du point tête est indexée sur la frame d'**observation** :
+        # le point est issu de la même détection que la boîte.
+        track.head_point_frame_index = frame_index
 
         if reliable:
             track.last_reliable_anchor = effective_anchor
@@ -1003,6 +1110,24 @@ class OccupancyManager:
     # ------------------------------------------------------------------
     # Personne non observée
     # ------------------------------------------------------------------
+    def _head_point_is_fresh(self, track: PersonTrack, frame_index: int) -> bool:
+        """Le point tête est-il issu de la frame courante ou de la précédente ?
+
+        ``_handle_missing`` relisait ``track.current_head_point`` figé lors de la
+        **dernière frame où la personne était observée**. Les keypoints sont
+        extraits de ``result.keypoints[i]``, indexés sur la même détection que la
+        boîte : pas de boîte, pas de point tête. Le code pouvait donc émettre
+        ``PRESENCE_MAINTAINED_BY_HEAD`` avec ``feet_anchor_status="no_detection"``
+        sur la base d'une donnée sans lien avec l'image courante, et maintenir
+        jusqu'à ``max_presence_extension_seconds`` une personne réellement sortie
+        du champ. Au-delà de la tolérance, le chemin normal s'applique :
+        ``OCCULTEE``, grâce, purge.
+        """
+        if track.head_point_frame_index is None:
+            return False
+        tolerance = self.config.presence.head_assist.max_head_staleness_frames
+        return (int(frame_index) - int(track.head_point_frame_index)) <= int(tolerance)
+
     def _handle_missing(
         self,
         track: PersonTrack,
@@ -1019,6 +1144,7 @@ class OccupancyManager:
             and track.current_head_point is not None
             and track.current_head_confidence is not None
             and track.current_head_confidence >= self.config.presence.head_assist.min_keypoint_confidence
+            and self._head_point_is_fresh(track, frame_index)
         ):
             ha_cfg = self.config.presence.head_assist
             if track.head_presence_first_s is None:

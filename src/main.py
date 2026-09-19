@@ -76,7 +76,12 @@ from config import (
     override_config,
 )
 from events import EventLogger
-from geometry import LineError, VirtualLine, extract_head_point
+from geometry import (
+    LineError,
+    VirtualLine,
+    confident_head_points,
+    extract_head_point,
+)
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
 from track_diagnostics import (
@@ -605,6 +610,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     frame_index = 0
     last_detection_s = 0.0
     no_detection_announced = False
+    #: Avertissement de base de temps (frames vs secondes) émis une seule fois,
+    #: dès que le FPS réellement traité est connu.
+    live_timebase_warned = False
+    live_timebase_logger = logging.getLogger(__name__)
 
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
@@ -717,6 +726,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for i, (box, track_id, confidence) in enumerate(zip(xyxy, ids, confidences)):
                     head_pt = None
                     head_conf = None
+                    head_pts: tuple[tuple[float, float], ...] = ()
                     if config.presence.head_assist.enabled and kpts_xy is not None and i < len(kpts_xy):
                         ki_xy = kpts_xy[i]
                         ki_conf = (
@@ -730,6 +740,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                             config.presence.head_assist.keypoints_used,
                             config.presence.head_assist.min_keypoint_confidence,
                         )
+                        # Points-clés de tête INDIVIDUELS : leur séparation à
+                        # l'intérieur de la boîte signale une fusion de deux
+                        # personnes, y compris dès la première frame (signal
+                        # indépendant de tout historique de largeur).
+                        if config.geometry.multi_person_box.enabled:
+                            head_pts = confident_head_points(
+                                ki_xy,
+                                ki_conf,
+                                config.presence.head_assist.keypoints_used,
+                                config.presence.head_assist.min_keypoint_confidence,
+                            )
                     detections.append(
                         Detection(
                             technical_track_id=int(track_id),
@@ -737,6 +758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             confidence=float(confidence),
                             head_point=head_pt,
                             head_confidence=head_conf,
+                            head_points=head_pts,
                         )
                     )
                     observed_confidences.append(float(confidence))
@@ -780,6 +802,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             if fps_estimator.is_ready:
                 budget = config.timing.frame_budget(fps_estimator.require_fps())
                 occupancy.set_frame_budget(budget)
+                if isinstance(source, int) and not live_timebase_warned:
+                    # Base de temps : `track_buffer` est en FRAMES, la galerie
+                    # ReID en SECONDES. Sur caméra live, le FPS traité est bien
+                    # plus bas que celui du flux : 150 frames couvrent donc une
+                    # durée réelle sans rapport avec un fichier vidéo, et les
+                    # deux mémoires divergent. Ce n'est PAS un refus de
+                    # démarrer — seulement un avertissement, émis au FPS mesuré.
+                    live_timebase_warned = True
+                    measured_fps = fps_estimator.require_fps()
+                    configured_retention = config.reid.long_term.gallery_retention_seconds
+                    retention_s = (
+                        config.timing.grace_period_seconds
+                        if configured_retention is None
+                        else float(configured_retention)
+                    )
+                    tracker_seconds = config.tracker.track_buffer / measured_fps
+                    gallery_window_s = retention_s + config.timing.grace_period_seconds
+                    details = (
+                        f"tracker.track_buffer = {config.tracker.track_buffer} frames, "
+                        f"soit {tracker_seconds:.1f} s de temps réel au FPS mesuré "
+                        f"({measured_fps:.2f} FPS), contre {gallery_window_s:.1f} s de "
+                        f"fenêtre de galerie ReID (grâce "
+                        f"{config.timing.grace_period_seconds} s + rétention "
+                        f"{retention_s} s). Les deux mémoires ne couvrent pas la même "
+                        "durée : au-delà de la plus courte des deux, la "
+                        "réassociation n'est plus possible."
+                    )
+                    logger.emit(
+                        "CONFIG_WARNING",
+                        timestamp_s,
+                        frame_index,
+                        code="track_buffer_frame_seconds_divergence",
+                        source="config",
+                        details=details,
+                    )
+                    live_timebase_logger.warning(
+                        "track_buffer_frame_seconds_divergence : %s", details
+                    )
 
             occupancy.process_frame(detections, frame, timestamp_s, frame_index)
 

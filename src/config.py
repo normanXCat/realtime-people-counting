@@ -184,6 +184,48 @@ class LongTermReidConfig:
     #: explicitement, jamais subi, pour éviter les fausses réassociations.
     long_absence_seconds: float = 2.0
     long_absence_similarity_floor: float | None = None
+    #: Momentum de la moyenne glissante qui met à jour le descripteur d'apparence
+    #: de la galerie (``_blend`` dans :mod:`identity_manager`). Était codé en dur
+    #: à 0,85 dans le constructeur : il vit désormais dans la configuration.
+    #: Une valeur élevée garde une référence stable (peu de dérive vers un autre
+    #: individu, mais lente adaptation à un vrai changement d'apparence) ; une
+    #: valeur basse suit l'apparence courante et **dérive vite** vers la mauvaise
+    #: personne après un swap non détecté. Bornes ``0,0 <= x < 1,0`` : 1,0
+    #: figerait le descripteur pour toujours.
+    feature_momentum: float = 0.85
+    #: Paramètres du descripteur d'apparence léger (HSV). Voir
+    #: :class:`DescriptorConfig`.
+    descriptor: "DescriptorConfig" = field(default_factory=lambda: DescriptorConfig())
+
+
+@dataclass(frozen=True)
+class DescriptorConfig:
+    """Paramètres de ``HistogramAppearanceExtractor`` (descripteur HSV par bandes).
+
+    L'ancien descripteur calculait un histogramme teinte × saturation sur le
+    **crop complet**. En salle de cours, il encodait donc principalement la
+    couleur des chaises, des tables et du mur derrière, et accessoirement le haut
+    du vêtement : deux personnes différentes de la même rangée donnaient
+    couramment une similarité > 0,9 alors que ``similarity_threshold`` vaut 0,40.
+    Le descripteur rogne désormais le crop, le découpe en bandes horizontales et
+    normalise chaque bande séparément, ce qui rend l'écart inter-personnes
+    exploitable.
+
+    - ``horizontal_crop_ratio`` : fraction rognée de chaque côté en largeur
+      (0,15 = 15 %), pour écarter le fond et les voisins absorbés par le crop.
+    - ``bands`` : nombre de bandes horizontales (tête / torse / bas).
+    - ``band_weights`` : poids relatif de chaque bande, de la plus haute à la
+      plus basse. Une bande basse pondérée plus faiblement est moins sensible aux
+      tables qui l'occultent.
+    - ``bins_hue`` / ``bins_saturation`` : résolution de l'histogramme 2D par
+      bande.
+    """
+
+    horizontal_crop_ratio: float = 0.15
+    bands: int = 3
+    band_weights: tuple[float, ...] = (1.0, 1.0, 0.5)
+    bins_hue: int = 24
+    bins_saturation: int = 8
 
 
 @dataclass(frozen=True)
@@ -225,6 +267,18 @@ class AppearanceContinuityConfig:
     similarity_threshold: float = 0.50
     max_gap_frames: int = 2
     min_interval_seconds: float = 1.0
+    #: Nombre de frames pendant lesquelles la mise à jour du descripteur de
+    #: galerie est **gelée** après une discontinuité d'apparence sur la piste.
+    #: Sans ce gel, ``_touch`` mélangeait à chaque frame le descripteur courant
+    #: dans ``record.feature`` : après un swap non détecté, la référence dérivait
+    #: vers l'autre personne (1 - 0,85^5 ≈ 56 % de l'apparence de B au bout de
+    #: 5 frames), et ``_correct_cross_swaps`` — qui compare l'apparence courante à
+    #: ``record.feature`` — devenait aveugle exactement quand le swap s'installait.
+    #: La position, la hauteur et ``last_seen_s`` continuent d'être mis à jour :
+    #: seul le descripteur est gelé. Défaut : équivalent à
+    #: ``min_interval_seconds`` en frames à la cadence de traitement mesurée
+    #: (~3,5 FPS), avec une borne minimale de 3 frames.
+    freeze_gallery_frames: int = 3
 
 
 @dataclass(frozen=True)
@@ -305,11 +359,24 @@ class MultiPersonBoxConfig:
     - ``max_growth_ratio`` : ratio ``largeur_courante / largeur_stabilisée``
       au-delà duquel le signal est déclenché. Valeur initiale à calibrer sur
       des cas confirmés de fusion.
+    - ``head_separation_ratio`` : second signal, **indépendant de l'historique".
+      Le détecteur par largeur exige une largeur d'**avant** la fusion : deux
+      personnes assises côte à côte dès la première frame ne produisent donc
+      JAMAIS le signal, leur largeur fusionnée *étant* la référence. Le nombre
+      de têtes détectées à l'intérieur de la boîte lève cet angle mort : deux
+      jeux de points-clés de tête suffisamment confiants et séparés de plus de
+      ``head_separation_ratio × largeur_boîte`` dans une seule boîte valent
+      fusion, dès la première frame.
     """
 
     enabled: bool = True
     #: PROVISOIRE — à calibrer sur des cas confirmés de fusion.
     max_growth_ratio: float = 1.6
+    #: PROVISOIRE — séparation relative entre deux têtes au-delà de laquelle une
+    #: boîte unique est considérée comme contenant deux personnes. N'a d'effet
+    #: que si ``presence.head_assist.enabled`` est vrai (les points-clés de tête
+    #: proviennent du modèle pose) ; sinon seul le signal par largeur subsiste.
+    head_separation_ratio: float = 0.4
 
 
 @dataclass(frozen=True)
@@ -476,8 +543,16 @@ class HeadAssistConfig:
     pose_model_path: str = "models/yolo11s-pose.pt"
     pose_model_expected_sha256: str | None = None
     min_keypoint_confidence: float = 0.5  # PROVISOIRE
-    keypoints_used: tuple[str, ...] = ("nose", "left_eye", "right_eye")
+    keypoints_used: tuple[str, ...] = (
+        "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    )
     max_presence_extension_seconds: float = 10.0  # PROVISOIRE
+    #: Écart maximal (en frames) entre la frame courante et celle où le point
+    #: tête a été **observé** pour autoriser un maintien de présence. Défaut 1 :
+    #: la frame courante ou la précédente. Les keypoints étant extraits de la
+    #: même détection que la boîte, un point plus vieux n'a plus de lien avec
+    #: l'image courante.
+    max_head_staleness_frames: int = 1
 
 
 @dataclass(frozen=True)
@@ -709,6 +784,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "geometry.multi_person_box.max_growth_ratio",
         problems,
     )
+    head_separation_ratio = _unit_interval(
+        multi_person_raw.get("head_separation_ratio", 0.4),
+        "geometry.multi_person_box.head_separation_ratio",
+        problems,
+    )
 
     anchor_raw = _section(raw, "anchor")
     anchor_window = _positive_int(
@@ -814,6 +894,16 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "reid.long_term.long_absence_similarity_floor",
         problems,
     )
+    feature_momentum = _momentum(
+        long_term_raw.get("feature_momentum", 0.85),
+        "reid.long_term.feature_momentum",
+        problems,
+    )
+    descriptor = _descriptor_config(
+        long_term_raw.get("descriptor"),
+        "reid.long_term.descriptor",
+        problems,
+    )
     if (
         long_absence_floor is not None
         and similarity_threshold is not None
@@ -841,6 +931,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         continuity_raw.get("min_interval_seconds", 1.0),
         "reid.appearance_continuity.min_interval_seconds",
         problems,
+    )
+    continuity_freeze_frames = _bounded_int(
+        continuity_raw.get("freeze_gallery_frames", 3),
+        "reid.appearance_continuity.freeze_gallery_frames",
+        problems,
+        low=3,
     )
 
     # -- Correction active des inversions d'identité (swap) ----------------
@@ -996,8 +1092,20 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "presence.head_assist.max_presence_extension_seconds",
         problems,
     )
+    ha_max_head_staleness = _positive_int(
+        head_assist_raw.get("max_head_staleness_frames", 1),
+        "presence.head_assist.max_head_staleness_frames",
+        problems,
+    )
     ha_keypoints_used = tuple(
-        str(k) for k in (head_assist_raw.get("keypoints_used", ("nose", "left_eye", "right_eye")) or ())
+        str(k)
+        for k in (
+            head_assist_raw.get(
+                "keypoints_used",
+                ("nose", "left_eye", "right_eye", "left_ear", "right_ear"),
+            )
+            or ()
+        )
     )
     if not ha_keypoints_used:
         problems.append(
@@ -1091,6 +1199,10 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 long_absence_similarity_floor=(
                     None if long_absence_floor is None else float(long_absence_floor)
                 ),
+                feature_momentum=float(
+                    feature_momentum if feature_momentum is not None else 0.85
+                ),
+                descriptor=descriptor,
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
@@ -1108,6 +1220,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 ),
                 min_interval_seconds=float(
                     continuity_min_interval if continuity_min_interval is not None else 1.0
+                ),
+                freeze_gallery_frames=int(
+                    continuity_freeze_frames
+                    if continuity_freeze_frames is not None
+                    else 3
                 ),
             ),
             swap_correction=SwapCorrectionConfig(
@@ -1133,6 +1250,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 enabled=bool(multi_person_raw.get("enabled", True)),
                 max_growth_ratio=float(
                     max_growth_ratio if max_growth_ratio is not None else 1.6
+                ),
+                head_separation_ratio=float(
+                    head_separation_ratio
+                    if head_separation_ratio is not None
+                    else 0.4
                 ),
             ),
         ),
@@ -1198,6 +1320,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 max_presence_extension_seconds=float(
                     ha_max_ext_s if ha_max_ext_s is not None else 10.0
                 ),
+                max_head_staleness_frames=int(
+                    ha_max_head_staleness
+                    if ha_max_head_staleness is not None
+                    else 1
+                ),
             ),
         ),
         config_path=config_path or DEFAULT_CONFIG_PATH,
@@ -1243,6 +1370,95 @@ def _section(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"La section {key!r} doit être un mapping YAML")
     return value
+
+
+def _momentum(value: Any, name: str, problems: list[str]) -> float | None:
+    """Momentum d'une moyenne glissante : ``0.0 <= x < 1.0``.
+
+    ``1.0`` est refusé : le descripteur de galerie ne serait alors plus jamais mis
+    à jour, ce qui figerait la référence par erreur de configuration plutôt que
+    par choix explicite.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} doit être un nombre (reçu {value!r})")
+        return None
+    if not (0.0 <= number < 1.0):
+        problems.append(f"{name} doit être dans [0, 1[ (reçu {number})")
+        return None
+    return number
+
+
+def _bounded_int(
+    value: Any, name: str, problems: list[str], *, low: int, high: int | None = None
+) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        problems.append(f"{name} doit être un entier (reçu {value!r})")
+        return None
+    if number < low or (high is not None and number > high):
+        borne = f">= {low}" if high is None else f"dans [{low}, {high}]"
+        problems.append(f"{name} doit être {borne} (reçu {number})")
+        return None
+    return number
+
+
+def _descriptor_config(
+    raw: Any, name: str, problems: list[str]
+) -> DescriptorConfig:
+    """Valide la section ``reid.long_term.descriptor`` (descripteur HSV par bandes)."""
+    if raw is None:
+        return DescriptorConfig()
+    if not isinstance(raw, Mapping):
+        problems.append(f"{name} doit être un mapping (reçu {type(raw).__name__})")
+        return DescriptorConfig()
+    unknown = sorted(set(raw) - {
+        "horizontal_crop_ratio", "bands", "band_weights", "bins_hue",
+        "bins_saturation",
+    })
+    if unknown:
+        problems.append(f"{name} contient des clés inconnues {unknown}")
+
+    crop_ratio = _bounded(
+        raw.get("horizontal_crop_ratio", 0.15),
+        f"{name}.horizontal_crop_ratio", problems, low=0.0, high=0.45,
+    )
+    bands = _positive_int(raw.get("bands", 3), f"{name}.bands", problems)
+    bins_hue = _positive_int(raw.get("bins_hue", 24), f"{name}.bins_hue", problems)
+    bins_saturation = _positive_int(
+        raw.get("bins_saturation", 8), f"{name}.bins_saturation", problems
+    )
+    weights_raw = raw.get("band_weights", (1.0, 1.0, 0.5))
+    weights: tuple[float, ...] = ()
+    if not isinstance(weights_raw, (list, tuple)) or not weights_raw:
+        problems.append(f"{name}.band_weights doit être une liste non vide de nombres")
+    else:
+        parsed: list[float] = []
+        for index, weight in enumerate(weights_raw):
+            number = _non_negative(weight, f"{name}.band_weights[{index}]", problems)
+            parsed.append(0.0 if number is None else number)
+        weights = tuple(parsed)
+        if all(weight == 0.0 for weight in weights):
+            problems.append(
+                f"{name}.band_weights ne peut pas être entièrement nul : le "
+                "descripteur serait alors toujours nul et inexploitable."
+            )
+    if bands is not None and weights and len(weights) != bands:
+        problems.append(
+            f"{name}.band_weights ({len(weights)} valeurs) doit avoir autant "
+            f"d'entrées que {name}.bands ({bands}) : un poids manquant rendrait "
+            "une bande silencieusement inutilisée."
+        )
+
+    return DescriptorConfig(
+        horizontal_crop_ratio=float(crop_ratio if crop_ratio is not None else 0.15),
+        bands=int(bands if bands is not None else 3),
+        band_weights=weights or (1.0, 1.0, 0.5),
+        bins_hue=int(bins_hue if bins_hue is not None else 24),
+        bins_saturation=int(bins_saturation if bins_saturation is not None else 8),
+    )
 
 
 def _unit_interval(value: Any, name: str, problems: list[str]) -> float | None:

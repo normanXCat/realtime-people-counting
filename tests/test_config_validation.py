@@ -15,6 +15,7 @@ import yaml
 from config import (
     DEFAULT_CONFIG_PATH,
     ConfigError,
+    LongTermReidConfig,
     build_config,
     load_config,
     override_config,
@@ -193,19 +194,39 @@ def test_diagnostics_section_is_exposed_and_configurable():
     assert "diagnostics" in config.to_dict()
 
 
-def test_gallery_retention_defaults_to_the_occupancy_grace_period():
-    """Par défaut, la mémoire d'apparence n'est pas libérée avant la grâce."""
+def test_production_gallery_retention_is_12_seconds_and_covers_long_occlusions():
+    """La config livrée découple la mémoire d'apparence de la grâce (12,0 s).
+
+    Ce test porte sur la **valeur de production** : il doit donc vérifier 12,0,
+    jamais ``None``. Le repli sur ``grace_period_seconds`` quand la clé est omise
+    est un comportement distinct, testé séparément ci-dessous.
+    """
     config = load_config()
-    assert config.reid.long_term.gallery_retention_seconds is None
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(12.0)
     from identity_manager import IdentityManager
 
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert manager.purge_retention_seconds == pytest.approx(
-        config.timing.grace_period_seconds
+    assert manager.purge_retention_seconds == pytest.approx(12.0)
+    # Fenêtre totale = grâce 5,0 s + rétention 12,0 s = 17,0 s : elle couvre
+    # l'occlusion maximale mesurée (13,5 s, rapport §4.6), qui tombait hors
+    # mémoire avec l'ancienne valeur alignée (10,0 s).
+    assert (
+        config.timing.grace_period_seconds + manager.purge_retention_seconds
+    ) > 13.5
+
+
+def test_gallery_retention_falls_back_on_the_grace_period_when_omitted():
+    """Repli : une rétention omise (``None``) s'aligne sur la grâce d'occupation."""
+    from identity_manager import IdentityManager
+
+    manager = IdentityManager(
+        long_term=LongTermReidConfig(gallery_retention_seconds=None),
+        grace_period_seconds=2.5,
     )
+    assert manager.purge_retention_seconds == pytest.approx(2.5)
 
 
 def test_gallery_retention_can_be_decoupled_explicitly():
@@ -218,6 +239,131 @@ def test_gallery_retention_can_be_decoupled_explicitly():
             load_config(),
             {"reid": {"long_term": {"gallery_retention_seconds": -1.0}}},
         )
+
+
+def test_feature_momentum_is_configurable_and_bounded():
+    """Le momentum du descripteur de galerie vient de la config, borné à [0, 1[.
+
+    Il était codé en dur à 0,85 dans le constructeur de ``IdentityManager`` : non
+    réglable, alors qu'il gouverne la vitesse de dérive de la référence après un
+    swap. ``1,0`` doit être refusé : il figerait le descripteur pour toujours.
+    """
+    config = load_config()
+    assert config.reid.long_term.feature_momentum == pytest.approx(0.85)
+
+    lowered = override_config(
+        load_config(), {"reid": {"long_term": {"feature_momentum": 0.5}}}
+    )
+    assert lowered.reid.long_term.feature_momentum == pytest.approx(0.5)
+
+    # 0,0 est légitime : la référence suit alors intégralement l'apparence courante.
+    zero = override_config(
+        load_config(), {"reid": {"long_term": {"feature_momentum": 0.0}}}
+    )
+    assert zero.reid.long_term.feature_momentum == pytest.approx(0.0)
+
+    for invalid in (1.0, 1.5, -0.1):
+        with pytest.raises(ConfigError) as error:
+            override_config(
+                load_config(),
+                {"reid": {"long_term": {"feature_momentum": invalid}}},
+            )
+        assert "feature_momentum" in str(error.value)
+
+
+def test_feature_momentum_reaches_the_identity_manager_from_the_configuration():
+    """Le câblage config -> IdentityManager est effectif (jamais la valeur en dur)."""
+    from identity_manager import IdentityManager
+
+    config = override_config(
+        load_config(), {"reid": {"long_term": {"feature_momentum": 0.4}}}
+    )
+    manager = IdentityManager(
+        long_term=config.reid.long_term,
+        grace_period_seconds=config.timing.grace_period_seconds,
+    )
+    assert manager.feature_momentum == pytest.approx(0.4)
+    # Une surcharge explicite du constructeur reste prioritaire (tests, ablations).
+    assert IdentityManager(
+        long_term=config.reid.long_term, feature_momentum=0.9
+    ).feature_momentum == pytest.approx(0.9)
+
+
+def test_freeze_gallery_frames_is_configurable_with_a_minimum_of_three():
+    """Le gel du descripteur après une discontinuité est paramétrable (lot B.3)."""
+    from config import AppearanceContinuityConfig
+
+    config = load_config()
+    assert config.reid.appearance_continuity.freeze_gallery_frames == 3
+
+    raised = override_config(
+        load_config(),
+        {"reid": {"appearance_continuity": {"freeze_gallery_frames": 8}}},
+    )
+    assert raised.reid.appearance_continuity.freeze_gallery_frames == 8
+
+    # Borne minimale 3 : en dessous, le gel serait plus court qu'une frame de
+    # réaction au FPS mesuré (~3,5 FPS) et ne protégerait plus rien.
+    for invalid in (0, 1, 2):
+        with pytest.raises(ConfigError) as error:
+            override_config(
+                load_config(),
+                {"reid": {"appearance_continuity": {"freeze_gallery_frames": invalid}}},
+            )
+        assert "freeze_gallery_frames" in str(error.value)
+
+    assert AppearanceContinuityConfig().freeze_gallery_frames == 3
+
+
+def test_descriptor_parameters_are_validated():
+    """``reid.long_term.descriptor`` : valeurs par défaut et rejets explicites."""
+    config = load_config()
+    descriptor = config.reid.long_term.descriptor
+    assert descriptor.horizontal_crop_ratio == pytest.approx(0.15)
+    assert descriptor.bands == 3
+    assert descriptor.band_weights == (1.0, 1.0, 0.5)
+    assert descriptor.bins_hue == 24
+    assert descriptor.bins_saturation == 8
+
+    updated = override_config(
+        load_config(),
+        {
+            "reid": {
+                "long_term": {
+                    "descriptor": {
+                        "horizontal_crop_ratio": 0.25,
+                        "bands": 4,
+                        "band_weights": [1.0, 1.0, 0.5, 0.25],
+                        "bins_hue": 12,
+                        "bins_saturation": 4,
+                    }
+                }
+            }
+        },
+    )
+    assert updated.reid.long_term.descriptor.bands == 4
+    assert updated.reid.long_term.descriptor.band_weights == (1.0, 1.0, 0.5, 0.25)
+
+
+@pytest.mark.parametrize(
+    "descriptor,expected",
+    [
+        ({"horizontal_crop_ratio": 0.5}, "horizontal_crop_ratio"),
+        ({"horizontal_crop_ratio": -0.1}, "horizontal_crop_ratio"),
+        ({"bands": 0}, "bands"),
+        ({"bins_hue": 0}, "bins_hue"),
+        ({"bands": 3, "band_weights": [1.0, 1.0]}, "band_weights"),
+        ({"bands": 2, "band_weights": [0.0, 0.0]}, "band_weights"),
+        ({"bands": 2, "band_weights": []}, "band_weights"),
+        ({"inconnu": 1}, "inconnues"),
+    ],
+)
+def test_descriptor_invalid_values_are_rejected(descriptor, expected):
+    with pytest.raises(ConfigError) as error:
+        override_config(
+            load_config(), {"reid": {"long_term": {"descriptor": descriptor}}}
+        )
+    assert expected in str(error.value)
 
 
 def test_progressive_similarity_floor_cannot_exceed_the_nominal_threshold():

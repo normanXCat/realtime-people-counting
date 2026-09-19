@@ -335,6 +335,54 @@ def test_sitting_down_and_staying_seated_adapts_and_recovers_reliability(sim, si
     assert track.anchor_unreliable_reason is None
 
 
+@pytest.mark.parametrize("head_assist", [False, True])
+def test_sitting_person_recovers_reliability_with_and_without_head_assist(
+    make_config, sink, frame, head_assist
+):
+    """8 bis. La réadaptation « personne assise » n'est pas neutralisée par l'assistance tête.
+
+    Les deux mécanismes sont complémentaires : réadaptation de l'historique de
+    hauteur quand la chute s'est stabilisée, **et** maintien de présence par la
+    tête. Avant la correction, la présence de
+    ``not presence.head_assist.enabled`` dans la condition de réadaptation
+    faisait que, l'assistance tête activée, une personne assise restait marquée
+    ``anchor_unreliable`` indéfiniment, sa coordonnée verticale gelée sur
+    ``last_reliable_anchor``, puis basculait en OCCULTEE à l'expiration de
+    ``max_presence_extension_seconds`` : la fonctionnalité censée gérer les
+    personnes assises dégradait exactement ce cas.
+    """
+    config = make_config({"presence": {"head_assist": {"enabled": head_assist}}})
+    assert config.presence.head_assist.enabled is head_assist
+    local_sink = type(sink)("sitting")
+    local_sim = Sim(build_manager(config, local_sink), frame)
+    local_sim.warmup()
+    label = "activé" if head_assist else "désactivé"
+
+    # Phase debout : hauteur stable 200 px.
+    for _ in range(10):
+        local_sim.step(
+            [Detection(1, person_box(150.0, OUTSIDE_Y, height=200.0, width=80.0), 0.9)]
+        )
+
+    seated = person_box(150.0, OUTSIDE_Y, height=100.0, width=120.0)
+
+    # Frames 1 et 2 : chute en cours de confirmation -> ancre non fiable.
+    local_sim.step([Detection(1, seated, 0.9)])
+    track = local_sim.manager.tracks[1]
+    assert track.anchor_unreliable_reason == "height_drop"
+    local_sim.step([Detection(1, seated, 0.9)])
+    assert track.anchor_unreliable_reason == "height_drop"
+
+    # Frame 3 : chute stabilisée (streak >= height_drop_confirm_frames) ->
+    # réadaptation et retour à la fiabilité, head_assist activé comme désactivé.
+    local_sim.step([Detection(1, seated, 0.9)])
+    assert track.anchor_unreliable_reason is None, (
+        f"une personne assise stabilisée doit redevenir fiable (head_assist {label})"
+    )
+    assert track.height_drop_streak == 0
+    assert track.last_reliable_anchor is not None
+
+
 def test_crossing_during_height_drop_is_delayed_not_lost(sim, sink):
     """9. Franchissement pendant une chute de hauteur : suspendu puis confirmé, pas perdu."""
     manager = sim.manager

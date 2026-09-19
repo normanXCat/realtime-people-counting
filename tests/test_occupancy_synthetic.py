@@ -391,7 +391,17 @@ def test_reappearance_after_release_creates_a_new_identity(manager, frame, sink)
     sim = Sim(manager, frame).warmup()
     sim.steps(2, [detection(1, OUTSIDE_Y)])
     sim.steps(3, [detection(1, INSIDE_Y)])
-    sim.steps(40)  # bien au-delà de la rétention de galerie
+    # Bien au-delà de la fenêtre de galerie, qui vaut désormais grâce (1 s) +
+    # rétention (12 s) = 13 s à 10 fps : la rétention n'est plus alignée sur la
+    # grâce, elle couvre les occultations longues mesurées (jusqu'à 13,5 s).
+    window_frames = int(
+        (
+            manager.config.timing.grace_period_seconds
+            + manager.config.reid.long_term.gallery_retention_seconds
+        )
+        * TEST_FPS
+    )
+    sim.steps(window_frames + 10)
 
     sim.steps(5, [detection(9, INSIDE_Y)])
     assert sink.count("REID_MATCH") == 0

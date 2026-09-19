@@ -323,6 +323,80 @@ def test_histogram_extractor_refuses_tiny_crops():
     assert extractor.describe(frame, [0, 0, 4, 4]) is None
 
 
+def test_histogram_extractor_erodes_the_crop_before_describing():
+    """Les bords de la boîte (fond, voisins) sont écartés du descripteur.
+
+    C'est le point clé du lot B.4 : sur un crop complet, la couleur des chaises,
+    des tables et du mur dominait l'histogramme, et deux personnes de la même
+    rangée atteignaient une similarité > 0,9.
+    """
+    solid_blue = np.zeros((200, 200, 3), dtype=np.uint8)
+    solid_blue[:] = (255, 0, 0)  # BGR : bleu franc
+    with_red_borders = solid_blue.copy()
+    with_red_borders[:, :30] = (0, 0, 255)    # bord gauche « fond »
+    with_red_borders[:, 170:] = (0, 0, 255)   # bord droit « voisin »
+
+    eroding = HistogramAppearanceExtractor(horizontal_crop_ratio=0.15, bands=3)
+    assert np.allclose(
+        eroding.describe(solid_blue, [0, 0, 200, 200]),
+        eroding.describe(with_red_borders, [0, 0, 200, 200]),
+    ), "15 % de chaque côté : les bordures rouges doivent être hors du crop"
+
+    # Sans rognage, les bordures entrent dans le descripteur : la différence est
+    # bien celle qu'on vient d'écarter, pas un artefact du calcul.
+    full = HistogramAppearanceExtractor(horizontal_crop_ratio=0.0, bands=3)
+    assert not np.allclose(
+        full.describe(solid_blue, [0, 0, 200, 200]),
+        full.describe(with_red_borders, [0, 0, 200, 200]),
+    )
+
+
+def test_histogram_extractor_is_banded_and_weights_the_low_band():
+    """Descripteur par bandes : dimension et pondération configurables."""
+    frame = np.zeros((150, 120, 3), dtype=np.uint8)
+    frame[:] = (255, 0, 0)  # couleur uniforme : les 3 bandes sont identiques
+    bands, bins_hue, bins_saturation = 3, 24, 8
+    band_size = bins_hue * bins_saturation
+
+    extractor = HistogramAppearanceExtractor(
+        bands=bands, band_weights=(1.0, 1.0, 0.0),
+        bins_hue=bins_hue, bins_saturation=bins_saturation,
+    )
+    descriptor = extractor.describe(frame, [0, 0, 120, 150])
+
+    assert descriptor.shape == (bands * band_size,), "une tranche par bande"
+    # Bandes identiques et poids égaux : les deux premières tranches coïncident.
+    assert np.allclose(descriptor[:band_size], descriptor[band_size:2 * band_size])
+    # La bande basse est pondérée à 0 (elle est la plus occultée par une table).
+    assert np.allclose(descriptor[2 * band_size:], 0.0)
+    # Le contrat reste « descripteur L2-normalisé ».
+    assert float(np.linalg.norm(descriptor)) == pytest.approx(1.0)
+
+
+def test_histogram_extractor_refuses_a_crop_eroded_under_the_minimum():
+    extractor = HistogramAppearanceExtractor(horizontal_crop_ratio=0.45, min_width=40)
+    frame = np.zeros((200, 100, 3), dtype=np.uint8)
+    # 100 px de large rognés de 45 % de chaque côté -> 10 px < min_width 40.
+    assert extractor.describe(frame, [0, 0, 100, 200]) is None
+
+
+def test_histogram_extractor_is_built_from_the_descriptor_config():
+    """Les paramètres du descripteur viennent de la configuration, jamais du code."""
+    from config import DescriptorConfig
+
+    extractor = HistogramAppearanceExtractor.from_config(
+        DescriptorConfig(
+            horizontal_crop_ratio=0.2, bands=2, band_weights=(1.0, 0.5),
+            bins_hue=8, bins_saturation=4,
+        )
+    )
+    assert extractor.horizontal_crop_ratio == pytest.approx(0.2)
+    assert extractor.bands == 2
+    assert extractor.band_weights == (1.0, 0.5)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert extractor.describe(frame, [0, 0, 100, 100]).shape == (2 * 8 * 4,)
+
+
 def test_deep_extractor_refuses_tiny_crop_without_loading_weights():
     extractor = DeepAppearanceExtractor(ExternalReidConfig(enabled=True))
     frame = np.zeros((50, 50, 3), dtype=np.uint8)
@@ -347,12 +421,80 @@ def test_low_confidence_descriptor_does_not_pollute_gallery(manager):
 
 
 def test_descriptor_is_blended_and_renormalized(manager):
+    """Le descripteur de galerie suit l'apparence courante en moyenne glissante.
+
+    Le changement d'apparence est volontairement **modéré** (similarité ≈ 0,96,
+    au-dessus de ``appearance_continuity.similarity_threshold`` = 0,5) : un saut
+    franc d'une frame à l'autre est une discontinuité, qui **gèle** désormais le
+    descripteur (lot B.3) — c'est le test dédié suivant qui couvre ce cas.
+    """
     manager.assign([observation(7, confidence=0.9, feature=unit(1, 0, 0))], FRAME, 0.0, 1)
-    manager.assign([observation(7, confidence=0.9, feature=unit(0, 1, 0))], FRAME, 0.1, 2)
+    manager.assign([observation(7, confidence=0.9, feature=unit(1, 0.3, 0))], FRAME, 0.1, 2)
     feature = manager.records[1].feature
     assert float(np.linalg.norm(feature)) == pytest.approx(1.0)
     # Moyenne glissante à 85 % : l'historique domine, sans effacer la nouvelle vue.
     assert 0.0 < float(feature[1]) < float(feature[0])
+
+
+def test_descriptor_is_frozen_while_appearance_is_discontinuous(manager, sink):
+    """Après une discontinuité, ``record.feature`` reste inchangé pendant N frames.
+
+    C'est la correction B.3 : sans ce gel, la référence dérivait à chaque frame
+    vers l'apparence de l'AUTRE personne (1 − 0,85⁵ ≈ 56 % au bout de 5 frames),
+    ce qui rendait ``_correct_cross_swaps`` aveugle au moment où le swap
+    s'installait.
+    """
+    manager.assign([observation(7, confidence=0.9, feature=unit(1, 0, 0))], FRAME, 0.0, 1)
+    frozen = manager.records[1].feature.copy()
+
+    # Apparence franchement différente : similarité 0 -> discontinuité.
+    freeze_frames = manager.freeze_gallery_frames
+    assert freeze_frames >= 3
+    for offset in range(1, freeze_frames + 1):
+        manager.assign(
+            [observation(7, confidence=0.9, feature=unit(0, 1, 0))],
+            FRAME,
+            0.1 * offset,
+            1 + offset,
+        )
+        assert np.allclose(manager.records[1].feature, frozen), (
+            f"le descripteur doit rester gelé à la frame {1 + offset}"
+        )
+    assert manager.records[1].feature.shape == frozen.shape
+    # Le diagnostic reste émis, lui : le gel porte sur la référence, pas sur la mesure.
+    assert sink.count("TRACK_ID_APPEARANCE_DISCONTINUITY") >= 1
+    # La position et l'horodatage continuent d'être mis à jour normalement.
+    assert manager.records[1].last_seen_s == pytest.approx(0.1 * freeze_frames)
+
+
+def test_descriptor_resumes_blending_once_the_freeze_expires(manager):
+    """Le gel est borné : au-delà de la péremption, la référence suit l'apparence."""
+    manager.assign([observation(7, confidence=0.9, feature=unit(1, 0, 0))], FRAME, 0.0, 1)
+    frozen = manager.records[1].feature.copy()
+
+    # Frame 2 : un swap se manifeste par UN saut d'apparence, pas par une suite de
+    # sauts. C'est ce saut unique qui arme le gel.
+    manager.assign([observation(7, confidence=0.9, feature=unit(0, 1, 0))], FRAME, 0.2, 2)
+    assert np.allclose(manager.records[1].feature, frozen)
+    deadline = manager.records[1].appearance_suspect_until_frame
+    assert deadline is not None
+
+    # Jusqu'à la péremption incluse, la référence reste gelée même si le saut n'a
+    # eu lieu qu'une fois (l'apparence est ensuite stable d'une frame à l'autre).
+    for frame_index in range(3, deadline + 1):
+        manager.assign(
+            [observation(7, confidence=0.9, feature=unit(0, 1, 0))],
+            FRAME, 0.1 * frame_index, frame_index,
+        )
+        assert np.allclose(manager.records[1].feature, frozen)
+
+    # Au-delà : le mélange reprend, la référence suit de nouveau l'apparence.
+    manager.assign(
+        [observation(7, confidence=0.9, feature=unit(0, 1, 0))],
+        FRAME, 0.1 * (deadline + 1), deadline + 1,
+    )
+    assert not np.allclose(manager.records[1].feature, frozen)
+    assert float(manager.records[1].feature[1]) > 0.0
 
 
 def test_cosine_similarity_bounds():

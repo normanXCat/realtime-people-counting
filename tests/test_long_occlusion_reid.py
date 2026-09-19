@@ -3,10 +3,15 @@
 Symptôme corrigé : une personne cachée longtemps, dont la piste technique a
 expiré, n'était plus jamais réassociée. Trois exigences sont vérifiées ici :
 
-1. la durée de rétention de la galerie d'apparence est **alignée** sur la période
-   de grâce d'occupation (``reid.long_term.gallery_retention_seconds: null``) :
-   la mémoire n'est jamais libérée avant que la personne n'ait eu une chance
-   réaliste de réapparaître ; un découplage explicite reste possible ;
+1. la durée de rétention de la galerie d'apparence est **découplée** explicitement
+   de la période de grâce d'occupation
+   (``reid.long_term.gallery_retention_seconds: 12.0``) : la fenêtre totale
+   passe à grâce + rétention = 17 s, ce qui couvre l'occlusion maximale
+   mesurée (13,5 s, rapport §4.6) que l'ancienne valeur alignée (10 s)
+   laissait sortir de mémoire par construction. Le repli sur
+   ``grace_period_seconds`` quand la clé est **omise** reste disponible et est
+   testé séparément, dans un manager construit explicitement avec
+   ``gallery_retention_seconds=None`` ;
 2. le seuil d'apparence peut être assoupli de façon **progressive** selon la
    durée d'absence — mais uniquement si un plancher est déclaré, et jamais en
    dessous de ce plancher (aucun assouplissement subi par défaut) ;
@@ -127,15 +132,35 @@ def enter(sim, track_id=1, x=150.0):
 # ---------------------------------------------------------------------------
 # 1. Durée de rétention : alignée sur la grâce, découplable explicitement
 # ---------------------------------------------------------------------------
-def test_retention_is_aligned_on_the_occupancy_grace_by_default(config):
+def test_production_retention_covers_the_measured_long_occlusions(config):
+    """La config livrée porte une rétention explicite de 12,0 s.
+
+    C'est une vérification de **valeur de production** : elle doit porter sur
+    12,0 et non sur ``None``. Le repli sur la grâce est un comportement
+    distinct, couvert par le test suivant.
+    """
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert config.reid.long_term.gallery_retention_seconds is None
-    assert manager.purge_retention_seconds == pytest.approx(
-        config.timing.grace_period_seconds
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(12.0)
+    assert manager.purge_retention_seconds == pytest.approx(12.0)
+    # Fenêtre totale = grâce + rétention : strictement supérieure à l'occlusion
+    # maximale mesurée (13,5 s), sans quoi les occultations longues — celles qui
+    # posent problème — resteraient hors mémoire par construction.
+    total_window = (
+        config.timing.grace_period_seconds + manager.purge_retention_seconds
     )
+    assert total_window > 13.5
+
+
+def test_retention_falls_back_on_the_occupancy_grace_when_omitted():
+    """Repli explicite : une rétention omise aligne la mémoire sur la grâce."""
+    manager = IdentityManager(
+        long_term=LongTermReidConfig(enabled=True, gallery_retention_seconds=None),
+        grace_period_seconds=3.0,
+    )
+    assert manager.purge_retention_seconds == pytest.approx(3.0)
 
 
 def test_explicit_retention_decouples_the_memory_from_the_occupancy_grace():
@@ -265,10 +290,43 @@ def test_typical_long_occlusion_is_reassociated_without_any_new(long_config, sin
     assert manager.occupancy_range == (1, 1)
 
 
+def test_long_occlusion_within_the_12s_retention_is_still_reassociated(long_config):
+    """Preuve que la rétention de 12 s protège : à 7 s, la mémoire est ACTIVE.
+
+    La fenêtre de galerie du test vaut ici grâce (3 s) + rétention (12 s) = 15 s,
+    soit 150 frames à 10 fps. À 7 s d'occultation — au-delà de l'ancienne
+    fenêtre alignée (3 + 3 = 6 s), qui aurait déjà libéré la mémoire — la
+    personne doit donc encore être ré-associée sous le **même** ``person_id``.
+    """
+    sink = ListSink("long")
+    manager = build(long_config, sink)
+    sim = Sim(manager).steps(5)
+    enter(sim)
+    assert manager.occupancy_operational == 1
+    person_id = manager.identities.person_of(1)
+
+    sim.steps(70)                                   # 7 s d'occultation
+    assert manager.identities.person_of(1) is not None, (
+        "à 7 s, la rétention de 12 s doit encore maintenir la mémoire"
+    )
+    assert manager.occupancy_operational == 1
+
+    sink.events.clear()
+    sim.steps(3, [det(42, INSIDE_Y, x=152.0)])      # nouvel ID technique, même personne
+
+    assert sink.count("REID_MATCH") == 1, "dans la fenêtre : la réassociation a lieu"
+    assert sink.count("NEW") == 0
+    assert sink.count("TECHNICAL_ID_CHANGED") == 1
+    assert manager.identities.person_of(42) == person_id
+    assert manager.total_new == 0
+    assert manager.occupancy_operational == 1
+
+
 def test_occlusion_beyond_retention_is_explicit_and_never_silent(long_config):
     """Au-delà de la rétention : comportement explicite, jamais silencieux.
 
-    Deux exigences sont vérifiées ensemble :
+    Fenêtre de galerie = grâce (3 s) + rétention (12 s) = 15 s (150 frames).
+    Au-delà, deux exigences sont vérifiées ensemble :
 
     - la mémoire de galerie est bien libérée (aucune réassociation possible) ;
     - la personne comptée n'est **jamais** retirée en silence : elle reste dans la
@@ -283,8 +341,9 @@ def test_occlusion_beyond_retention_is_explicit_and_never_silent(long_config):
     enter(sim)
     assert manager.occupancy_operational == 1
 
-    # Fenêtre de galerie = grâce (3 s) + rétention (3 s) : 70 frames = 7 s.
-    sim.steps(70)
+    # 150 frames = 15 s : la fenêtre totale (3 s de grâce + 12 s de rétention)
+    # est franchie, avec une marge de 10 frames.
+    sim.steps(160)
     assert manager.occupancy_operational == 1
     assert manager.occupancy_observed == 0
     assert manager.occupancy_uncertain == 1

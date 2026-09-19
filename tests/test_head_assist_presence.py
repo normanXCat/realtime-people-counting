@@ -10,7 +10,9 @@ from occupancy_manager import Detection, OccupancyManager
 from occupancy_types import TrackState
 
 
-def _make_head_assist_manager(make_config, sink, max_extension=2.0, min_conf=0.5):
+def _make_head_assist_manager(
+    make_config, sink, max_extension=2.0, min_conf=0.5, max_head_staleness=1
+):
     cfg = make_config({
         "line": {"inside_side": "negative"},
         "timing": {
@@ -25,6 +27,7 @@ def _make_head_assist_manager(make_config, sink, max_extension=2.0, min_conf=0.5
                 "enabled": True,
                 "min_keypoint_confidence": min_conf,
                 "max_presence_extension_seconds": max_extension,
+                "max_head_staleness_frames": max_head_staleness,
                 "keypoints_used": ["nose", "left_eye", "right_eye"],
             }
         },
@@ -105,9 +108,41 @@ def test_head_assist_transitions_to_occluded_when_head_not_confident(make_config
 
 
 def test_head_assist_extension_expires_after_max_seconds(make_config, sink):
-    """3. Au-delà de max_presence_extension_seconds -> PRESENCE_EXTENSION_EXPIRED émis, bascule vers OCCULTEE."""
+    """3. Au-delà de max_presence_extension_seconds : PRESENCE_EXTENSION_EXPIRED, puis OCCULTEE.
+
+    La chute de hauteur est maintenue **non confirmée**
+    (``height_drop_confirm_frames`` volontairement élevé) : l'ancre reste donc
+    non fiable pendant toute la séquence. C'est désormais le seul cas où le
+    maintien par la tête s'applique durablement sur une piste observée, depuis
+    la suppression de ``not presence.head_assist.enabled`` dans la réadaptation
+    de hauteur (lot B.1) : une chute **stabilisée** redevient fiable au bout de
+    ``height_drop_confirm_frames`` frames et la personne assise est suivie
+    normalement, sans plus rien à maintenir. Le garde-fou porte donc bien sur le
+    maintien lui-même : il doit expirer, jamais maintenir indéfiniment.
+    """
     max_extension = 0.5  # 5 frames à 10 ips
-    manager, _ = _make_head_assist_manager(make_config, sink, max_extension=max_extension)
+    cfg = make_config({
+        "line": {"inside_side": "negative"},
+        "timing": {
+            "warmup_seconds": 0.3,
+            "warmup_min_frames": 4,
+            "confirmation_seconds": 0.2,
+            "grace_period_seconds": 1.0,
+            "fps_estimate_window": 4,
+        },
+        "anchor": {"height_drop_confirm_frames": 50},
+        "presence": {
+            "head_assist": {
+                "enabled": True,
+                "min_keypoint_confidence": 0.5,
+                "max_presence_extension_seconds": max_extension,
+                "keypoints_used": ["nose", "left_eye", "right_eye"],
+            }
+        },
+    })
+    line = VirtualLine(p1=(0.0, 0.5), p2=(1.0, 0.5), inside_side="negative")
+    manager = OccupancyManager(cfg, event_sink=sink, line=line)
+    manager.set_frame_budget(cfg.timing.frame_budget(10.0))
     frame = np.zeros((600, 600, 3), dtype=np.uint8)
 
     box_inside = np.array([260.0, 250.0, 340.0, 450.0])
@@ -118,7 +153,7 @@ def test_head_assist_extension_expires_after_max_seconds(make_config, sink):
     track = manager.tracks[1]
     assert track.state is TrackState.PRESENTE
 
-    # Chute de hauteur continue pendant 1.0 s (> 0.5 s) avec tête confiante
+    # Chute de hauteur continue pendant 1,5 s (> 0,5 s) avec tête confiante.
     drop_box = np.array([260.0, 350.0, 340.0, 450.0])
     head_pt = (300.0, 360.0)
     for f in range(10, 25):
@@ -136,6 +171,78 @@ def test_head_assist_extension_expires_after_max_seconds(make_config, sink):
     assert len(expired_events) >= 1
     assert expired_events[0]["person_id"] == 1
     assert expired_events[0]["max_extension_seconds"] == pytest.approx(max_extension)
+
+
+@pytest.mark.parametrize("tolerance,expected_count", [(1, 1), (2, 2)])
+def test_head_maintenance_accepts_only_fresh_head_points(
+    make_config, sink, tolerance, expected_count
+):
+    """2 bis. ``_handle_missing`` n'accepte qu'un point tête frais (lot B.2).
+
+    Le point tête provient de la même détection que la boîte : il est donc figé
+    dès que la personne n'est plus observée. Sur un point périmé au-delà de
+    ``presence.head_assist.max_head_staleness_frames``, le maintien doit être
+    **refusé** et le chemin normal s'appliquer (OCCULTEE), au lieu de prolonger
+    la présence sur une donnée qui n'a plus de lien avec l'image courante.
+    """
+    manager, _ = _make_head_assist_manager(
+        make_config, sink, max_extension=10.0, max_head_staleness=tolerance
+    )
+    frame = np.zeros((600, 600, 3), dtype=np.uint8)
+
+    box_inside = np.array([260.0, 250.0, 340.0, 450.0])
+    # Série continue : le point tête est rafraîchi à chaque frame observée.
+    for f in range(1, 21):
+        t = f * 0.1
+        manager.process_frame(
+            [
+                Detection(
+                    1, box_inside, 0.9,
+                    head_point=(300.0, 260.0), head_confidence=0.9,
+                )
+            ],
+            frame, t, f,
+        )
+
+    track = manager.tracks[1]
+    assert track.state is TrackState.PRESENTE
+    # Dernière observation : frame 20 — le point tête y est frais.
+    assert track.head_point_frame_index == 20
+
+    sink.events.clear()
+    # Trois frames sans aucune détection : la péremption vaut 1, puis 2, puis 3.
+    for f in range(21, 24):
+        manager.process_frame([], frame, f * 0.1, f)
+
+    maintained = sink.of_type("PRESENCE_MAINTAINED_BY_HEAD")
+    assert len(maintained) == expected_count, (
+        f"tolérance {tolerance} frame(s) : {expected_count} maintien(s) attendu(s), "
+        "aucun au-delà — un point tête périmé ne maintient pas la présence"
+    )
+    if maintained:
+        assert maintained[0]["feet_anchor_status"] == "no_detection"
+    # Au-delà de la tolérance, le chemin normal s'applique : OCCULTEE, grâce, purge.
+    assert track.state is TrackState.OCCULTEE
+
+
+def test_head_maintenance_is_refused_without_any_head_point(make_config, sink):
+    """2 ter. Sans point tête connu, aucun maintien : pas de valeur par défaut inventée."""
+    manager, _ = _make_head_assist_manager(make_config, sink, max_extension=10.0)
+    frame = np.zeros((600, 600, 3), dtype=np.uint8)
+
+    box_inside = np.array([260.0, 250.0, 340.0, 450.0])
+    for f in range(1, 10):
+        manager.process_frame([Detection(1, box_inside, 0.9)], frame, f * 0.1, f)
+
+    track = manager.tracks[1]
+    assert track.current_head_point is None
+    assert track.head_point_frame_index == 9
+
+    sink.events.clear()
+    manager.process_frame([], frame, 1.0, 10)
+
+    assert sink.of_type("PRESENCE_MAINTAINED_BY_HEAD") == []
+    assert track.state is TrackState.OCCULTEE
 
 
 def test_head_point_crossing_line_never_triggers_crossing(make_config, sink):
