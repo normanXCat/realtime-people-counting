@@ -391,17 +391,7 @@ def test_reappearance_after_release_creates_a_new_identity(manager, frame, sink)
     sim = Sim(manager, frame).warmup()
     sim.steps(2, [detection(1, OUTSIDE_Y)])
     sim.steps(3, [detection(1, INSIDE_Y)])
-    # Au-delà de la FENÊTRE de galerie réelle (grâce + rétention, dérivée de la
-    # configuration) : depuis le lot A.2 la rétention vaut 12 s, un nombre de
-    # frames codé en dur ne suffirait plus à libérer la mémoire.
-    window_frames = int(
-        (
-            manager.identities.grace_period_seconds
-            + manager.identities.purge_retention_seconds
-        )
-        * TEST_FPS
-    ) + 2
-    sim.steps(window_frames)
+    sim.steps(40)  # bien au-delà de la rétention de galerie
 
     sim.steps(5, [detection(9, INSIDE_Y)])
     assert sink.count("REID_MATCH") == 0

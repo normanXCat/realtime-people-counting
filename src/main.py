@@ -101,46 +101,6 @@ TRACKED_DEPENDENCIES = (
 
 
 # ---------------------------------------------------------------------------
-# Incohérence de base de temps track_buffer (frames) / galerie ReID (secondes)
-# ---------------------------------------------------------------------------
-def track_buffer_timebase_warning(
-    config: PipelineConfig, source: int | str, fps: float | None = None
-) -> str | None:
-    """Avertissement (A.4) sur la durée réelle couverte par ``track_buffer``.
-
-    ``tracker.track_buffer`` est exprimé en FRAMES, la galerie ReID long terme en
-    SECONDES : les deux mémoires ne couvrent donc pas la même durée. Sur un
-    fichier vidéo à 30 ips, 150 frames ≈ 5 s de contenu ; sur une caméra live
-    traitée à ~3,5 FPS, 150 frames ≈ 43 s de temps réel.
-
-    Aucune conversion automatique n'est appliquée (ce serait inventer une
-    cadence). Un avertissement — jamais un refus — est journalisé au démarrage
-    quand la source est une caméra live (index entier), puis complété par la
-    durée réellement couverte dès que le FPS mesuré est disponible.
-
-    Returns:
-        Le message à journaliser, ou ``None`` si la source n'est pas une caméra
-        live.
-    """
-    if not isinstance(source, int):
-        return None
-    buffer_frames = int(config.tracker.track_buffer)
-    if fps is not None and fps > 0:
-        covered = buffer_frames / float(fps)
-        return (
-            f"tracker.track_buffer={buffer_frames} frames est exprimé en FRAMES alors "
-            f"que la galerie ReID l'est en SECONDES : au FPS mesuré de {fps:.2f}, il "
-            f"couvre {covered:.1f} s de temps réel. Les deux mémoires ne couvrent pas "
-            "la même durée — à trancher lors de la calibration."
-        )
-    return (
-        f"tracker.track_buffer={buffer_frames} frames est exprimé en FRAMES alors que "
-        "la galerie ReID l'est en SECONDES : sur caméra live, la durée réellement "
-        "couverte dépend du FPS mesuré et diffère de celle d'un fichier 30 ips."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -561,16 +521,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "CONFIG_WARNING", 0.0, 0, code=code, details=message, source="config"
         )
         print(f"[CONFIG] {code} : {message}", file=sys.stderr)
-    # A.4 — incohérence de base de temps entre les deux mémoires (aucun refus,
-    # seulement un avertissement) : sur caméra live, 150 frames ne valent pas 5 s.
-    timebase_message = track_buffer_timebase_warning(config, source)
-    if timebase_message is not None:
-        logging.getLogger("main").warning(timebase_message)
-        logger.emit(
-            "CONFIG_WARNING", 0.0, 0,
-            code="track_buffer_timebase_frames_vs_seconds",
-            details=timebase_message, source="config",
-        )
     print(
         f"[MODE] {args.mode} | source={source} | étape 1/2 : définition manuelle "
         "de la ligne virtuelle (la première image va s'afficher)"
@@ -655,7 +605,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     frame_index = 0
     last_detection_s = 0.0
     no_detection_announced = False
-    timebase_reported = False
 
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
@@ -831,20 +780,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             if fps_estimator.is_ready:
                 budget = config.timing.frame_budget(fps_estimator.require_fps())
                 occupancy.set_frame_budget(budget)
-                if not timebase_reported:
-                    # Dès que le FPS est mesuré, l'avertissement A.4 est complété
-                    # par la durée réellement couverte par track_buffer.
-                    message = track_buffer_timebase_warning(
-                        config, source, fps_estimator.require_fps()
-                    )
-                    if message is not None:
-                        timebase_reported = True
-                        logging.getLogger("main").warning(message)
-                        logger.emit(
-                            "CONFIG_WARNING", timestamp_s, frame_index,
-                            code="track_buffer_timebase_frames_vs_seconds",
-                            details=message, source="config",
-                        )
 
             occupancy.process_frame(detections, frame, timestamp_s, frame_index)
 

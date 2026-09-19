@@ -55,30 +55,16 @@ compromis dans `docs/rapport_final.md` § 4.6) :
   condition ; le compteur de stabilité est indexé par `person_id`, donc un
   changement d'identifiant technique réassocié ne le remet pas à zéro.
 - **Réidentification après occultation longue** :
-  `reid.long_term.gallery_retention_seconds` (explicite, 12 s) découple la
-  rétention de la galerie d'apparence de la grâce d'occupation : la fenêtre
-  totale (17 s) couvre le **maximum** d'occlusion mesuré (13,5 s), là où
-  l'ancienne valeur `null` (fenêtre 10 s) laissait les occultations longues hors
-  mémoire par construction. Une tolérance progressive du seuil, bornée, reste
-  disponible mais désactivée par défaut.
+  `reid.long_term.gallery_retention_seconds: null` aligne la rétention de la
+  galerie d'apparence sur la grâce d'occupation (la mémoire n'est jamais libérée
+  avant que la personne n'ait eu une chance de réapparaître). Une tolérance
+  progressive du seuil, bornée, reste disponible mais désactivée par défaut.
 - **Assistance par détection de tête (additif, désactivé par défaut)** :
   `presence.head_assist.enabled: false`. Conçu pour les amphithéâtres où les pieds
   sont masqués par les tables : utilise `yolo11s-pose.pt` (17 points-clés COCO) pour
   maintenir la présence d'une personne sans basculer à tort en `OCCULTEE`.
-  Cinq points-clés de tête sont utilisés (`nose`, yeux, **oreilles** — les seuls
-  qui survivent à une vue de profil) ; `max_head_staleness_frames` interdit de
-  maintenir une présence sur la base d'un point tête périmé de plus d'une frame.
   Le point tête ne participe **jamais** au calcul de franchissement de ligne ni aux
   décisions IN/OUT.
-- **Correctif occlusion dense (lots A et B)** : seuils BoT-SORT resserrés
-  (`match_thresh` 0,75, `proximity_thresh` 0,8, `new_track_thresh` 0,45),
-  descripteur d'apparence HSV **par bandes** sur crop érodé (paramétré par
-  `reid.long_term.descriptor`), gel du descripteur pendant une discontinuité
-  (`reid.appearance_continuity.freeze_gallery_frames`), second signal
-  multi-personnes par **nombre de têtes dans la boîte**
-  (`geometry.multi_person_box.head_count_*`). Détail, mesures et **réserves**
-  dans `docs/correctif_occlusion.md` : sur les clips disponibles, le lot A n'a
-  pas amélioré la stabilité d'identité et n'est donc **pas validé**.
 
 ## Installation
 
@@ -341,14 +327,3 @@ docs/politique_confidentialite.md  données, conservation, accès
   annotées (ensemble de calibration et ensemble de test disjoints).
 - La vérité terrain MOT dense (IDF1, ID switches) est à produire et à évaluer
   séparément avec `py-motmetrics`.
-- Les seuils BoT-SORT du lot A (`match_thresh`, `proximity_thresh`,
-  `new_track_thresh`) ne sont **pas validés** : sur un clip de salle de classe
-  (300 frames), les identifiants techniques créés passent de 11 à 15 et les
-  changements d'identifiant technique de 2 à 6, sans qu'aucun swap n'ait été
-  observé. Voir `docs/correctif_occlusion.md` §1.2.
-- L'assistance tête n'a **jamais** été exécutée sur vidéo réelle :
-  `models/yolo11s-pose.pt` n'est pas versionné. Les tests couvrent la logique de
-  décision et la forme des tenseurs, pas le coût CPU du modèle pose.
-- `reid.long_term.similarity_threshold` (0,40) reste PROVISOIRE faute de vérité
-  terrain inter-identités : aucune valeur n'est proposée sans histogramme
-  inter-personnes mesuré.

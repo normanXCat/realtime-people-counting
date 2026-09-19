@@ -347,16 +347,8 @@ def test_low_confidence_descriptor_does_not_pollute_gallery(manager):
 
 
 def test_descriptor_is_blended_and_renormalized(manager):
-    # Lot B.3.b : une nouvelle vue d'apparence PROCHE (similarité 0,995 > seuil de
-    # continuité 0,5) est fondue comme avant. La vue orthogonale unit(0, 1, 0)
-    # utilisée initialement est désormais interprétée comme une discontinuité et
-    # GÈLE le descripteur pendant ``freeze_gallery_frames`` — c'est le
-    # comportement voulu par B.3.b, testé séparément dans
-    # ``tests/test_correctif_occlusion.py``.
     manager.assign([observation(7, confidence=0.9, feature=unit(1, 0, 0))], FRAME, 0.0, 1)
-    manager.assign(
-        [observation(7, confidence=0.9, feature=unit(1, 0.1, 0))], FRAME, 0.1, 2
-    )
+    manager.assign([observation(7, confidence=0.9, feature=unit(0, 1, 0))], FRAME, 0.1, 2)
     feature = manager.records[1].feature
     assert float(np.linalg.norm(feature)) == pytest.approx(1.0)
     # Moyenne glissante à 85 % : l'historique domine, sans effacer la nouvelle vue.

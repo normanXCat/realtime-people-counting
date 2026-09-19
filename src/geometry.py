@@ -504,62 +504,6 @@ def check_box_width_growth(
     return is_abnormal, float(current_ratio), float(max_growth_ratio)
 
 
-def detect_multi_person_by_head_count(
-    boxes: Sequence[Sequence[float]],
-    head_points: Sequence[tuple[float, float] | None],
-    separation_ratio: float = 0.4,
-) -> dict[int, dict[str, float]]:
-    """Signale une boîte contenant **plusieurs têtes** (angle mort de la largeur).
-
-    Le détecteur ``check_box_width_growth`` compare la largeur courante à un
-    historique **d'avant la fusion** : deux personnes assises côte à côte dès la
-    première frame ne le déclenchent jamais, leur largeur fusionnée étant la
-    référence. Ce second signal ne dépend d'aucun historique : il compte les
-    points de tête (issus du modèle pose, donc déjà filtrés en confiance) qui
-    tombent à l'intérieur d'une même boîte. Deux têtes séparées de plus de
-    ``separation_ratio × largeur_boîte`` concluent à une fusion, dès la première
-    frame.
-
-    Args:
-        boxes: boîtes ``(x1, y1, x2, y2)`` de la frame.
-        head_points: point tête associé à chaque boîte (``None`` si aucun
-            point-clé fiable) — même ordre que ``boxes``.
-        separation_ratio: fraction de la largeur de boîte au-delà de laquelle
-            deux têtes internes attestent de deux personnes distinctes.
-
-    Returns:
-        ``{index_boîte: {"heads", "separation", "box_width"}}`` pour les boîtes
-        suspectées. Vide si aucune tête n'est exploitable.
-    """
-    heads = [point for point in head_points if point is not None]
-    if len(heads) < 2:
-        return {}
-    flagged: dict[int, dict[str, float]] = {}
-    for index, box in enumerate(boxes):
-        if len(box) < 4:
-            continue
-        x1, y1, x2, y2 = (float(v) for v in box[:4])
-        width = x2 - x1
-        if width <= 0:
-            continue
-        inside = [
-            point
-            for point in heads
-            if x1 <= point[0] <= x2 and y1 <= point[1] <= y2
-        ]
-        if len(inside) < 2:
-            continue
-        xs = sorted(point[0] for point in inside)
-        separation = float(xs[-1] - xs[0])
-        if separation > float(separation_ratio) * width:
-            flagged[int(index)] = {
-                "heads": float(len(inside)),
-                "separation": separation,
-                "box_width": float(width),
-            }
-    return flagged
-
-
 # ---------------------------------------------------------------------------
 # Assistance tête : extraction des points-clés COCO (additif)
 # ---------------------------------------------------------------------------

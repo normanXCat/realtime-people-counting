@@ -43,15 +43,7 @@ tracker:
   # silencieuse).
   track_high_thresh: 0.4    # plancher de l'association principale
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
-  # new_track_thresh 0.7 -> 0.45 (PROVISOIRE). Une personne assise partiellement
-  # masquée sort à 0.35–0.6 : détectée, mais sans le droit de créer une piste,
-  # elle ne pouvait JAMAIS obtenir d'identifiant après expiration de
-  # track_buffer (symptôme « personne jamais ré-attribuée »). Compromis accepté :
-  # hausse du nombre de pistes créées sur détections faibles. Le garde-fou
-  # contre les faux positifs est reporté explicitement sur le filtre géométrique
-  # ci-dessous (geometry.min_aspect_ratio_wh, max_aspect_ratio_wh,
-  # min_box_height_px, min_box_width_px) et sur timing.confirmation_seconds.
-  new_track_thresh: 0.45
+  new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
 
   # -- Persistance de piste et ré-identification native -------------------
   # track_buffer : nombre de frames pendant lesquelles une piste perdue reste
@@ -63,35 +55,12 @@ tracker:
   # mais plus de mémoire/calcul et un risque légèrement accru de réassociation
   # erronée en forte densité de personnes d'apparence similaire.
   track_buffer: 150
-  # -- Incohérence de base de temps entre les deux mémoires -----------------
-  # track_buffer est exprimé en FRAMES (150) alors que la galerie ReID
-  # long terme (reid.long_term.gallery_retention_seconds) est exprimée en
-  # SECONDES. Sur un fichier vidéo à 30 ips, 150 frames ≈ 5 s de contenu ; sur
-  # une caméra live traitée à ~3,5 FPS, 150 frames ≈ 43 s de temps réel. Les
-  # deux mécanismes ne couvrent donc PAS la même durée selon source.default.
-  # Aucune conversion automatique n'est appliquée (ce serait inventer une
-  # cadence) : un avertissement est journalisé au démarrage quand la source est
-  # une caméra live (voir src/main.py), rappelant la durée réelle couverte par
-  # track_buffer au FPS mesuré. À trancher lors de la calibration.
   # with_reid : module d'apparence de BoT-SORT. Il tente une réassociation AVANT
   # de créer un nouvel identifiant technique, en complément du ReID long terme
   # de IdentityManager (qui, lui, opère après expiration de la piste technique).
   with_reid: true
-  # match_thresh 0.9 -> 0.75 (PROVISOIRE). Dans Ultralytics, match_thresh est un
-  # seuil de COÛT : linear_assignment(dists, thresh=match_thresh) avec
-  # dists = 1 - IoU. À 0.9 le tracker acceptait un appariement à IoU 0.1, ce qui
-  # autorise l'appariement croisé de deux personnes voisines — premier facteur
-  # de swap d'identifiant. Compromis : sous 0.75, une piste rapide peut être
-  # perdue plus tôt et basculer sur le chemin de réassociation par galerie.
-  match_thresh: 0.75
-  # proximity_thresh 0.5 -> 0.8 (PROVISOIRE). Dans BOTrack.get_dists,
-  # dists_mask = ious_dist > proximity_thresh puis emb_dists[dists_mask] = 1.0 :
-  # l'apparence n'était consultée que si l'IoU était déjà >= 0.5. Une personne
-  # qui ressort d'une occlusion a un IoU quasi nul avec sa boîte prédite, donc
-  # le ReID natif était neutralisé exactement quand il aurait servi. Compromis
-  # accepté : apparence consultée presque toujours (coût de calcul en hausse,
-  # risque accru sur des apparences très similaires).
-  proximity_thresh: 0.8
+  match_thresh: 0.9         # seuil d'association IoU principal
+  proximity_thresh: 0.5     # seuil de proximité du ReID natif
   appearance_thresh: 0.25   # seuil d'apparence du ReID natif
   # Caméra FIXE : aucune compensation de mouvement ne doit être estimée (une GMC
   # active introduirait une instabilité de boîte et d'identifiant sans cause).
@@ -125,43 +94,7 @@ reid:
     # réapparaître (fenêtre totale = grâce + rétention, soit 2 × grâce par
     # défaut). Une valeur explicite découple la mémoire ReID de la grâce
     # d'occupation et doit être justifiée.
-    # gallery_retention_seconds : null -> 12.0 (explicite).
-    # Justification : `within_gallery_window` (src/identity_manager.py) donne une
-    # fenêtre totale `grace_period_seconds + purge_retention_seconds` = 10 s avec
-    # la valeur null. Or les occlusions mesurées sur les sessions réelles
-    # (rapport §4.6 : événements OCCLUDED -> réapparition) ont un MAXIMUM de
-    # 13,5 s. Les occlusions longues — précisément celles qui posent problème —
-    # tombaient donc hors mémoire par construction. 12.0 porte la fenêtre totale
-    # à 17 s (> 13,5 s) tout en restant bornée. Compromis accepté : mémoire
-    # d'apparence conservée plus longtemps après purge (plus de candidats à
-    # comparer, donc un coût de calcul et un risque de fausse réassociation
-    # marginalement supérieurs, encadrés par safety_margin).
-    gallery_retention_seconds: 12.0
-    # Momentum de la moyenne glissante qui met à jour le descripteur d'apparence
-    # d'une identité observée (était codé en dur à 0.85 dans IdentityManager).
-    # `feature = momentum * précédent + (1 - momentum) * courant` : une valeur
-    # proche de 1 rend la galerie très inerte (résistante au bruit, lente à
-    # suivre un vrai changement), une valeur basse la rend réactive (et vulnérable
-    # à un swap non détecté). Borne exigée : 0.0 <= x < 1.0. Le gel du
-    # descripteur pendant un swap est réglé séparément par
-    # reid.appearance_continuity.freeze_gallery_frames.
-    feature_momentum: 0.85
-    # -- Descripteur d'apparence HSV (extracteur par défaut) ----------------
-    # Le descripteur global (histogramme teinte x saturation sur le crop complet)
-    # encode principalement la couleur des chaises, des tables et du mur : deux
-    # personnes de la même rangée y donnent couramment une similarité > 0.9 alors
-    # que similarity_threshold vaut 0.40. Le descripteur est donc calculé par
-    # bandes horizontales sur un crop érodé (le fond et les voisins sont rognés).
-    descriptor:
-      # Fraction de la largeur rognée de CHAQUE côté avant tout calcul.
-      horizontal_crop_ratio: 0.15
-      # Nombre de bandes horizontales (tête / torse / bas).
-      bands: 3
-      # Poids de chaque bande, du haut vers le bas. La bande basse est pondérée
-      # plus faiblement : elle est la plus souvent occultée par une table.
-      band_weights: [1.0, 1.0, 0.5]
-      bins_hue: 24
-      bins_saturation: 8
+    gallery_retention_seconds: null
     # Tolérance progressive du seuil d'apparence selon la durée d'absence (une
     # longue occultation change un peu l'apparence : angle, luminosité). Le seuil
     # descend linéairement de similarity_threshold vers ce plancher au bout de
@@ -200,15 +133,6 @@ reid:
     # tant que la continuité n'est pas rétablie, et au plus une fois par
     # intervalle.
     min_interval_seconds: 1.0
-    # Gel du descripteur de galerie après une discontinuité d'apparence : tant
-    # que le drapeau est actif sur une piste, `_blend` n'est pas appliqué — seul
-    # le descripteur cesse d'être mis à jour, la position, la hauteur et
-    # last_seen_s continuent normalement. Sans ce gel, un swap non détecté fait
-    # dériver la référence de l'identité vers l'apparence de l'autre personne
-    # (1 - 0.85^5 ≈ 56 % en 5 frames), et `_correct_cross_swaps` devient aveugle
-    # au moment précis où la correction serait utile. Valeur par défaut
-    # équivalente à min_interval_seconds en frames au FPS mesuré, borne min 3.
-    freeze_gallery_frames: 3
 
   # -- Correction active des inversions d'identité (swap) ------------------
   # Réintroduit le comportement [RE-ID-LOCK] de l'ancien IDManager : compare
@@ -322,16 +246,5 @@ presence:
     pose_model_path: models/yolo11s-pose.pt
     pose_model_expected_sha256: null      # à renseigner une fois le poids téléchargé
     min_keypoint_confidence: 0.5          # PROVISOIRE — à calibrer
-    # keypoints_used : 3 points -> 5 (avenant). Le rapport §4.7 annonçait 5
-    # points-clés alors que la configuration n'en déclarait que 3. Les oreilles
-    # (left_ear, right_ear) sont précisément les points qui survivent à une vue
-    # de profil : les exclure réduisait l'assistance au seul visage de face.
-    # ALLOWED_HEAD_KEYPOINTS (src/config.py) accepte déjà les cinq.
-    keypoints_used: [nose, left_eye, right_eye, left_ear, right_ear]
+    keypoints_used: [nose, left_eye, right_eye]
     max_presence_extension_seconds: 10.0  # PROVISOIRE — borne de sécurité
-    # Péremption du point tête dans `_handle_missing` : le point tête d'une
-    # piste non observée est celui de la DERNIÈRE frame vue. Au-delà de
-    # `max_head_staleness_frames` frames, il n'a plus de lien avec l'image
-    # courante et ne doit plus maintenir la présence (sinon la personne est
-    # maintenue jusqu'à 10 s alors qu'elle est réellement sortie du champ).
-    max_head_staleness_frames: 1
