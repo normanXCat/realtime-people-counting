@@ -1,14 +1,64 @@
 # Lot 1 — Base de temps et seuil NMS
 
-> Premier lot du plan. Prérequis : catalogue du corpus (§2 de `CLAUDE.md`),
-> vérité terrain (§3), critères d'acceptation validés (§4), contrôle de
-> déterminisme (§2.1). Lire `docs/diagnostic.md` avant.
+> Prérequis : **lot 0 accepté** (sans harnais versionné, ce lot n'est pas
+> mesurable), catalogue du corpus (§2 de `CLAUDE.md`), vérité terrain (§3),
+> critères d'acceptation validés (§4), contrôle de déterminisme (§2.1). Lire
+> `docs/diagnostic.md` avant.
+>
+> **Élargi après la session 0.** Deux mesures ont changé le contenu de ce lot :
+> l'écart entre base de temps vidéo et base murale (13 purges contre 0 sur la
+> même vidéo) et les 235 rejets `aspect_ratio_out_of_range` sur `fort_occ`.
+> Voir `docs/correctif_occlusion.md` §11.7 et §11.9.
 
 **Pourquoi ce lot en premier.** Deux correctifs en amont de tout le reste :
 l'un rétablit la cohérence temporelle sans laquelle aucune mesure de durée
 d'occlusion n'est interprétable, l'autre empêche la destruction de détections
 avant même que le tracker les voie. Aucun réglage en aval ne peut récupérer une
 détection supprimée par la NMS ni une piste tuée trop tôt.
+
+---
+
+## 1.0 Base de temps selon la source
+
+**Mesure de la session 0** : sur `fort_occ4`, en base de temps murale (celle
+qu'emploie réellement `src/main.py`), `PURGE` tombe de 13 à **0**. Le mécanisme
+est identifié : `grace_period_frames` est compté en frames (150) tandis que la
+fenêtre de galerie est en secondes sur `timestamp_s`
+(`identity_manager.py:1175-1179`) ; à ~4 ips de traitement, 17 s murales valent
+≈ 2,4 s de vidéo, donc la galerie libère l'identité avant que la FSM puisse la
+purger — `release_expired` retire la piste de `self.tracks` et `_handle_missing`
+n'a plus rien à purger (`occupancy_manager.py:631-633`). Le commentaire « la
+purge a déjà été journalisée » y est faux dans ce régime.
+
+Second effet mesuré : le bruit run-à-run est **nul** en base vidéo (3 exécutions
+concordantes) et **non nul** en base murale (±1 sur l'identité, ±37 sur
+`INCONSISTENT_STATE`), parce que le FPS de traitement varie avec la charge
+machine et que la base murale propage cette variation dans toutes les durées.
+
+**Correctif** : l'horloge du pipeline suit la source.
+
+```yaml
+timing:
+  time_base: auto     # auto | video | wall
+                      # auto ⇒ horodatage vidéo si la source est un fichier,
+                      #        temps mural si la source est une caméra
+```
+
+- Une seule horloge par exécution, consultée partout (FSM, galerie, snapshots) —
+  pas de mélange frames/secondes/temps mural selon le module.
+- La base retenue est journalisée au démarrage et publiée dans
+  `config_resolved.yaml` ; elle figure dans chaque entrée du harnais (champ
+  `time_base`).
+- `video` et `wall` restent forçables explicitement, pour comparer les deux
+  régimes lors d'une investigation.
+
+**Pourquoi c'est dans ce lot** : sans cela, les lots 2 à 7 se mesureraient sur
+fichier dans un régime qui n'existe pas en production, et aucun de leurs
+résultats ne transposerait à la caméra.
+
+**Tests** : sélection correcte de la base selon le type de source ; cohérence
+grâce FSM / fenêtre galerie dans les deux bases ; sur `fort_occ4` en base
+vidéo, `PURGE` retrouve 13.
 
 ---
 
@@ -91,7 +141,40 @@ d'association par frame.
 
 ---
 
-## 1.3 Mesure du lot
+## 1.3 Ordre du filtre géométrique
+
+**Mesure de la session 0** : sur `fort_occ`, les 235 `DETECTION_REJECTED_GEOMETRY`
+sont **tous** `aspect_ratio_out_of_range`, tous des boîtes trop larges (ratio
+W/H jusqu'à 3,85). Or `check_detection_geometry` s'exécute **avant** la
+détection de fusion (`occupancy_manager.py:365-399`). Une boîte large est
+exactement la signature de deux personnes côte à côte : le filtre élimine donc
+le cas que `POSSIBLE_MULTI_PERSON_BOX` doit attraper, avant qu'il puisse être
+émis.
+
+Conséquence directe sur le catalogue : les « 0 fusions » relevées en session 0
+sont, au moins en partie, un artefact de mesure. Les vidéos les plus peuplées du
+corpus (`fort_occ`, `fort_occ2`) sont précisément celles qui ne produisent aucun
+phénomène — à revérifier après ce correctif.
+
+**Correctif** : une boîte rejetée pour ratio W/H **trop grand** est routée vers
+le chemin fusion avant d'être écartée, au lieu d'être éliminée en silence. Les
+autres motifs de rejet (`box_too_small`, ratio trop petit) sont inchangés.
+
+- Ne pas relâcher `max_aspect_ratio_wh` : le filtre garde son rôle, on corrige
+  l'ordre des opérations, pas le seuil.
+- Chaque rejet pour ratio trop grand émet son motif et ses dimensions, pour que
+  la mesure reste vérifiable.
+
+**Tests** : une boîte de ratio 3,5 contenant deux personnes déclenche
+`POSSIBLE_MULTI_PERSON_BOX` au lieu d'un rejet silencieux ; une boîte trop
+petite reste rejetée comme avant.
+
+**À refaire après ce correctif** : rejouer le catalogue complet. Le classement
+des vidéos du corpus peut changer.
+
+---
+
+## 1.4 Mesure du lot
 
 Protocole standard (§7 de `CLAUDE.md`) : vidéo à occlusion dense en mesure
 principale, vidéo à occlusion faible en non-régression, chaque changement
@@ -105,12 +188,16 @@ d'identités distinctes créées, `[BILAN]`, FPS moyen.
 `fragments_par_personne`, `erreur_comptage_max`, plus **taux de
 réidentification après perte** — c'est le chiffre que 1.1 doit déplacer.
 
-**Mesure spécifique à 1.1** : durée de la plus longue occlusion du corpus, et
-nombre de pistes détruites par expiration de `track_buffer` avant / après.
+**Mesures spécifiques** — 1.0 : `PURGE`, `INCONSISTENT_STATE` et
+`OCCUPANCY_SNAPSHOT` dans les deux bases de temps, plus le bruit run-à-run en
+base retenue. 1.1 : durée de la plus longue occlusion du corpus et nombre de
+pistes détruites par expiration de `track_buffer`. 1.3 :
+`DETECTION_REJECTED_GEOMETRY` ventilé par motif et `POSSIBLE_MULTI_PERSON_BOX`,
+sur `fort_occ` et `fort_occ2` en particulier.
 
 ---
 
-## 1.4 Ce qui doit rester vrai après ce lot
+## 1.5 Ce qui doit rester vrai après ce lot
 
 - `occupancy_operational` inchangé sur la vidéo de contrôle (aucun IN/OUT
   fantôme créé par des doublons NMS).

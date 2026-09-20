@@ -99,6 +99,15 @@ reid:
       reject_when_multi_person_box: true
 ```
 
+**Recalibrer `gallery_min_confidence` d'abord.** Mesure de la session 0 sur
+`fort_occ4` : 238 des 260 rejets de descripteur (91 %) sont des
+`low_confidence`, parce que `gallery_min_confidence: 0.70` est confronté à un
+`model.confidence: 0.10`. Une galerie de 6 échantillons ne se remplira jamais
+dans ces conditions — et ce seuil explique peut-être à lui seul une part des
+pertes d'identité actuelles. Mesurer le taux de remplissage de la galerie en
+fonction de ce seuil **avant** de figer `min_detection_confidence` ci-dessous :
+la valeur 0,6 proposée est un point de départ, pas une recommandation.
+
 **Règles d'insertion** — un échantillon n'entre dans la galerie que si :
 
 - confiance de détection ≥ `min_detection_confidence` ;
