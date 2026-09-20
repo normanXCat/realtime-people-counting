@@ -369,3 +369,549 @@ Aucun test n'a été supprimé ni marqué `skip`.
 5. **Distribution des similarités** : un seul clip, une seule scène, sans
    vérité-terrain d'identité ; les paires « inter » sont supposées appartenir à
    des personnes distinctes.
+
+---
+
+# 11. Session 0 — commande de lancement, catalogue du corpus, contrôle de déterminisme
+
+> **Mention de portée (CLAUDE.md §2).** Tout ce qui suit est mesuré sur un
+> corpus de **7 vidéos, 5 726 frames, 178,6 s cumulées**, contenant au total
+> **1 correction de swap signalée, 0 fusion signalée, 22 purges après grâce et
+> 1 perte > 5 s suivie de redétection**. Le phénomène visé par le plan
+> (inversion d'identité sous occlusion dense) est donc présent mais **rare** :
+> aucun lot ne pourra être « validé » sur ce corpus au sens fort. Les seuils de
+> signification à respecter sont ceux du §11.7.
+>
+> **Aucun fichier de code n'a été modifié dans cette session.** Les seules
+> écritures dans le dépôt sont ce document, le §0 de `CLAUDE.md`, et le
+> téléchargement de `models/yolo11n.pt` (non versionné, voir `.gitignore`).
+
+## 11.1 Commande de lancement du pipeline sur un fichier vidéo
+
+Établie en lisant `build_argument_parser()` (`src/main.py:111-150`) et vérifiée
+par `python src/main.py --help`. **À inscrire une fois pour toutes dans
+`CLAUDE.md` §2** :
+
+```bash
+python src/main.py --mode comptage --source test/<video>.mp4
+```
+
+`--config` vaut `config/pipeline.yaml` par défaut. `--source` est **obligatoire
+pour un fichier** : `source.default` vaut `"0"` dans la configuration, c'est
+à-dire l'index de la caméra (`config/pipeline.yaml:15`).
+
+Options utiles, telles qu'elles existent réellement :
+
+| Option | Effet réel |
+|---|---|
+| `--no-show` | Supprime la prévisualisation **pendant le traitement**. **N'enlève pas** la sélection manuelle de la ligne. |
+| `--write-video` | Écrit `annotated.mp4` dans le dossier de session. |
+| `--max-frames N` | Arrêt après N frames (diagnostic). |
+| `--session-id ID` | Fixe le nom du dossier de session (défaut : horodatage UTC). |
+| `--output-root DIR` | Racine des résultats (défaut `results/`). |
+| `--conf`, `--iou`, `--imgsz`, `--model` | Surcharges YOLO, revalidées par `override_config`. |
+| `--inside-side {positive,negative}` | Orientation **initiale proposée**, inversible en direct par la touche « I ». |
+
+Sorties, dans `results/<session_id>/` : `events.jsonl`, `summary.json`,
+`calibration.json`, `config_resolved.yaml`.
+
+Codes de retour : `2` configuration invalide, `3` poids ou tracker introuvable,
+`4` calibration annulée ou impossible, `5` source illisible.
+
+### 11.1.1 Cette commande n'est pas automatisable — constat bloquant
+
+**Le pipeline ne possède aucun chemin d'exécution non interactif.** Au démarrage,
+`perform_line_selection` (`src/main.py:356-369` → `calibrate`,
+`src/main.py:300-352`) ouvre une fenêtre OpenCV sur la première image et attend
+**deux clics de souris puis la touche « C »**. La docstring de `calibrate` est
+explicite : le repli historique `if no_show: return (0.0, 0.6), (1.0, 0.6)` a été
+**délibérément supprimé**, et `--no-show` sans interface graphique lève
+`CalibrationUnavailable` (code 4) au lieu de retomber sur une ligne par défaut.
+
+Sur cette machine `display_available()` renvoie `True` : la commande ci-dessus
+fonctionne, mais elle **bloque** sur l'attente des clics. Elle ne peut donc pas
+servir à cataloguer 7 vidéos ni à rejouer une baseline deux fois.
+
+Ce n'est pas un défaut à corriger — c'est une décision de conception assumée
+(« sans ligne validée par l'opérateur, le comptage ne démarre pas »). C'est en
+revanche une **contrainte de protocole** : toute mesure avant/après des lots 1 à
+7 devra soit être conduite à la main par la personne responsable, soit passer
+par un harnais du type décrit au §11.2. Le dépôt avait déjà tranché dans ce
+sens : `scripts/measure_tracker_swaps.py` et `scripts/diagnose_occlusion.py`
+documentent tous deux, en tête de fichier, qu'ils s'exécutent « sans ligne
+virtuelle — la sélection manuelle empêcherait toute mesure automatisée ».
+
+## 11.2 Harnais de catalogue employé
+
+Les deux scripts existants ne suffisaient pas : ils n'instancient que
+`IdentityManager`, donc ils ne peuvent produire ni `POSSIBLE_MULTI_PERSON_BOX`
+ni `PURGE` ni les compteurs d'occupation, qui vivent dans `OccupancyManager`.
+
+Le catalogue a donc été produit par un harnais de session (hors dépôt, dans le
+répertoire temporaire de la session) qui rejoue **le pipeline réel** :
+`YOLO.track` avec `src/configs/custom_botsort.yaml` → `Detection` →
+`OccupancyManager.process_frame` → `ListSink`. C'est la boucle de
+`src/main.py:692-843`, sans le rendu et sans la sélection de ligne.
+
+Deux écarts assumés, à connaître avant de lire les chiffres :
+
+1. **Ligne de catalogue conventionnelle.** `OccupancyManager` refuse d'être
+   construit sans ligne (`src/occupancy_manager.py:146-155`). Le harnais lui
+   fournit une ligne horizontale fixe — `(0,05 ; 0,60) → (0,95 ; 0,60)`,
+   `inside_side = negative` — **identique pour les 7 vidéos**. Elle n'a aucune
+   valeur opérationnelle.
+   **Conséquence directe : `IN`, `OUT`, `NEW`, `INCONSISTENT_STATE` et
+   `occupancy_operational` dépendent de ce tracé arbitraire et ne sont PAS
+   utilisés pour classer le corpus.** Le classement ne repose que sur les
+   compteurs d'identité, qui sont indépendants de la ligne.
+2. **Base de temps vidéo.** Le harnais calcule `timestamp_s = frame_index / fps`
+   là où `src/main.py:780` utilise `time.perf_counter() - start_s`. Ce choix
+   est mesuré, pas supposé : voir §11.7, où les deux bases sont comparées.
+
+## 11.3 Environnement et poids de modèle
+
+| Élément | Valeur constatée |
+|---|---|
+| Python | 3.11.9 |
+| `ultralytics` | 8.4.126 |
+| `torch` | 2.13.0+cpu — **`cuda_available = False`** |
+| OpenCV | 5.0.0 |
+| `model.device` (config) | `cpu` |
+
+**Poids YOLO.** `models/yolo11n.pt` était **absent** du dépôt (le dossier
+`models/` n'existait pas ; `.gitignore` exclut `models/` et `*.pt`). Téléchargé
+via `ultralytics.utils.downloads.attempt_download_asset("yolo11n.pt")`.
+
+- Source exacte : `https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo11n.pt`
+- Taille : 5 613 764 octets
+- **SHA-256 : `0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1`**
+- Ce condensat est **identique** à `model.expected_sha256`
+  (`config/pipeline.yaml:26`). `verify_weights` passe donc sans modification de
+  configuration.
+
+**Poids pose.** `models/yolo11s-pose.pt` reste absent et
+`pose_model_expected_sha256` reste `null` : non nécessaire en session 0
+(`presence.head_assist.enabled: false`), à traiter au lot 6.
+
+## 11.4 Catalogue du corpus (CLAUDE.md §2)
+
+Dossier des vidéos de test : **`test/`** (exclu du versionnement par
+`.gitignore`). Sept fichiers, tous en `.mp4`.
+
+### 11.4.1 Caractéristiques des fichiers
+
+| Vidéo | Frames | FPS source | Durée | Résolution | Poids |
+|---|---|---|---|---|---|
+| `fort_occ.mp4` | 1 057 | 50,00 | 21,1 s | 1920×1080 | 13,9 Mo |
+| `fort_occ2.mp4` | 328 | 30,00 | 10,9 s | 1920×1080 | 12,3 Mo |
+| `fort_occ3.mp4` | 330 | 29,97 | 11,0 s | 3840×2160 | 29,5 Mo |
+| **`fort_occ4.mp4`** | **1 055** | **30,00** | **35,2 s** | **1280×720** | 32,1 Mo |
+| `fort_occ5.mp4` | 1 996 | 30,00 | 66,5 s | 1280×720 | 60,5 Mo |
+| `rare_occ.mp4` | 216 | 24,00 | 9,0 s | 3840×2160 | 26,3 Mo |
+| **`rare_occ2.mp4`** | **744** | **29,97** | **24,8 s** | **1280×720** | 15,6 Mo |
+
+### 11.4.2 Mesure du pipeline en l'état, pleine longueur
+
+Chaque vidéo a été traitée **intégralement**, une seule fois, configuration de
+production inchangée.
+
+| Vidéo | Détections | Identités créées | ids techniques | `TECHNICAL_ID_CHANGED` | `TRACK_ID_APPEARANCE_DISCONTINUITY` | `IDENTITY_SWAP_CORRECTED` | `POSSIBLE_MULTI_PERSON_BOX` | `PURGE` | `OCCLUDED` | `REID_AMBIGUOUS` | `REID_MATCH` | perte > 5 s redétectée | ips traitées |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `fort_occ` | 15 289 | 16 | 16 | 0 | 0 | 0 | 0 | 0 | 4 | 0 | 0 | 0 | 4,31 |
+| `fort_occ2` | 5 250 | 21 | 21 | 0 | 1 | 0 | 0 | 0 | 7 | 0 | 0 | 0 | 3,93 |
+| `fort_occ3` | 2 551 | 17 | 19 | 2 | 0 | **1** | 0 | 3 | 38 | 0 | 2 | 0 | 3,83 |
+| **`fort_occ4`** | 5 680 | 18 | 15 | **5** | **1** | 0 | 0 | **13** | **49** | **5** | 5 | 0 | 4,47 |
+| `fort_occ5` | 14 902 | 11 | 13 | 4 | 1 | 0 | 0 | 4 | 23 | 0 | 4 | **1** | 4,28 |
+| `rare_occ` | 1 296 | 6 | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3,11 |
+| **`rare_occ2`** | 2 553 | 7 | 5 | 0 | 0 | 0 | 0 | 2 | 6 | 0 | 0 | 0 | 4,06 |
+
+### 11.4.3 Décompte des phénomènes et classement
+
+Le §2.3 impose de classer sur « swaps + fusions + pertes > 5 s », **réellement
+comptés**, et non sur l'étiquette du nom de fichier.
+
+Traduction en compteurs, justifiée :
+
+- **swaps** → `IDENTITY_SWAP_CORRECTED` (swap réellement détecté et corrigé) ;
+- **fusions** → `POSSIBLE_MULTI_PERSON_BOX` ;
+- **pertes > 5 s** → `PURGE` **+** les écarts > 5 s entre deux observations d'un
+  même `person_id`. Une `PURGE` n'est émise qu'après expiration de la fenêtre de
+  grâce, et `timing.grace_period_seconds` vaut **5,0 s**
+  (`config/pipeline.yaml:292`) : toute purge est donc, par construction, une
+  perte d'au moins 5 s. `mark_purged` (`src/identity_manager.py:1273-1311`) la
+  journalise en `purge_kind="technical"`, `is_exit=False`.
+
+| Vidéo | Étiquette | **Score strict §2.3** | Proxys d'identité (`chgID` + discontinuités + ambigus) | Verdict |
+|---|---|---|---|---|
+| `fort_occ` | fort | **0** | 0 | étiquette **non confirmée** |
+| `fort_occ2` | fort | **0** | 1 | étiquette **non confirmée** |
+| `fort_occ3` | fort | 4 | 2 | confirmée |
+| **`fort_occ4`** | fort | **13** | **11** | confirmée — **maximum du corpus** |
+| `fort_occ5` | fort | 5 | 5 | confirmée |
+| `rare_occ` | rare | **0** | 0 | confirmée |
+| `rare_occ2` | rare | 2 | 0 | **écart signalé** (2 purges) |
+
+**Écarts étiquette / décompte, signalés comme l'exige le §2.3 :**
+
+1. **`fort_occ.mp4` et `fort_occ2.mp4` ne présentent aucun phénomène compté**
+   malgré leur préfixe `fort_occ` — alors que ce sont les deux vidéos les plus
+   peuplées du corpus (15 289 et 5 250 détections). Forte densité de personnes
+   n'y signifie pas instabilité d'identité. Ce sont exactement les clips sur
+   lesquels les deux sessions précédentes auraient de nouveau conclu à tort.
+2. **`rare_occ2.mp4` contient 2 purges** (donc 2 pertes ≥ 5 s) et 6
+   occultations, alors que son préfixe annonce une occlusion faible. L'écart
+   est faible mais réel.
+3. **Aucun fichier n'a été renommé**, conformément à la consigne.
+
+### 11.4.4 Vidéos retenues — choix figé pour tous les lots
+
+| Rôle | Vidéo | Justification |
+|---|---|---|
+| **Mesure principale (occlusion dense)** | **`test/fort_occ4.mp4`** | Maximum du corpus sur **les deux** critères : score strict §2.3 = 13 (13 purges) et proxys d'identité = 11 (5 changements d'identifiant technique, 1 discontinuité d'apparence, 5 ré-identifications ambiguës). C'est aussi la seule vidéo où `REID_AMBIGUOUS` est non nul, et celle où l'écart identités créées (18) / identifiants techniques (15) est le plus marqué. Ni la plus longue (`fort_occ5`, 66,5 s) ni la première par ordre alphabétique. |
+| **Contrôle de non-régression (occlusion faible)** | **`test/rare_occ2.mp4`** | Retenue plutôt que `rare_occ.mp4` : 744 frames contre 216, résolution 1280×720 identique à la vidéo principale (donc charge de calcul comparable), et 24,8 s contre 9,0 s. Ses 2 purges sont signalées au §11.4.3 et constituent la ligne de base à ne pas dégrader. `rare_occ.mp4` (0 phénomène) reste disponible comme second contrôle. |
+
+**Ce choix est figé.** Aucun lot ne doit en changer, sous peine de rendre les
+tableaux avant/après incomparables entre lots.
+
+### 11.4.5 Trois observations à verser aux lots concernés
+
+Elles ne sont pas des conclusions de lot : ce sont des faits mesurés en session 0
+qui orientent la lecture des lots à venir.
+
+**(a) La galerie d'apparence ne se remplit presque jamais — lot 3.**
+`REID_DESCRIPTOR_REJECTED` est massif sur tout le corpus : 248, 291, 242, 260 et
+**375** écritures refusées pour respectivement 16, 21, 17, 18 et **11** identités.
+En regard, `REID_MATCH` vaut 0 sur quatre vidéos sur sept. Le ReID long terme est
+donc, en pratique, **structurellement inopérant sur ce corpus** : il ne peut pas
+ré-associer une personne dont il n'a jamais pu mémoriser l'apparence. Les
+raisons exactes des rejets sont mesurées au §11.5 (vidéo principale) et au
+§11.6 (vidéo de contrôle).
+
+**(b) Le filtre géométrique s'exécute avant la détection de fusion — lot 5.**
+`check_detection_geometry` (`src/geometry.py:413-438`) est appliqué en tête de
+`process_frame` (`src/occupancy_manager.py:365-399`) et rejette toute boîte de
+ratio W/H > `max_aspect_ratio_wh` = 2,5, **avant** que le chemin de détection de
+fusion (`check_box_width_growth`, qui émet `POSSIBLE_MULTI_PERSON_BOX`) ne soit
+atteint. Or une boîte contenant deux personnes assises côte à côte est
+précisément une boîte anormalement **large**.
+
+Mesure sur `fort_occ.mp4`, qui concentre les rejets du corpus : **les 235 rejets
+sont tous `aspect_ratio_out_of_range`, et tous portent sur des boîtes trop
+LARGES** (ratio W/H supérieur à 2,5, jusqu'à **3,85**) — aucun rejet pour boîte
+trop petite ou trop verticale. Ces 235 détections sont donc supprimées avant
+d'avoir pu être examinées comme fusions possibles.
+
+**Ce que cette mesure ne dit pas** : qu'il s'agisse effectivement de fusions.
+Un ratio de 3,85 peut aussi être un artefact du détecteur. Départager exige
+l'annotation du §3. Ce qui est établi, c'est l'**ordre des opérations** : sur
+cette vidéo, le signal de fusion ne pouvait structurellement pas se déclencher.
+
+À nuancer pour la vidéo principale : **`fort_occ4` ne produit aucun rejet
+géométrique**. Sur elle, le filtre n'explique donc pas le `POSSIBLE_MULTI_PERSON_BOX`
+à 0 — l'angle mort d'historique décrit au diagnostic §4.1.7 reste la piste.
+
+**(c) La marge sur le plancher de FPS est très faible — §4 et lot 6.**
+Voir §11.8.
+
+
+## 11.5 Ligne de base détaillée de la vidéo principale (`fort_occ4`)
+
+Mesure instrumentée, base de temps vidéo, pleine longueur.
+
+| Grandeur | Valeur |
+|---|---|
+| Frames traitées | 1 055 (35,2 s) |
+| Détections suivies | 5 680 |
+| Identités logiques créées | 18 |
+| Identifiants techniques distincts | 15 |
+| `TECHNICAL_ID_CHANGED` | 5 |
+| `TRACK_ID_APPEARANCE_DISCONTINUITY` | 1 |
+| `IDENTITY_SWAP_CORRECTED` | 0 |
+| `POSSIBLE_MULTI_PERSON_BOX` | 0 |
+| `OCCLUDED` | 49 |
+| `PURGE` | 13 |
+| `REID_MATCH` / `REID_NEW` / `REID_AMBIGUOUS` | 5 / 18 / 5 |
+| `REID_DESCRIPTOR_REJECTED` | 260 |
+| `ANCHOR_UNRELIABLE` | 50 |
+| `occupancy_operational` en fin de séquence | 13 |
+| `occupancy_observed` en fin de séquence | 3 |
+
+**Les 13 purges, dans le détail** : toutes ont pour raison `grace_expired` et
+pour dernier état `OCCULTEE`. Impact sur l'occupation : **10 `uncertain`**,
+3 `none`. Durées de vie des identités purgées, en secondes : 0,33 / 1,07 / 1,57 /
+2,10 / 4,17 / 7,37 / 8,80 / 9,43 / 9,50 / 11,93 / 13,90 / 20,27 / 23,77.
+
+Cela confirme par la mesure ce que le code annonçait : une purge n'arrive
+**qu'après** expiration de la grâce de 5 s, donc chaque purge est bien une perte
+d'au moins 5 s. `purge_kind` vaut toujours `technical` et `is_exit` toujours
+`false` — aucune purge n'a produit de sortie fantôme.
+
+**Écarts entre observations d'une même identité** : 37 au total, dont 4 au-delà
+de 1 s et **aucun au-delà de 3 s**. Autrement dit, sur cette vidéo, une personne
+retrouvée l'est vite ; une personne perdue longtemps n'est jamais retrouvée —
+elle est purgée. Les deux mécanismes ne se recouvrent pas.
+
+**Répartition de la présence** (frames observées par identité logique, sur
+1 055) : 980, 794, 681, 462, 442, 404, 343, 270, 267, 263, 222, 201, 126, 69,
+64, 48, 33, 11. Une moitié des identités vit moins de 300 frames : c'est le
+symptôme de fragmentation, quantifié.
+
+**Rejets d'écriture en galerie** : 260, dont **238 `low_confidence`** et
+22 `edge_truncated`. Avec `gallery_min_confidence: 0.70`
+(`config/pipeline.yaml:135`) face à `model.confidence: 0.10`
+(`config/pipeline.yaml:33`), **91 % des rejets viennent du seul seuil de
+confiance**. La galerie d'apparence est donc quasiment vide sur une scène de
+salle de classe, où les personnes assises et partiellement masquées sortent
+précisément à faible confiance. Le ReID long terme ne peut pas ré-associer ce
+qu'il n'a jamais pu mémoriser : c'est la donnée d'entrée du **lot 3**.
+
+## 11.6 Ligne de base de la vidéo de contrôle (`rare_occ2`)
+
+Mesure instrumentée, base de temps vidéo, pleine longueur. **C'est la ligne à ne
+pas dégrader** lors des lots suivants (§7 : un `new_track_thresh` abaissé ne doit
+pas faire exploser les créations de piste sur scène calme).
+
+| Grandeur | Valeur |
+|---|---|
+| Frames traitées | 744 (24,8 s) |
+| Détections suivies | 2 553 |
+| Identités logiques créées | **7** |
+| Identifiants techniques distincts | 5 |
+| `TECHNICAL_ID_CHANGED` | 0 |
+| `TRACK_ID_APPEARANCE_DISCONTINUITY` | 0 |
+| `IDENTITY_SWAP_CORRECTED` | 0 |
+| `POSSIBLE_MULTI_PERSON_BOX` | 0 |
+| `OCCLUDED` | 6 |
+| `PURGE` | 2 (`grace_expired`, `grace_expired_in_progress` — toutes deux `uncertain`) |
+| `AMBIGUOUS_CROSSING` | 1 |
+| `REID_DESCRIPTOR_REJECTED` | 76 (63 `low_confidence`, 13 `edge_truncated`) |
+| Écarts d'observation | 4, **aucun au-delà de 1 s** |
+
+## 11.7 Contrôle de déterminisme (CLAUDE.md §2.1)
+
+Baseline rejouée sur `fort_occ4`, sans rien changer. **Quatre rejouages** : deux
+en base de temps vidéo, deux en base de temps murale — celle qu'utilise
+réellement `src/main.py:780` (`time.perf_counter() - start_s`).
+
+Aucune graine aléatoire n'est fixée dans `src/` ni dans `scripts/`
+(`grep -rn "seed\|torch.manual\|np.random.seed"` : aucun résultat). Un éventuel
+déterminisme est donc empirique, non garanti par construction. `torch` tourne
+sur 2 threads, en CPU.
+
+### 11.7.1 Base de temps vidéo — écart nul
+
+| Compteur | run 1 | run 2 | run du catalogue | écart |
+|---|---|---|---|---|
+| Tous les compteurs d'événements | identiques | identiques | identiques | **0** |
+| `persons_created` | 18 | 18 | 18 | 0 |
+| `technical_id_changes` | 5 | 5 | 5 | 0 |
+| `PURGE` | 13 | 13 | 13 | 0 |
+| `INCONSISTENT_STATE` | 10 | 10 | 10 | 0 |
+| ips de traitement | 4,247 | 4,121 | 4,474 | **≠** |
+
+**Trois exécutions, aucun écart sur aucun compteur** — y compris entre des runs
+dont la vitesse de traitement différait de 8 %. Le déterminisme est robuste à la
+charge machine dès lors que la base de temps est celle de la vidéo.
+
+### 11.7.2 Base de temps murale — écart non nul
+
+| Compteur | wall run 1 | wall run 2 | écart |
+|---|---|---|---|
+| ips de traitement | 4,176 | 3,042 | −27 % |
+| durée murale | 252,7 s | 346,9 s | +94 s |
+| `TECHNICAL_ID_CHANGED` | 7 | 8 | **+1** |
+| `IN` | 4 | 5 | **+1** |
+| `NEW` | 9 | 8 | **−1** |
+| `REID_MATCH` | 7 | 8 | **+1** |
+| `REID_AMBIGUOUS` | 2 | 1 | **−1** |
+| identifiants techniques | 5 | 6 | **+1** |
+| `REID_DESCRIPTOR_REJECTED` | 260 | 261 | **+1** |
+| `ANCHOR_UNRELIABLE` | 50 | 49 | **−1** |
+| `INCONSISTENT_STATE` | 152 | 189 | **+37** |
+| `OCCUPANCY_SNAPSHOT` | 223 | 260 | **+37** |
+
+**La source du bruit est identifiée** : le FPS de traitement, qui dépend de la
+charge de la machine, entre directement dans toutes les durées exprimées en
+secondes. Entre les deux runs il a varié de 4,176 à 3,042 ips sans qu'aucun
+paramètre ne change.
+
+### 11.7.3 Effet de la base de temps elle-même — et non plus seulement du bruit
+
+Comparaison de la **même vidéo**, **même configuration**, seule la base de temps
+change :
+
+| Compteur | base vidéo | base murale | commentaire |
+|---|---|---|---|
+| `PURGE` | **13** | **0** | disparition totale de la traçabilité des pertes |
+| `INCONSISTENT_STATE` | 10 | 152–189 | ×15 à ×19 |
+| `OCCUPANCY_SNAPSHOT` | 36 | 223–260 | `snapshot_interval_seconds: 1.0` appliqué à 252 s murales au lieu de 35 s vidéo |
+| `TECHNICAL_ID_CHANGED` | 5 | 7–8 | |
+| identifiants techniques | 15 | 5–6 | |
+| `IN` / `NEW` | 6 / 7 | 4–5 / 8–9 | **le comptage lui-même change** |
+
+**Explication mécanique du `PURGE` à 0**, vérifiée dans le code :
+
+- la grâce FSM est convertie en **frames** par `TimingConfig.frame_budget`
+  (`src/config.py:440-457`) : `grace_period_frames = round(5,0 × fps)` = **150
+  frames** ;
+- la fenêtre de galerie, elle, reste en **secondes** dans
+  `within_gallery_window` (`src/identity_manager.py:1175-1179`) :
+  `grace_period_seconds + purge_retention_seconds` = 5 + 12 = **17 s** ;
+- en base murale, 17 s de temps mural ≈ 2,4 s de temps vidéo ≈ **73 frames**, à
+  4,2 ips traitées. La galerie libère donc l'identité **avant** que la FSM ait
+  atteint ses 150 frames de grâce ;
+- `release_expired` retire alors la piste de `self.tracks`
+  (`src/occupancy_manager.py:631-633`), si bien que `_handle_missing` ne la voit
+  plus jamais et ne peut plus la purger. `mark_purged` n'est jamais appelée,
+  l'événement `PURGE` n'est jamais émis.
+
+C'est exactement le scénario que la docstring de `within_gallery_window` dit
+vouloir empêcher : « La galerie n'est jamais plus stricte que la machine à
+états : sinon elle libérerait une identité avant que le FSM ait pu la purger, ce
+qui supprimerait l'événement `PURGE` et le passage en occupation incertaine. »
+Le garde-fou est écrit, mais il suppose que les deux mécanismes partagent la
+même base de temps — ce que l'implémentation actuelle ne garantit pas.
+
+Le commentaire de `src/occupancy_manager.py:632` (« La purge a déjà été
+journalisée lors du passage à ABSENTE : la libération de mémoire n'est donc
+jamais silencieuse ») est donc **faux dans cette configuration** : la libération
+y est parfaitement silencieuse.
+
+### 11.7.4 Seuils de signification à appliquer dans tous les lots suivants
+
+Conclusion opérationnelle du §2.1, à reprendre tel quel dans chaque livrable :
+
+| Protocole de mesure | Bruit run-à-run mesuré | Écart minimal significatif |
+|---|---|---|
+| **Base de temps vidéo** (recommandé) | **0** sur tous les compteurs | **≥ 1** |
+| Base de temps murale (`src/main.py` en l'état) | ±1 sur les compteurs d'identité et de comptage ; ±37 sur `INCONSISTENT_STATE` et `OCCUPANCY_SNAPSHOT` | ≥ 2 pour l'identité ; ≥ 38 pour les deux autres |
+
+**Recommandation de protocole** : conduire toutes les mesures avant/après des
+lots 1 à 7 en base de temps vidéo. C'est le seul régime où le bruit est nul,
+donc le seul où un écart de 1 sur `IDENTITY_SWAP_CORRECTED` ou
+`POSSIBLE_MULTI_PERSON_BOX` — compteurs dont les valeurs de base sont 0 et 1 —
+puisse signifier quelque chose. En base murale, ces compteurs sont noyés dans le
+bruit et **aucun lot ne serait démontrable**.
+
+Ce point n'est pas une anticipation du lot 1 : aucune ligne de code n'a été
+modifiée. C'est la mesure de bruit que le §2.1 exige avant toute mesure
+avant/après, et elle conclut sur le protocole, pas sur un correctif.
+
+## 11.8 Plancher de FPS — recalcul demandé au §4
+
+Le §4 demande de recalculer le plancher de 3,0 ips avec la profondeur réelle de
+la zone et de le confronter à `timing.confirmation_seconds`.
+
+**Confrontation à `confirmation_seconds`** : elle vaut **0,5 s**
+(`config/pipeline.yaml:291`), soit moins que les ≈ 1,15 s de séjour supposées.
+Ce n'est donc **pas** elle qui domine : la contrainte dominante reste bien le
+nombre d'observations dans la zone, comme le §4 le supposait. Le plancher de
+3,0 ips n'a pas à être relevé de ce fait.
+
+**Profondeur réelle de la zone** : inconnue. Elle n'est renseignée nulle part
+dans le dépôt et dépend de l'installation caméra. **Le recalcul complet reste
+donc à faire par la personne responsable** ; le plancher de 3,0 ips est conservé
+comme valeur de travail, non validée.
+
+**FPS mesurés en l'état, modèle pose *inactif*, CPU, `imgsz: 960` :**
+
+| Vidéo | ips traitées | Marge sur 3,0 ips |
+|---|---|---|
+| `fort_occ4` (principale) | 4,47 / 4,25 / 4,12 / 4,00 | +33 % à +49 % |
+| `fort_occ4`, base murale, run lent | **3,04** | **+1 %** |
+| `rare_occ` (3840×2160) | **3,11** | **+4 %** |
+| `fort_occ3` (3840×2160) | 3,83 | +28 % |
+| `fort_occ5` | 4,28 | +43 % |
+| `rare_occ2` (contrôle) | 4,06 / 4,14 | +35 % |
+
+**Alerte à verser au lot 6.** La marge est déjà mince : deux mesures sont à
+3,0–3,1 ips, c'est-à-dire **au plancher**. Or le critère du §4 exige ≥ 3,0 ips
+**avec le modèle pose actif**, et `yolo11s-pose.pt` est sensiblement plus lourd
+que `yolo11n.pt` utilisé ici. Sur cette machine (CPU seul, `cuda_available =
+False`), **le critère de FPS du lot 6 a de fortes chances d'être violé**. Il
+faudra soit une accélération matérielle, soit une baisse de `image_size`, soit
+une révision explicite du critère — décision à prendre par la personne
+responsable, pas en cours de lot.
+
+**Contrainte relative du §4** (≥ 80 % de la baseline) : la baseline de
+`fort_occ4` étant de **4,47 ips**, le plancher relatif est de **3,58 ips**. Il
+est plus contraignant que le plancher absolu de 3,0 ips : c'est lui qui devra
+être opposé aux lots.
+
+## 11.9 Écarts relevés en chemin (CLAUDE.md §9)
+
+| Point | Constat | Conséquence |
+|---|---|---|
+| **Corpus des sessions précédentes introuvable** | Le §2.1 et le §5.1 de ce document mesurent sur `test/5121204_School_Classroom_1280x720.mp4`. Ce fichier **n'existe plus** dans `test/`, qui contient exclusivement les 7 fichiers `fort_occ*` / `rare_occ*` catalogués ci-dessus. | **Aucun chiffre des §2 à §5 de ce document n'est reproductible ni comparable au présent catalogue.** Les tableaux avant/après des lots 1 à 7 repartent de la ligne de base du §11.5, pas de ceux-là. Le commentaire de `config/pipeline.yaml:56-58`, qui cite ce fichier à l'appui du refus des trois seuils BoT-SORT, repose donc sur une mesure non rejouable. |
+| **Nombre de tests** | `grep -rc "^def test_" tests/` → **433** fonctions de test réparties sur **30** fichiers. | Concorde avec le chiffre « 433 après » annoncé au §8. Le §8 reste exact ; rien à corriger. La suite n'a **pas** été exécutée dans cette session : aucun code n'ayant été modifié, il n'y avait rien à revalider. |
+| **Poids du modèle absents du dépôt** | `models/` n'existait pas. Sans `models/yolo11n.pt`, `verify_weights` échoue (`FileNotFoundError`, code 3) et **le pipeline ne démarre pas du tout**. | Prérequis d'installation non documenté dans `CLAUDE.md` §2. Le SHA-256 obtenu correspond à celui attendu : voir §11.3, à reporter dans `docs/rapport_final.md` §4 à la clôture. |
+| **`POSSIBLE_MULTI_PERSON_BOX` = 0 sur tout le corpus** | Aucune fusion signalée sur 5 726 frames, alors que le symptôme 1 du §1 la décrit comme un problème persistant. | Soit les fusions n'existent pas dans ce corpus, soit le détecteur ne les voit pas. Le diagnostic §4.1.7 documente déjà un angle mort : `check_box_width_growth` a besoin d'un historique de largeur **avant** la fusion, donc deux personnes assises côte à côte dès la première frame ne déclenchent jamais le signal. **Départager les deux demande une annotation humaine** (§3) — c'est précisément ce que la vérité terrain doit trancher. |
+
+## 11.10 Ce qui reste à faire avant le lot 1
+
+Les trois lignes du §0 de `CLAUDE.md` ne sont pas toutes levées par cette session.
+
+| Étape §0 | État à l'issue de cette session |
+|---|---|
+| **Catalogue du corpus (§2)** | **Fait.** §11.4, vidéos figées au §11.4.4. |
+| **Contrôle de déterminisme (§2.1)** | **Fait.** §11.7, seuils de signification au §11.7.4. |
+| **Vérité terrain (§3)** | **NON FAITE — bloquante.** Voir ci-dessous. |
+| **Critères d'acceptation validés (§4)** | **NON VALIDÉS.** Voir ci-dessous. |
+
+### 11.10.1 Vérité terrain — demande explicite
+
+Le §3 est formel : l'annotation ne doit **pas** être remplacée par une
+estimation automatique produite par le pipeline testé. Rien dans cette session ne
+peut s'y substituer — tous les chiffres ci-dessus sont des compteurs émis par le
+pipeline lui-même, donc des proxys.
+
+Ce qui est demandé, et que je ne peux pas produire seul :
+
+- un fichier `tests/fixtures/ground_truth_fort_occ4.json`, versionné ;
+- portant sur un segment de 30 à 60 s de **`test/fort_occ4.mp4`** — la vidéo
+  fait 35,2 s, **le segment peut donc être la vidéo entière** ;
+- pour chaque seconde : le nombre de personnes réellement présentes dans la zone
+  comptée, et l'identité stable de chacune (`P1`, `P2`, …) ;
+- les segments d'occlusion ≥ 3 s marqués (utiles au lot 6).
+
+**Aide au choix du segment, à partir de la mesure** : si un sous-segment doit
+être préféré à la vidéo entière, les 13 purges du §11.5 en donnent les points
+d'entrée — ce sont les instants où le pipeline a perdu une identité pendant plus
+de 5 s. Les identités les plus fragmentées (11, 33, 48, 64 et 69 frames
+observées sur 1 055) sont les meilleures candidates à l'inspection visuelle.
+
+Tant que ce fichier n'existe pas, `id_switches_reels`, `fragments_par_personne`,
+`erreur_comptage_max` et `fusions_reelles` **ne sont pas calculables**, et
+aucun lot ne peut être déclaré accepté au sens du §4.
+
+### 11.10.2 Critères d'acceptation — à confirmer
+
+Le tableau du §4 reste **`NON VALIDÉ`** : ses valeurs sont proposées, pas
+confirmées. Deux d'entre elles appellent une décision à la lumière de cette
+session :
+
+1. **`id_switches_reels` ≤ 1** — la baseline demandée est maintenant partiellement
+   mesurable : 5 `TECHNICAL_ID_CHANGED` et 1 discontinuité d'apparence sur
+   `fort_occ4`. Mais ce sont des proxys : la valeur réelle exige le §11.10.1.
+2. **FPS ≥ 3,0 ips avec modèle pose actif** — voir l'alerte du §11.8 : ce
+   critère est probablement inatteignable sur la machine actuelle. Mieux vaut le
+   trancher maintenant qu'au lot 6.
+
+### 11.10.3 Question de protocole à trancher
+
+Le §11.1.1 établit que le pipeline officiel ne peut pas tourner sans opérateur.
+Il faut choisir, **avant le lot 1**, comment les mesures avant/après seront
+conduites :
+
+- **(a)** mesures à la main par la personne responsable, avec la même ligne
+  cliquée à chaque fois — au risque d'une variabilité de tracé qui s'ajoutera au
+  bruit du §11.7 ;
+- **(b)** mesures par un harnais versionné dans `scripts/`, sur le modèle du
+  §11.2, avec une ligne de calibration lue depuis un fichier figé — ce qui
+  supprime la variabilité de tracé, mais suppose d'ajouter un script au dépôt
+  (donc une modification, hors périmètre de cette session).
+
+Je recommande **(b)**, pour la raison mesurée au §11.7 : le bruit n'est nul
+qu'en conditions strictement reproductibles, et une ligne re-cliquée à chaque
+mesure ne l'est pas. Mais c'est une décision de la personne responsable, pas la
+mienne.
