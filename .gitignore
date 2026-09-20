@@ -12,6 +12,12 @@ models/
 # (voir docs/politique_confidentialite.md).
 test/
 data/videos/
+# Images extraites pour l'annotation de vérité terrain : mêmes personnes que
+# les vidéos ci-dessus, donc même régime de confidentialité. Le fichier
+# tests/fixtures/ground_truth_*.json y renvoie (champ « image ») mais reste
+# lisible sans elles ; elles sont conservées hors dépôt par la personne
+# responsable (voir docs/correctif_occlusion.md §12.1).
+annotation/
 results/
 
 # Médias et fragments temporaires

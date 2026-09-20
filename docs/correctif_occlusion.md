@@ -929,7 +929,15 @@ mienne.
 # 12. Vérité terrain de `fort_occ4` — reçue
 
 Fichier versionné : **`tests/fixtures/ground_truth_fort_occ4.json`**.
-Images d'appui : `annotation/t01.jpg` … `t35.jpg`, une par seconde.
+
+Images d'appui : `annotation/t01.jpg` … `t35.jpg`, une par seconde — **non
+versionnées**. Elles montrent les mêmes personnes que les vidéos du corpus et
+relèvent donc du même régime que `test/` (`.gitignore`, voir
+`docs/politique_confidentialite.md`). Le fichier de vérité terrain y renvoie
+par son champ `image`, mais il se lit sans elles : `present`, `count` et
+`notes` sont autonomes. Les images sont conservées hors dépôt par la personne
+responsable ; il faut les lui demander pour revérifier une annotation seconde
+par seconde.
 
 Il lève l'étape bloquante du §3, demandée au §11.10.1.
 
