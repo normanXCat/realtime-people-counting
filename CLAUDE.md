@@ -25,7 +25,7 @@ au moment de traiter le lot concerné.
 |---|---|---|---|---|
 | Catalogue du corpus (§2) | `docs/correctif_occlusion.md` §11.4 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
 | Contrôle de déterminisme (§2.1) | `docs/correctif_occlusion.md` §11.7 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
-| Vérité terrain (§3) | — | **à faire — bloquante** (demandée en `docs/correctif_occlusion.md` §11.10.1) | — | — |
+| Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (`docs/correctif_occlusion.md` §12). Métriques dérivées : **à outiller** (§12.3) | non commité | 2026-09-20 |
 | Critères d'acceptation validés (§4) | — | à faire (§11.10.2 ; recalcul du plancher FPS fait en §11.8) | — | — |
 | Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire | — | — |
 | Lot 2 — rétention hors zone | `docs/lot_2_retention.md` | à faire | — | — |

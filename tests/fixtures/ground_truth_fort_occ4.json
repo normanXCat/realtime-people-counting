@@ -1,0 +1,305 @@
+{
+  "video": "test/fort_occ4.mp4",
+  "fps": 30.0,
+  "duration_s": 35.17,
+  "resolution": "1280x720",
+  "frames_extraites": "annotation/t01.jpg = seconde 0, t02.jpg = seconde 1, ... t35.jpg = seconde 34",
+  "annotateur": "A RENSEIGNER",
+  "date": "A RENSEIGNER",
+  "_mode_emploi": [
+    "1. Ouvrir t01.jpg. Donner une etiquette P1, P2, ... a chaque personne visible.",
+    "2. Remplir 'etiquettes' ci-dessous avec un repere visuel par personne (couleur, place).",
+    "3. Pour chaque seconde : mettre dans 'present' les etiquettes visibles, et leur nombre dans 'count'.",
+    "4. Une personne masquee puis revenue GARDE son etiquette. Une nouvelle personne recoit une etiquette neuve.",
+    "5. 'notes' : ecrire le doute plutot que de trancher arbitrairement.",
+    "6. Remplir 'occlusions' pour tout masquage de plus de 3 secondes."
+  ],
+  "etiquettes": {
+    "P1": "chemise rouge_jaune, 1e rang gauche",
+    "P2": "chemise vert, 2e rang gauche",
+    "P3": "chemise bleu, 2e rang droite",
+    "P4": "chemise jaune, 1e rang droite",
+    "P5": "chemise grenat, 1e rang droite",
+    "P6": "chemise gris, 1e rang gauche",
+    "P7": "chemise rouge, 2e rang gauche",
+    "P8": "chemise rouge_blanc, 1e rang gauche",
+    "P9": "chemise gris_blanc, 1e rang gauche",
+    "P10": "chemise noir, 2e rang droite",
+    "P11": "chemise blanc, 1e rang droite",
+    "P12": "chemise noir, 2e rang droite",
+    "P13": "chemise bleu_noir, 1e rang droite"
+  },
+  "secondes": [
+    {
+      "seconde": 0,
+      "image": "t01.jpg",
+      "present": ["P1", "P2", "P3", "P4"],
+      "count": 4,
+      "notes": "Une partie de P1 et P4 sont derrières une porte"
+    },
+    {
+      "seconde": 1,
+      "image": "t02.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5"],
+      "count": 5,
+      "notes": "P5 est devenue première rang à droite comme P4 car P5 est tout juste devant P4"
+    },
+    {
+      "seconde": 2,
+      "image": "t03.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5"],
+      "count": 5,
+      "notes": "P1, P2, P3, P4 sont devenues moins visibles (floues) et P5 est mis à l'avant (entre dans la salle) et P4 de plus en plus caché par P5"
+    },
+    {
+      "seconde": 3,
+      "image": "t04.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5"],
+      "count": 5,
+      "notes": "P5 est maintenant dans la salle et ne cache plus P4."
+    },
+    {
+      "seconde": 4,
+      "image": "t05.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5", "P6"],
+      "count": 6,
+      "notes": "P1 mis en avant et occulte P2. P6 apparaît à l'endroit où il y avait P1."
+    },
+    {
+      "seconde": 5,
+      "image": "t06.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5", "P6"],
+      "count": 6,
+      "notes": "P1 entre dans la salle et P6 est moins visible."
+    },
+    {
+      "seconde": 6,
+      "image": "t07.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5", "P6", "P7"],
+      "count": 7,
+      "notes": "P7 mis en avant et occulte P2, P5 est sur le point de s'assoir et P1 est dans la salle ."
+    },
+    {
+      "seconde": 7,
+      "image": "t08.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7"],
+      "count": 7,
+      "notes": "P5 s'assoit et P1 est dans la salle et occulte ou cache P5, P7entre dans la salle, P4 est moins visible"
+    },
+    {
+      "seconde": 8,
+      "image": "t09.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8"],
+      "count": 8,
+       "notes": "P5 n'est plus occulté par P1, P7 est dans la salle et P8 mis en avant par rapport à P6"
+    },
+    {
+      "seconde": 9,
+      "image": "t10.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8"],
+      "count": 8,
+      "notes": "P8 entre dans la salle, P7 occulte P5"
+    },
+    {
+      "seconde": 10,
+      "image": "t11.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8"],
+      "count": 8,
+      "notes": "P5 n'est plus occulté par P7, P6 mis en avant et entre dans la salle"
+    },
+    {
+      "seconde": 11,
+      "image": "t12.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8"],
+      "count": 8,
+      "notes": "P6 est dans la salle, P2 est entrain d'entrer et suivre P6 sans occultation"
+    },
+    {
+      "seconde": 12,
+      "image": "t13.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9"],
+      "count": 9,
+      "notes": "P9 apparait, P6 et P2 sont dans la salle ."
+    },
+    {
+      "seconde": 13,
+      "image": "t14.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9"],
+      "count": 9,
+      "notes": "P9 entre dans la salle, P4 mis en avant, P8 occulte P5"
+    },
+    {
+      "seconde": 14,
+      "image": "t15.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10"],
+      "count": 10,
+      "notes": "P6 occulte P8 et P1, P9 est dans la salle, P10 apparait derrière P4 qui est entrain d'entrer dans la salle"
+    },
+    {
+      "seconde": 15,
+      "image": "t16.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11"],
+      "count": 11,
+      "notes": "P2 occulte P8 et P1, P4 est dans la salle et P10 n'est plus caché par P4, P11 apparait et occulte P3"
+    },
+    {
+      "seconde": 16,
+      "image": "t17.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11"],
+      "count": 11,
+      "notes": "P9 occulte P8 et P5, P10 est dans la salle et occulte P3, P11 suit P10 sans être occulté ."
+    },
+    {
+      "seconde": 17,
+      "image": "t18.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P11 entre dans la salle et occulte P3 et P12 qui vient d'apparaître, P4 occulte P5, P2 occulte P7"
+    },
+    {
+      "seconde": 18,
+      "image": "t19.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P11 est dans la salle, P12 est entrain d'entrer la salle et occulte le partie de P3, P10 occulte P5, P4 occulte P8, P9 occulte P6, P7 n'est plus occulté par P2"
+    },
+    {
+      "seconde": 19,
+      "image": "t20.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P3 est entrain d'entrer et P12 est maintenant dans la salle, P5 et P8 et P1 ne sont plus occultés mais floues, P4 occulte P9 les deux occultent P6 et P7 ."
+    },
+    {
+      "seconde": 20,
+      "image": "t21.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "Tous est maintenant dans la salle, P4 occulte P9 et P2, P10 occulte P6 et P7, P11 occulte P5 et P1 et P8"
+    },
+    {
+      "seconde": 21,
+      "image": "t22.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P12 occulte P8 et P1, P10 occulte P6 et P7, P10 occulte P9, à part ceux qui occulte les autres et P4 et P3 les visibles sont floues et moins visibles"
+    },
+    {
+      "seconde": 22,
+      "image": "t23.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P10 occulte P9, P12 occulte P6 et P7, P11 occulte P7 . une partie de P5 est occulté par P3 ."
+    },
+    {
+      "seconde": 23,
+      "image": "t24.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P12 occulte P7, P10 occulte P9 puisque on ne voit que la tête de ce dernier, P2 est flou et P4 s'accroupit afin de regarder au dessous d'une table"
+    },
+    {
+      "seconde": 24,
+      "image": "t25.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P4 regarde toujours en bas de la table, P3 occulte P6 et P7 et P2, P12 occulte P10, P11 occulte P9  "
+    },
+    {
+      "seconde": 25,
+      "image": "t26.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P4 qui regarde toujours au dessous d'une table, P6 occulte P2, P3 occulte P10 et P7, P11 occulte P12, P9 en dehors de la vue"
+    },
+    {
+      "seconde": 26,
+      "image": "t27.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P11 occulte P3, P9 n'est plus visible"
+    },
+    {
+      "seconde": 27,
+      "image": "t28.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P9 n'est pas encore visible"
+    },
+    {
+      "seconde": 28,
+      "image": "t29.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "notes": "P9 et P3 ne sont plus visibles ."
+    },
+    {
+      "seconde": 29,
+      "image": "t30.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P13 apparait, P12 occulte P3. P9 n'est pas encore visible"
+    },
+    {
+      "seconde": 30,
+      "image": "t31.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P13 n'est plus visible, P3 n'est plus occulté, P12 disparait"
+    },
+    {
+      "seconde": 31,
+      "image": "t32.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P12 et P9 ne sont pas visibles . P13 apparait"
+    },
+    {
+      "seconde": 32,
+      "image": "t33.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P13 et P9 ne sont pas visibles . P12 est occulté par P4"
+    },
+    {
+      "seconde": 33,
+      "image": "t34.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P4 occulte P12, P12 occulte P3, P9 n'est pas visible puisqu'il est sorti de la zone de camera mais reste dans la salle "
+    },
+    {
+      "seconde": 34,
+      "image": "t35.jpg",
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
+      "count": 13,
+      "notes": "P4 occulte P12, P12 occulte P3 . P9 n'est pas encore visible . P2 occulte P10 ."
+    }
+  ],
+  "occlusions": [
+    {
+      "etiquette": "P8",
+      "debut_s": 14,
+      "fin_s": 16,
+      "cause": "plusieurs personnes devant P8 (P6, P2, P9) chacun a seconde différent ."
+    },
+    {
+      "etiquette": "P9",
+      "debut_s": 20,
+      "fin_s": 24,
+      "cause": "P10 devant P9 ."
+    },
+    {
+      "etiquette": "P12",
+      "debut_s": 30,
+      "fin_s": 34,
+      "cause": "P4 devant P12 ."
+    },
+    {
+      "etiquette": "P7",
+      "debut_s": 19,
+      "fin_s": 25,
+      "cause": "P7 s'assoit tandisque les autres en train de marcher afin de chercher leurs places ."
+    }
+  ]
+}

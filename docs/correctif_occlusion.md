@@ -915,3 +915,97 @@ Je recommande **(b)**, pour la raison mesurée au §11.7 : le bruit n'est nul
 qu'en conditions strictement reproductibles, et une ligne re-cliquée à chaque
 mesure ne l'est pas. Mais c'est une décision de la personne responsable, pas la
 mienne.
+
+---
+
+# 12. Vérité terrain de `fort_occ4` — reçue
+
+Fichier versionné : **`tests/fixtures/ground_truth_fort_occ4.json`**.
+Images d'appui : `annotation/t01.jpg` … `t35.jpg`, une par seconde.
+
+Il lève l'étape bloquante du §3, demandée au §11.10.1.
+
+## 12.1 Contenu et contrôle de cohérence
+
+| Élément | Valeur |
+|---|---|
+| Vidéo annotée | `test/fort_occ4.mp4`, 30,0 ips, 35,17 s, 1280×720 |
+| Couverture | **35 secondes, de 0 à 34** — la vidéo entière, pas un extrait |
+| Étiquettes humaines | **13** (`P1` … `P13`), chacune décrite par un repère visuel (couleur de vêtement, rang, côté) |
+| Segments d'occlusion documentés | 4 |
+| `count` ≠ `len(present)` | **aucune incohérence** |
+| Étiquettes déclarées mais jamais utilisées | aucune |
+| Étiquettes utilisées mais non déclarées | aucune |
+
+**Effectif réel, seconde par seconde** : 4, 5, 5, 5, 6, 6, 7, 7, 8, 8, 8, 8, 9,
+9, 10, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13,
+13, 13. La salle se remplit de 4 à 13 personnes, sans jamais se vider : aucune
+sortie réelle sur la séquence.
+
+**Segments d'occlusion annotés :**
+
+| Étiquette | Début | Fin | Durée | Cause notée |
+|---|---|---|---|---|
+| `P7` | 19 s | 25 s | **6 s** | s'assoit pendant que les autres cherchent leur place |
+| `P9` | 20 s | 24 s | **4 s** | `P10` devant `P9` |
+| `P12` | 30 s | 34 s | **4 s** | `P4` devant `P12` |
+| `P8` | 14 s | 16 s | 2 s | plusieurs personnes devant (`P6`, `P2`, `P9`) |
+
+Trois segments sur quatre dépassent 3 s et relèvent donc directement du lot 6
+(§7.5). Le quatrième (`P8`, 2 s) est en dessous du seuil demandé au §3 — il est
+conservé tel quel, il ne gêne rien.
+
+**Deux champs restent à compléter** : `annotateur` et `date` valent
+`A RENSEIGNER`. Sans conséquence sur les mesures, mais à renseigner pour la
+traçabilité.
+
+## 12.2 Première confrontation aux mesures de session 0
+
+Confrontation partielle, sur les seules grandeurs déjà mesurées au §11.5.
+**Ce n'est pas encore le tableau complet des métriques du §3** — voir §12.3.
+
+| Grandeur | Vérité terrain | Pipeline (§11.5) | Écart |
+|---|---|---|---|
+| Personnes réellement présentes en fin de séquence | **13** | — | — |
+| `occupancy_operational` en fin de séquence | — | **13** | **0 — exact** |
+| `occupancy_observed` en fin de séquence | 13 attendues | **3** | **−10** |
+| Identités logiques créées sur la séquence | 13 personnes | **18** | **+5 identifiants surnuméraires** |
+
+Trois enseignements, tous soutenus par la mesure :
+
+1. **`occupancy_operational` est exact** sur cette séquence : 13 contre 13. Le
+   bilan officiel ne se trompe pas — cohérent avec le fait que la vérité terrain
+   ne comporte aucune sortie réelle et que le pipeline n'a produit aucun `OUT`
+   fantôme (les 13 purges sont toutes `is_exit=false`, §11.5).
+2. **`occupancy_observed` s'effondre** : 3 personnes vues alors que 13 sont
+   présentes. `erreur_comptage_max` est donc **au moins 10**, contre une cible
+   de ≤ 1 au §4. C'est précisément le compteur que l'assistance tête doit
+   protéger (§6 de `CLAUDE.md`), et l'écart mesuré donne au lot 6 une marge de
+   progression considérable — ainsi qu'une base de comparaison nette.
+3. **18 identités pour 13 personnes** : au moins 5 identifiants surnuméraires,
+   cohérent avec les 5 `TECHNICAL_ID_CHANGED` du §11.5. La fragmentation est
+   donc confirmée par une source indépendante du pipeline.
+
+## 12.3 Ce qui reste à calculer
+
+Les quatre métriques du §3 ne sont **pas** toutes calculables en l'état :
+
+| Métrique | Calculable ? | Ce qu'il manque |
+|---|---|---|
+| `erreur_comptage_max` | **partiellement** — borne inférieure de 10 établie ci-dessus | `occupancy_observed` relevé **seconde par seconde**, ce qui demande un run instrumenté supplémentaire (le run du §11.5 n'a conservé que l'état final) |
+| `fragments_par_personne` | non | l'association entre identifiant technique et étiquette humaine, qui exige une inspection visuelle des pistes |
+| `id_switches_reels` | non | idem |
+| `fusions_reelles` | non | idem |
+
+Autrement dit : l'annotation fournit le **dénominateur** (qui est réellement là,
+et quand), mais pas encore le **rattachement** entre les `person_id` du pipeline
+et les étiquettes `P1` … `P13`. Trois des quatre métriques en dépendent.
+
+Ce rattachement est le travail à faire avant le lot 1 — il est mécanisable
+(rejouer la séquence en journalisant la boîte de chaque `person_id` par seconde,
+puis apparier avec les étiquettes sur les images `annotation/t*.jpg`), mais il
+suppose d'ajouter un script au dépôt, ce qui rejoint la décision de protocole
+laissée ouverte au §11.10.3.
+
+Le §0 de `CLAUDE.md` est mis à jour en conséquence : la vérité terrain est
+**fournie**, les métriques dérivées restent **à outiller**.
