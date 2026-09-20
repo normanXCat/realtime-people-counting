@@ -27,7 +27,7 @@ au moment de traiter le lot concerné.
 | Contrôle de déterminisme (§2.1) | `docs/correctif_occlusion.md` §11.7 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
 | Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (`docs/correctif_occlusion.md` §12). Métriques dérivées : **à outiller** (§12.3) | non commité | 2026-09-20 |
 | Critères d'acceptation validés (§4) | — | à faire (§11.10.2) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | non commité | 2026-09-20 |
-| Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | mesuré, en attente d'acceptation (`docs/correctif_occlusion.md` §13). Critère §0.3 **non satisfait** : divergence du harnais de session 0 expliquée et chiffrée (§13.5) | non commité | 2026-09-20 |
+| Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | **accepté** le 2026-09-21 (`docs/correctif_occlusion.md` §13). Critère §0.3 non satisfait mais divergence expliquée et chiffrée (§13.5) ; ajout `line_origin` dans `src/events.py` **conservé** ; publication de la ligne dans `config_resolved.yaml` **reste ouverte** | `435804c` | 2026-09-20 |
 | Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire ; §1.3 (filtre géométrique) **ramené à une investigation conditionnelle** après le lot 0 | — | — |
 | Lot 4 — seuils BoT-SORT (**avancé**) | `docs/lot_4_seuils_botsort.md` | à faire | — | — |
 | Lot 2 — rétention hors zone (+ bord du cadre) | `docs/lot_2_retention.md` | à faire | — | — |
@@ -112,8 +112,27 @@ zone ou un franchissement.
   l'index caméra). **Cette commande exige un opérateur** : la ligne virtuelle se
   définit par deux clics puis « C », sans aucun repli automatique — voir
   `docs/correctif_occlusion.md` §11.1 et §11.1.1. Elle ne peut donc pas servir à
-  une mesure automatisée ; le protocole retenu pour les lots reste à trancher
-  (§11.10.3).
+  une mesure automatisée. Depuis le lot 0, `--line` lève ce blocage (§13.2.1).
+- **Ligne de mesure — FIGÉE pour tout le plan (lots 1 à 7).** Celle du lot 0,
+  relevée dans `results/test_line_lot0/calibration.json` et identique sur les
+  trois rejouages de la baseline (`results/baseline_lot0.jsonl`) :
+
+  ```bash
+  --line 0.05,0.6,0.95,0.6
+  ```
+
+  Coordonnées normalisées, `line_origin: argument`, `inside_side: negative` ;
+  sur `fort_occ4` (1280×720), segment horizontal (64, 432) – (1216, 432).
+  Commande de mesure de référence :
+
+  ```bash
+  python scripts/measure_corpus.py --videos test/ --line 0.05,0.6,0.95,0.6 \
+      --repeat 3 --out results/<lot>.jsonl
+  ```
+
+  **Ne jamais changer cette ligne en cours de plan** : elle détermine zones,
+  côtés et franchissements, donc tous les compteurs IN/OUT et de rétention. Une
+  autre ligne rend les tableaux avant/après entre lots incomparables.
 - **Prérequis d'installation** : `models/yolo11n.pt` n'est pas versionné et doit
   être téléchargé avant tout lancement, sinon `verify_weights` échoue (code 3).
   Source et SHA-256 : `docs/correctif_occlusion.md` §11.3.
@@ -210,7 +229,9 @@ compteurs internes :**
 |---|---|---|
 | `id_switches_reels` | changements d'identifiant technique pour une même étiquette humaine | symptôme 1 |
 | `fragments_par_personne` | nb d'identifiants distincts attribués à une étiquette humaine sur le segment | pertes/redétections |
-| `erreur_comptage_max` | écart max entre `occupancy_observed` et le nombre réel de personnes | effet visible |
+| `erreur_comptage_max_operational` | écart max, sur les secondes annotées, entre `occupancy_operational` et le nombre de personnes **présentes** | bilan officiel |
+| `erreur_comptage_max_visible` | écart max entre `visible_count` et le nombre de personnes **visibles** annotées | effet visible |
+| `pistes_vues` (diagnostic, sans cible) | nombre de pistes BoT-SORT observées à la seconde, contre les personnes visibles | localise le décrochage (tracker ou aval) |
 | `fusions_reelles` | nb d'instants où 2 étiquettes humaines partagent un identifiant | symptôme 1 |
 
 L'annotation est faite **une fois**, par la personne responsable ou par
@@ -233,7 +254,8 @@ occlusion dense :
 |---|---|---|
 | `id_switches_reels` | ≤ 1 sur le segment (baseline à mesurer d'abord) | à valider |
 | `fusions_reelles` non signalées | 0 — toute fusion réelle doit au minimum être publiée comme incertitude | à valider |
-| `erreur_comptage_max` sur `occupancy_observed` | ≤ 1 personne | à valider |
+| `erreur_comptage_max_operational` : `occupancy_operational` contre les personnes **présentes** (`count`) | exact (0) à chaque seconde | à valider |
+| `erreur_comptage_max_visible` : `visible_count` contre les personnes **visibles annotées** (§12.2.1 de `docs/correctif_occlusion.md`) | ≤ 1 personne | à valider |
 | `occupancy_operational` | strictement exact (aucun IN/OUT fantôme) | à valider |
 | Non-régression, vidéo à occlusion faible | aucun compteur dégradé au-delà du bruit mesuré en §2.1 | à valider |
 | FPS moyen, modèle pose actif — plancher absolu | ≥ 3,0 ips | à valider |
@@ -329,11 +351,28 @@ n'est pas un succès** : le dire explicitement dans le livrable.
 - `occupancy_operational` = `initial + IN + NEW − OUT`. Bilan officiel (HUD,
   `SESSION_END`). Ne varie que sur une sortie confirmée par la FSM — jamais sur
   une occlusion, jamais sur une purge technique.
-- `occupancy_observed` = sous-ensemble des pistes actuellement considérées
-  visibles. **C'est ce compteur, et lui seul, que l'assistance tête protège.**
-- `occupancy_uncertain` / `occupancy_range` = écart entre les deux, publié
-  comme incertitude quand une personne est occultée sans confirmation de
-  sortie.
+- `occupancy_observed` = pistes comptées (`inside_occupancy`) dont l'état
+  n'est pas `ABSENTE` (`occupancy_manager.py:285-289`). **Il inclut l'état
+  `OCCULTEE`** : une personne occultée pendant sa grâce y reste. Sa docstring
+  affirme le contraire (« une personne comptée mais occultée n'y figure pas ») :
+  elle est fausse, c'est le code qui fait foi.
+- `visible_count` = pistes dans un état visible (`is_visible` :
+  `INITIALISATION`, `EXTERIEUR`, `PRESENTE`, `EN_ZONE_MORTE`,
+  `ENTREE_EN_COURS`, `SORTIE_EN_COURS`), **hors `OCCULTEE` et `ABSENTE`**
+  (`occupancy_manager.py:312-314`, `occupancy_types.py:125-133`). Attention :
+  il n'est **pas** filtré sur `inside_occupancy`, donc il compte aussi les
+  pistes `EXTERIEUR` et `INITIALISATION`. Publié dans `OCCUPANCY_SNAPSHOT`
+  (`visible_count`). **C'est lui, et non `occupancy_observed`, qui se compare
+  aux personnes visibles annotées** (§4), et c'est lui que l'assistance tête
+  doit protéger.
+- `occupancy_uncertain` / `occupancy_range` = écart entre `occupancy_observed`
+  et `occupancy_operational`, publié comme incertitude quand une personne est
+  perdue sans confirmation de sortie.
+
+Trois compteurs distincts, pas deux : `occupancy_operational` ≥
+`occupancy_observed` ≥ personnes comptées et visibles. `visible_count` n'entre
+pas dans cette chaîne : il ajoute les pistes visibles non comptées
+(`EXTERIEUR`, `INITIALISATION`) et peut donc dépasser `occupancy_observed`.
 
 ---
 
