@@ -1,17 +1,29 @@
 # Lot 4 — Seuils BoT-SORT
 
-> Ex-« lot A ». Ne pas démarrer avant que le lot 3 soit mesuré et accepté.
-> Lire d'abord `CLAUDE.md` et `docs/diagnostic.md`.
+> Ex-« lot A ». **Avancé : ce lot se traite désormais juste après le lot 1**,
+> avant les lots 2 et 3. Lire d'abord `CLAUDE.md` et `docs/diagnostic.md`.
 >
 > **Amputé de deux sections lors de la révision du plan :** A.2 (mémoire
 > d'identité) est remplacée par le lot 2 (rétention hors zone), A.4 (base de
 > temps) par le lot 1.1 (`track_buffer` en secondes). Les intitulés A.1 à A.5
 > sont conservés pour la traçabilité avec `docs/correctif_occlusion.md`.
 >
-> **Pourquoi après le lot 3 :** `proximity_thresh` gouverne le moment où
-> l'apparence est consultée. Le régler pendant que le descripteur est un
-> histogramme HSV peu discriminant reviendrait à calibrer une vanne sur un
-> signal de bruit.
+> **Pourquoi avancé.** Le lot 0 a mesuré où le système décroche : à la
+> seconde 28 de `fort_occ4`, 2 pistes vues pour 10 personnes visibles. Ce sont
+> les **pistes** qui sont perdues, pas les identités de la galerie — donc le
+> domaine du tracker, pas du descripteur. Ces trois seuils sont trois valeurs
+> de YAML, mesurables en une heure avec le harnais du lot 0 : c'est le
+> meilleur rapport effet/temps du plan, et il doit être épuisé avant
+> d'engager le coût d'OSNet.
+>
+> **Réserve conservée, et à mesurer ici** : `proximity_thresh` gouverne le
+> moment où l'apparence est consultée. Avec le descripteur HSV actuel, peu
+> discriminant, son réglage peut ne rien donner — ou donner un résultat qui
+> changera après le lot 3. Mesurer les trois seuils **isolément** rend ce
+> risque visible : si `proximity_thresh` seul ne déplace rien alors que
+> `match_thresh` et `new_track_thresh` agissent, c'est le signe qu'il faudra
+> le reprendre après le lot 3. Le consigner dans le livrable plutôt que de
+> conclure.
 
 ### A.1 Seuils BoT-SORT
 
@@ -25,8 +37,9 @@ le vérifie) :
 | `proximity_thresh` | 0.5 | 0.8 |
 | `new_track_thresh` | 0.7 | 0.45 |
 
-**Mesurer chaque seuil isolément d'abord**, sur la vidéo à occlusion dense du
-corpus (section 1), avant
+**Mesurer chaque seuil isolément d'abord**, sur `fort_occ4` (mesure
+principale) et `rare_occ2` (non-régression), avec `scripts/measure_corpus.py`,
+avant
 de les combiner — ne pas les changer tous en même temps sans savoir lequel
 contribue à quoi. Étendre `scripts/measure_tracker_swaps.py` si nécessaire pour
 isoler `match_thresh` (il n'expose peut-être aujourd'hui que `track_buffer`,
@@ -79,6 +92,6 @@ sur-comptage (doublons survivants promus en identités). Mesurer la combinaison,
 pas seulement chaque seuil isolément, et surveiller le nombre d'identités
 créées sur la vidéo à occlusion faible.
 
-**S'arrêter et rendre ce tableau avant de continuer vers le lot 5.**
+**S'arrêter et rendre ce tableau avant de continuer vers le lot 2.**
 
 ---

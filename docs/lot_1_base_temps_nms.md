@@ -5,10 +5,10 @@
 > critères d'acceptation validés (§4), contrôle de déterminisme (§2.1). Lire
 > `docs/diagnostic.md` avant.
 >
-> **Élargi après la session 0.** Deux mesures ont changé le contenu de ce lot :
-> l'écart entre base de temps vidéo et base murale (13 purges contre 0 sur la
-> même vidéo) et les 235 rejets `aspect_ratio_out_of_range` sur `fort_occ`.
-> Voir `docs/correctif_occlusion.md` §11.7 et §11.9.
+> **Révisé deux fois.** Après la session 0, pour l'écart entre base de temps
+> vidéo et base murale. Après le lot 0, qui a invalidé la prémisse du §1.3 :
+> celui-ci passe d'un correctif prescrit à une investigation conditionnelle.
+> Voir `docs/correctif_occlusion.md` §11.7 et §13.5.
 
 **Pourquoi ce lot en premier.** Deux correctifs en amont de tout le reste :
 l'un rétablit la cohérence temporelle sans laquelle aucune mesure de durée
@@ -141,36 +141,58 @@ d'association par frame.
 
 ---
 
-## 1.3 Ordre du filtre géométrique
+## 1.3 Filtre géométrique — investigation avant correctif
 
-**Mesure de la session 0** : sur `fort_occ`, les 235 `DETECTION_REJECTED_GEOMETRY`
-sont **tous** `aspect_ratio_out_of_range`, tous des boîtes trop larges (ratio
-W/H jusqu'à 3,85). Or `check_detection_geometry` s'exécute **avant** la
-détection de fusion (`occupancy_manager.py:365-399`). Une boîte large est
-exactement la signature de deux personnes côte à côte : le filtre élimine donc
-le cas que `POSSIBLE_MULTI_PERSON_BOX` doit attraper, avant qu'il puisse être
-émis.
+> **Section réécrite après le lot 0. Sa version précédente reposait sur une
+> prémisse fausse.** Elle affirmait que `check_detection_geometry`, exécuté
+> avant la détection de fusion, empêchait `POSSIBLE_MULTI_PERSON_BOX` d'être
+> émis, et que les « 0 fusions » du catalogue étaient un artefact d'ordre des
+> opérations. Le lot 0 a mesuré **52 `POSSIBLE_MULTI_PERSON_BOX` sur
+> `fort_occ4`** avec le pipeline réel : le signal de fusion fonctionne. Les
+> zéros de session 0 venaient du harnais, qui ne branchait pas les
+> stabilisateurs et calculait la grâce sur 30 ips au lieu de 3,8
+> (`docs/correctif_occlusion.md` §13.5).
+>
+> **Donc : aucun correctif n'est prescrit ici tant que l'investigation
+> ci-dessous n'a pas conclu.** Ne pas modifier l'ordre des opérations sur la
+> foi de l'ancienne section.
 
-Conséquence directe sur le catalogue : les « 0 fusions » relevées en session 0
-sont, au moins en partie, un artefact de mesure. Les vidéos les plus peuplées du
-corpus (`fort_occ`, `fort_occ2`) sont précisément celles qui ne produisent aucun
-phénomène — à revérifier après ce correctif.
+**Ce qui reste à expliquer.** Sur `fort_occ`, la session 0 a relevé 235
+`DETECTION_REJECTED_GEOMETRY`, tous `aspect_ratio_out_of_range`, tous des
+boîtes trop larges (ratio W/H jusqu'à 3,85). Et `fort_occ` est la vidéo la plus
+peuplée du corpus tout en ne produisant aucun phénomène. Ces deux faits
+peuvent avoir trois explications, qui appellent des suites opposées :
 
-**Correctif** : une boîte rejetée pour ratio W/H **trop grand** est routée vers
-le chemin fusion avant d'être écartée, au lieu d'être éliminée en silence. Les
-autres motifs de rejet (`box_too_small`, ratio trop petit) sont inchangés.
+1. **Artefact du harnais**, comme les zéros de `fort_occ4` : les 235 rejets
+   n'existent peut-être pas, ou pas dans cette proportion, avec le pipeline
+   réel. C'est l'hypothèse la plus probable au vu de §13.5.
+2. **Rejets légitimes** : boîtes aberrantes produites par le détecteur
+   (reflets, objets, fragments), que le filtre a raison d'écarter.
+3. **Fusions réellement perdues** : deux personnes côte à côte dont la boîte
+   est écartée avant le chemin fusion.
 
-- Ne pas relâcher `max_aspect_ratio_wh` : le filtre garde son rôle, on corrige
-  l'ordre des opérations, pas le seuil.
-- Chaque rejet pour ratio trop grand émet son motif et ses dimensions, pour que
-  la mesure reste vérifiable.
+**Investigation, dans cet ordre :**
 
-**Tests** : une boîte de ratio 3,5 contenant deux personnes déclenche
-`POSSIBLE_MULTI_PERSON_BOX` au lieu d'un rejet silencieux ; une boîte trop
-petite reste rejetée comme avant.
+- Rejouer `fort_occ` et `fort_occ2` avec `scripts/measure_corpus.py`, donc le
+  pipeline réel, et relever `DETECTION_REJECTED_GEOMETRY` ventilé par motif
+  ainsi que `POSSIBLE_MULTI_PERSON_BOX`. Comparer aux 235 / 0 de session 0.
+- Si des rejets pour ratio trop grand subsistent en nombre : extraire une
+  dizaine de ces boîtes en images et les regarder. Une boîte de ratio 3,85
+  contenant visiblement deux personnes tranche l'hypothèse 3 ; un reflet ou un
+  fragment tranche l'hypothèse 2. Consigner les vignettes ou leurs coordonnées
+  dans le livrable.
+- Ne conclure qu'après ce regard. Le compteur seul ne distingue pas les trois
+  cas.
 
-**À refaire après ce correctif** : rejouer le catalogue complet. Le classement
-des vidéos du corpus peut changer.
+**Si et seulement si l'hypothèse 3 est confirmée**, le correctif envisagé est
+de router une boîte rejetée pour ratio **trop grand** vers le chemin fusion
+avant de l'écarter, sans relâcher `max_aspect_ratio_wh` — on corrige l'ordre,
+pas le seuil. Les autres motifs (`box_too_small`, ratio trop petit) restent
+inchangés. Ce correctif n'est pas prescrit : il est conditionnel.
+
+**Dans tous les cas** : consigner l'issue de l'investigation dans le livrable,
+y compris « rien à corriger ». Une hypothèse écartée sur mesure vaut un
+correctif — et celle-ci a déjà coûté une section entière écrite à tort.
 
 ---
 
@@ -191,9 +213,18 @@ réidentification après perte** — c'est le chiffre que 1.1 doit déplacer.
 **Mesures spécifiques** — 1.0 : `PURGE`, `INCONSISTENT_STATE` et
 `OCCUPANCY_SNAPSHOT` dans les deux bases de temps, plus le bruit run-à-run en
 base retenue. 1.1 : durée de la plus longue occlusion du corpus et nombre de
-pistes détruites par expiration de `track_buffer`. 1.3 :
-`DETECTION_REJECTED_GEOMETRY` ventilé par motif et `POSSIBLE_MULTI_PERSON_BOX`,
-sur `fort_occ` et `fort_occ2` en particulier.
+pistes détruites par expiration de `track_buffer`. 1.3 : issue de
+l'investigation (hypothèse retenue et sur quelle observation), et seulement si
+un correctif a été appliqué, `DETECTION_REJECTED_GEOMETRY` ventilé par motif et
+`POSSIBLE_MULTI_PERSON_BOX` avant/après.
+
+**Référence de comparaison** : les compteurs du **pipeline réel** mesurés au
+lot 0 (`docs/correctif_occlusion.md` §13), pas ceux du harnais de session 0
+(§11), qui divergent. Seuils de signification du bruit : §13.5.1 — `PURGE` ±2,
+`STATE_TRANSITION` ±2, `OCCUPANCY_SNAPSHOT` ±11, `long_gaps_count` ±3 ; tous
+les autres compteurs sont strictement stables, donc tout écart y est un signal.
+
+**Baseline FPS** : 3,825 ips, plancher relatif 3,06 ips (`CLAUDE.md` §4).
 
 ---
 
