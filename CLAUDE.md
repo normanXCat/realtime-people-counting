@@ -28,29 +28,46 @@ au moment de traiter le lot concerné.
 | Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (`docs/correctif_occlusion.md` §12). Métriques dérivées : **à outiller** (§12.3) | non commité | 2026-09-20 |
 | Critères d'acceptation validés (§4) | — | à faire (§11.10.2) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | non commité | 2026-09-20 |
 | Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | mesuré, en attente d'acceptation (`docs/correctif_occlusion.md` §13). Critère §0.3 **non satisfait** : divergence du harnais de session 0 expliquée et chiffrée (§13.5) | non commité | 2026-09-20 |
-| Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire | — | — |
-| Lot 2 — rétention hors zone | `docs/lot_2_retention.md` | à faire | — | — |
+| Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire ; §1.3 (filtre géométrique) **ramené à une investigation conditionnelle** après le lot 0 | — | — |
+| Lot 4 — seuils BoT-SORT (**avancé**) | `docs/lot_4_seuils_botsort.md` | à faire | — | — |
+| Lot 2 — rétention hors zone (+ bord du cadre) | `docs/lot_2_retention.md` | à faire | — | — |
 | Lot 3 — ReID OSNet + galerie | `docs/lot_3_reid_osnet.md` | à faire | — | — |
-| Lot 4 — seuils BoT-SORT | `docs/lot_4_seuils_botsort.md` | à faire | — | — |
 | Lot 5 — retouches locales | `docs/lot_5_retouches.md` | à faire | — | — |
 | Lot 6 — head_assist | `docs/lot_6_head_assist.md` | à faire | — | — |
 | Lot 7 — prétraitement | `docs/lot_7_pretraitement.md` | à faire | — | — |
 | Clôture — mise à jour de `docs/rapport_final.md` (§7.1) | — | à faire | — | — |
 
-**Ordre imposé et sa raison** — chaque lot dépend de la mesure du précédent :
+**Ordre imposé : 1 → 4 → 2 → 3 → 5 → 6 → 7.** Les numéros de lot sont
+conservés (noms de fichiers, traçabilité avec `docs/correctif_occlusion.md`) ;
+seul l'ordre d'exécution a changé après le lot 0. Chaque lot dépend de la
+mesure du précédent dans cet ordre :
 
-1. La base de temps corrigée conditionne l'interprétation de toute durée
-   d'occlusion ; le seuil NMS agit en amont de tout le reste (une détection
-   supprimée n'est récupérable par aucun réglage aval).
-2. La règle de rétention suppose la survie de piste stabilisée par le lot 1.
-3. Le descripteur profond change l'échelle de `similarity_threshold` : mesuré
-   seul, en deux étapes (3.a modèle, 3.b structure de galerie).
-4. `proximity_thresh` gouverne quand l'apparence est consultée — le régler avant
-   d'avoir un descripteur fiable revient à calibrer une vanne sur du bruit.
+1. **Lot 1.** La base de temps corrigée conditionne l'interprétation de toute
+   durée d'occlusion ; le seuil NMS agit en amont de tout le reste (une
+   détection supprimée n'est récupérable par aucun réglage aval). Le §1.3
+   n'est plus un correctif prescrit : le lot 0 a mesuré 52
+   `POSSIBLE_MULTI_PERSON_BOX` sur `fort_occ4` avec le pipeline réel, ce qui
+   invalide sa prémisse (`docs/correctif_occlusion.md` §13.5).
+2. **Lot 4, avancé.** Le lot 0 localise le décrochage au niveau des **pistes**
+   (s28 de `fort_occ4` : 2 pistes pour 10 personnes visibles), pas de la
+   galerie : domaine du tracker. Trois valeurs de YAML, meilleur rapport
+   effet/temps du plan, à épuiser avant le coût d'OSNet. Réserve conservée :
+   `proximity_thresh` gouverne quand l'apparence est consultée ; avec le
+   descripteur HSV, son effet peut être nul ou changer après le lot 3. Les
+   seuils sont mesurés **isolément** pour rendre ce risque visible, et
+   `proximity_thresh` sera à reprendre après le lot 3 s'il ne déplace rien.
+3. **Lot 2.** La règle de rétention suppose la survie de piste stabilisée par
+   les lots 1 et 4. Elle couvre aussi le **bord du cadre**, où la rétention
+   est illimitée : `P9` sort du champ à s25 de `fort_occ4` mais reste dans la
+   salle.
+4. **Lot 3.** Le descripteur profond change l'échelle de
+   `similarity_threshold` : mesuré seul, en deux étapes (3.a modèle, 3.b
+   structure de galerie).
 5. à 7. Inchangés.
 
 Statuts possibles : `à faire` / `en cours` / `mesuré, en attente d'acceptation`
-/ `accepté`. Un lot ne démarre que si le précédent est `accepté`.
+/ `accepté`. Un lot ne démarre que si le précédent **dans l'ordre ci-dessus**
+est `accepté`.
 
 ---
 
