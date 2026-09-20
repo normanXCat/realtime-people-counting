@@ -201,24 +201,45 @@ def test_la_fenetre_de_selection_recoit_ses_parametres_de_la_configuration(monke
     assert "ligne" in captured["window_name"]
 
 
-def test_no_show_avec_affichage_conserve_la_selection_manuelle(monkeypatch):
-    """`--no-show` supprime la prévisualisation, pas la validation de la ligne."""
-    captured: dict = {}
+def test_no_show_sans_ligne_refuse_meme_avec_un_affichage(monkeypatch):
+    """`--no-show` sans `--line` refuse, même si un écran est disponible.
+
+    Attente **modifiée par le lot 0**. Auparavant, `--no-show` ouvrait tout de
+    même la fenêtre de sélection : la prévisualisation était supprimée, pas la
+    validation de la ligne. Le lot 0 (`docs/lot_0_outillage.md` §0.1) fait de
+    `--no-show` un mode non interactif réel, où `--line` est obligatoire.
+
+    Ce que le test continue de garantir est inchangé et reste l'essentiel :
+    **aucune ligne n'est jamais devinée**. Seule la façon de le refuser change.
+    """
+    appels: list = []
 
     def _fake(source, **kwargs):
-        captured.update(kwargs, source=source)
+        appels.append(source)
         return "ligne-validee"
 
     monkeypatch.setattr(entry_point, "display_available", lambda: True)
     monkeypatch.setattr(entry_point, "select_line", _fake)
     config = _overrides("--no-show")
 
-    assert perform_line_selection(config, "clip.mp4", headless_requested=True) == "ligne-validee"
-    assert captured["source"] == "clip.mp4"
+    with pytest.raises(entry_point.NonInteractiveLineRequired):
+        perform_line_selection(config, "clip.mp4", headless_requested=True)
+    assert appels == [], "la fenêtre de sélection ne doit pas être sollicitée"
 
 
 def test_no_show_sans_interface_graphique_annonce_l_erreur(monkeypatch):
-    """Sans écran, `--no-show` doit expliquer qu'aucune ligne n'est définissable."""
+    """Sans écran, `--no-show` doit expliquer qu'aucune ligne n'est définissable.
+
+    Attente **ajustée par le lot 0** : le refus reste un `CalibrationUnavailable`
+    (la hiérarchie d'exceptions est préservée, `NonInteractiveLineRequired` en
+    hérite), mais le diagnostic pointe désormais la cause première — il manque
+    `--line` — plutôt que l'absence d'écran, qui n'est plus l'obstacle puisque
+    `--line` permet de s'en passer. Les assertions portent donc sur le nouveau
+    message ; l'exigence testée (refus explicite, jamais silencieux) est la même.
+
+    Le cas « pas d'écran **sans** `--no-show` » reste couvert par
+    `tests/test_main_e2e.py::test_sans_affichage_refuse_de_demarrer`.
+    """
     monkeypatch.setattr(entry_point, "display_available", lambda: False)
     config = _overrides("--no-show")
 
@@ -226,9 +247,9 @@ def test_no_show_sans_interface_graphique_annonce_l_erreur(monkeypatch):
         perform_line_selection(config, "clip.mp4", headless_requested=True)
 
     message = str(error.value)
-    assert "--no-show" in message
-    assert "interface graphique" in message
-    assert "deux clics" in message
+    assert "--line" in message
+    assert "non interactif" in message
+    assert "devin" in message, "le refus doit dire qu'aucune ligne n'est devinée"
 
 
 def test_calibrate_interface_deux_points(monkeypatch):
@@ -269,6 +290,11 @@ def test_source_inouvrable_produit_une_erreur_explicite(tmp_path: Path):
             "--output-root", str(tmp_path / "results"),
             "--session-id", session_id,
             "--no-show",
+            # Ligne explicite : sans elle, le mode non interactif refuse de
+            # démarrer AVANT d'avoir tenté d'ouvrir la source (lot 0), et le
+            # chemin réellement visé par ce test — « source illisible » — ne
+            # serait jamais atteint.
+            "--line", "0.05,0.6,0.95,0.6",
         ],
         cwd=str(REPO_ROOT),
         capture_output=True,

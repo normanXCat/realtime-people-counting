@@ -288,8 +288,18 @@ def test_annulation_par_l_operateur_ne_lance_aucun_comptage(tmp_path: Path, monk
     assert summary["counters"] is None
 
 
-def test_no_show_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch, capsys):
-    """`--no-show` sans interface graphique : erreur claire, aucun comptage."""
+def test_no_show_sans_ligne_refuse_de_demarrer(tmp_path: Path, monkeypatch, capsys):
+    """`--no-show` sans `--line` : erreur claire, aucun comptage.
+
+    Attente **ajustée par le lot 0** (`docs/lot_0_outillage.md` §0.1). Avant, le
+    refus venait de l'absence d'interface graphique et sortait en code 4. Le
+    mode non interactif exige désormais `--line`, et ce refus-là porte un code
+    dédié (6) pour ne pas être confondu avec « aucun écran disponible » : les
+    deux situations se corrigent différemment.
+
+    Ce qui est garanti reste identique : aucun comptage, aucune ligne devinée,
+    aucun `calibration.json`, et un refus journalisé.
+    """
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setattr("calibration.display_available", lambda: False)
     monkeypatch.setattr(entry_point, "display_available", lambda: False)
@@ -304,14 +314,14 @@ def test_no_show_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch, 
         ]
     )
 
-    assert code == 4
+    assert code == 6
     root = tmp_path / "results" / "session-headless"
     types = [event["type"] for event in read_events(root / "events.jsonl")]
     assert types == ["SESSION_START", "LINE_CALIBRATION_UNAVAILABLE", "SESSION_END"]
     assert not (root / "calibration.json").exists()
     stderr = capsys.readouterr().err
-    assert "--no-show" in stderr
-    assert "interface graphique" in stderr
+    assert "--line" in stderr
+    assert "non interactif" in stderr
 
 
 def test_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch):
@@ -344,6 +354,10 @@ def test_source_inouvrable_pendant_la_selection(tmp_path: Path):
             "--output-root", str(tmp_path / "results"),
             "--session-id", "session-source-absente",
             "--no-show",
+            # Ligne explicite : sans elle, le mode non interactif refuse avant
+            # même d'ouvrir la source (lot 0), et le chemin visé ici — source
+            # illisible, code 5 — ne serait pas atteint.
+            "--line", "0.05,0.6,0.95,0.6",
         ]
     )
 

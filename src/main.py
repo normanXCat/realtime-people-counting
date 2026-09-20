@@ -63,6 +63,7 @@ from calibration import (
     SourceUnreadable,
     ValidatedLine,
     display_available,
+    read_first_frame,
     sanitize_window_name,
     select_line,
 )
@@ -78,9 +79,11 @@ from config import (
 from events import EventLogger
 from geometry import (
     LineError,
+    Point,
     VirtualLine,
     confident_head_points,
     extract_head_point,
+    validate_line,
 )
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
@@ -132,7 +135,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-show", action="store_true",
         help="Mode headless : aucune prévisualisation pendant le traitement "
-             "(la sélection manuelle de la ligne reste obligatoire)",
+             "(sans --line, la sélection manuelle de la ligne reste obligatoire)",
+    )
+    parser.add_argument(
+        "--line",
+        default=None,
+        metavar="x1,y1,x2,y2",
+        help="Ligne virtuelle EXPLICITE, quatre réels normalisés dans [0,1] "
+             "séparés par des virgules. Aucune valeur par défaut : sans ce "
+             "drapeau, la sélection manuelle par clics est inchangée. La ligne "
+             "fournie subit exactement la même validation que la ligne cliquée.",
     )
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
     parser.add_argument("--max-frames", type=int, default=None, help="Arrêt après N frames (diagnostic)")
@@ -353,14 +365,106 @@ def calibrate(
     )
 
 
+class NonInteractiveLineRequired(CalibrationUnavailable):
+    """Mode non interactif demandé sans ligne explicite.
+
+    Sous-classe de :class:`CalibrationUnavailable` — c'est bien une calibration
+    impossible — mais **distincte**, pour porter son propre code de sortie : le
+    diagnostic « il manque ``--line`` » n'est pas le diagnostic « aucune
+    interface graphique disponible », et les confondre ferait chercher au mauvais
+    endroit.
+    """
+
+
+def parse_line_argument(raw: str) -> tuple[Point, Point]:
+    """Analyse ``x1,y1,x2,y2`` en deux points normalisés.
+
+    Ne contrôle **que** la forme : quatre nombres réels séparés par des
+    virgules. Les bornes [0,1] et la longueur minimale relèvent de
+    :func:`geometry.validate_line`, exactement comme pour une ligne cliquée —
+    il n'existe pas de second chemin de validation.
+
+    Raises:
+        LineError: nombre de composantes incorrect ou composante non numérique.
+    """
+    parts = [part.strip() for part in str(raw).split(",")]
+    if len(parts) != 4:
+        raise LineError(
+            f"--line invalide : {raw!r} — quatre valeurs « x1,y1,x2,y2 » sont "
+            f"attendues, {len(parts)} reçue(s)."
+        )
+    try:
+        x1, y1, x2, y2 = (float(part) for part in parts)
+    except ValueError as error:
+        raise LineError(
+            f"--line invalide : {raw!r} — les quatre valeurs doivent être "
+            f"numériques ({error})."
+        ) from error
+    return (x1, y1), (x2, y2)
+
+
+def line_from_argument(
+    config: PipelineConfig,
+    source: int | str,
+    raw: str,
+    *,
+    inside_side: str | None = None,
+) -> ValidatedLine:
+    """Construit la ligne à partir de ``--line``, sans aucun repli implicite.
+
+    La première image est lue malgré tout : c'est elle qui donne la résolution
+    inscrite dans la traçabilité, et son illisibilité doit être signalée ici
+    (``SourceUnreadable``) plutôt que plus tard dans la boucle.
+    """
+    p1, p2 = parse_line_argument(raw)
+    # Même fonction de validation que `LineSelection.confirm` : bornes,
+    # dégénérescence et longueur minimale sont contrôlées une seule fois, au
+    # même endroit, pour les deux provenances.
+    validate_line(p1, p2, config.line.min_length_ratio)
+    frame = read_first_frame(source)
+    height, width = frame.shape[:2]
+    return ValidatedLine(
+        p1=p1,
+        p2=p2,
+        inside_side=inside_side or config.line.inside_side,
+        frame_width=int(width),
+        frame_height=int(height),
+        display_scale=1.0,
+        clicks_px=((p1[0] * width, p1[1] * height), (p2[0] * width, p2[1] * height)),
+        confirmed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+
+
 def perform_line_selection(
     config: PipelineConfig,
     source: int | str,
     *,
     headless_requested: bool = False,
+    line_argument: str | None = None,
     **kwargs: Any,
 ) -> ValidatedLine:
-    """Point d'entrée du pipeline pour la calibration manuelle obligatoire."""
+    """Point d'entrée du pipeline pour la définition de la ligne.
+
+    Trois cas, sans aucun repli automatique :
+
+    1. ``--line`` fourni : la ligne est explicite, validée, tracée. Le mode
+       interactif n'est pas sollicité.
+    2. ``--line`` absent et mode interactif : comportement historique, inchangé
+       (deux clics puis « C »).
+    3. ``--line`` absent et ``--no-show`` : refus immédiat. Deviner une ligne
+       serait une erreur silencieuse, et c'est précisément ce que le dépôt a
+       supprimé.
+    """
+    if line_argument is not None:
+        return line_from_argument(config, source, line_argument)
+    if headless_requested:
+        raise NonInteractiveLineRequired(
+            "Mode non interactif : --line est obligatoire. La ligne virtuelle "
+            "ne peut pas être devinée (aucun repli automatique n'existe), et "
+            "--no-show empêche de la définir par clics. Fournir "
+            "« --line x1,y1,x2,y2 » en coordonnées normalisées, ou retirer "
+            "--no-show pour la sélectionner à la main."
+        )
     return calibrate(
         config,
         source,
@@ -370,8 +474,12 @@ def perform_line_selection(
 
 
 #: Type d'événement et code de sortie par cause d'échec de sélection.
+#: L'ordre compte : la première entrée dont le type correspond gagne, donc la
+#: sous-classe `NonInteractiveLineRequired` précède `CalibrationUnavailable`
+#: dont elle hérite — sinon son code dédié serait absorbé par le code 4.
 _LINE_FAILURES: tuple[tuple[type[BaseException], str, int], ...] = (
     (SourceUnreadable, "SOURCE_ERROR", 5),
+    (NonInteractiveLineRequired, "LINE_CALIBRATION_UNAVAILABLE", 6),
     (CalibrationUnavailable, "LINE_CALIBRATION_UNAVAILABLE", 4),
     (CalibrationCancelled, "LINE_CALIBRATION_CANCELLED", 4),
 )
@@ -527,17 +635,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(f"[CONFIG] {code} : {message}", file=sys.stderr)
     print(
-        f"[MODE] {args.mode} | source={source} | étape 1/2 : définition manuelle "
-        "de la ligne virtuelle (la première image va s'afficher)"
+        f"[MODE] {args.mode} | source={source} | étape 1/2 : "
+        + (
+            f"ligne virtuelle explicite (--line {args.line})"
+            if args.line is not None
+            else "définition manuelle de la ligne virtuelle "
+                 "(la première image va s'afficher)"
+        )
     )
 
-    # -- Ligne virtuelle : sélection manuelle obligatoire --------------------
-    # Aucun repli n'est possible : sans ligne validée par l'opérateur, le
-    # comptage ne démarre pas (et le refus est journalisé, jamais silencieux).
+    # -- Ligne virtuelle : explicite (--line) ou sélection manuelle ----------
+    # Aucun repli n'est possible : sans ligne explicite ni ligne validée par
+    # l'opérateur, le comptage ne démarre pas (et le refus est journalisé,
+    # jamais silencieux).
     try:
         validated = perform_line_selection(
-            config, source, headless_requested=args.no_show
+            config, source, headless_requested=args.no_show, line_argument=args.line
         )
+    except LineError as error:
+        # `--line` mal formé ou refusé par la validation partagée : c'est une
+        # erreur d'argument, signalée avant toute ouverture de session de
+        # comptage, avec le même code qu'une configuration invalide.
+        print(f"[LINE] {error}", file=sys.stderr)
+        logger.close()
+        return 2
     except (SourceUnreadable, CalibrationUnavailable, CalibrationCancelled) as error:
         return abort_line_selection(
             logger=logger,
@@ -552,10 +673,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     # comptage. Elle est figée dans la configuration résolue de la session.
     config = override_config(config, {"line": {"inside_side": validated.inside_side}})
     resolved_config_path = write_resolved_config(config, session_root, session_id)
+    line_origin = "argument" if args.line is not None else "operator_clicks"
     calibration_path = session_root / "calibration.json"
     write_json(
         calibration_path,
-        {"session_id": session_id, "source": str(source), "line": validated.to_dict()},
+        {
+            "session_id": session_id,
+            "source": str(source),
+            "line": validated.to_dict(),
+            "line_origin": line_origin,
+        },
     )
     logger.emit(
         "LINE_VALIDATED",
@@ -569,6 +696,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         display_scale=round(validated.display_scale, 6),
         confirmed_at=validated.confirmed_at,
         calibration_path=str(calibration_path),
+        line_origin=line_origin,
     )
 
     try:
@@ -610,6 +738,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     frame_index = 0
     last_detection_s = 0.0
     no_detection_announced = False
+    #: Identifiants vus depuis le début de la session, pour le résumé (lot 0).
+    seen_person_ids: set[int] = set()
+    seen_technical_ids: set[int] = set()
     #: Avertissement de base de temps (frames vs secondes) émis une seule fois,
     #: dès que le FPS réellement traité est connu.
     live_timebase_warned = False
@@ -656,6 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_sha256=model_sha256, frames_processed=0,
             duration_s=time.perf_counter() - start_s, budget=None,
             diagnostics=diagnostics,
+            identity_totals={"technical_ids": 0, "persons_created": 0},
         )
         logger.close()
         return 5
@@ -843,6 +975,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             occupancy.process_frame(detections, frame, timestamp_s, frame_index)
 
+            # Totaux d'identité cumulés (lot 0, schéma de mesure §0.2). Relevés
+            # ici parce que les identités expirées disparaissent de l'état du
+            # gestionnaire : un décompte final les manquerait toutes.
+            for person_id, person_track in occupancy.tracks.items():
+                seen_person_ids.add(int(person_id))
+                if int(person_track.technical_track_id) >= 0:
+                    seen_technical_ids.add(int(person_track.technical_track_id))
+
             with Timer() as render_timer:
                 rendered = frame.copy()
                 occupancy.draw_overlay(rendered)
@@ -932,6 +1072,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             duration_s=time.perf_counter() - start_s,
             budget=budget,
             diagnostics=diagnostics,
+            identity_totals={
+                "technical_ids": len(seen_technical_ids),
+                "persons_created": len(seen_person_ids),
+            },
         )
         logger.close()
 
@@ -978,6 +1122,7 @@ def _finalize(
     duration_s: float,
     budget: FrameBudget | None,
     diagnostics: DetectionDiagnostics | None = None,
+    identity_totals: dict[str, int] | None = None,
 ) -> None:
     """Écrit le bilan de session : événement final, résumé, environnement (spec 6.5)."""
     latency = profiler.summary()
@@ -1056,6 +1201,19 @@ def _finalize(
                 occupancy.identities.descriptor_rejections
             ),
         },
+        # Ajout du lot 0 : deux grandeurs d'identité que le schéma de mesure
+        # (docs/lot_0_outillage.md §0.2) exige et que le résumé ne publiait pas.
+        # `technical_ids` compte les identifiants de BoT-SORT ayant porté une
+        # identité, `persons_created` les identités logiques attribuées : leur
+        # écart est l'indicateur direct de fragmentation.
+        #
+        # Les deux totaux sont accumulés au fil des frames par la boucle
+        # d'exécution, et NON relus dans l'état final de `IdentityManager` :
+        # `release_expired` supprime les identités expirées de `records` comme
+        # de `technical_to_person`, si bien qu'un décompte pris à la fin
+        # ignorerait précisément les identités perdues — celles qui nous
+        # intéressent. Aucun attribut interne n'est lu.
+        "identity": dict(identity_totals or {"technical_ids": 0, "persons_created": 0}),
         "tracker": {
             "track_buffer": int(config.tracker.track_buffer),
             "with_reid": bool(config.tracker.with_reid),

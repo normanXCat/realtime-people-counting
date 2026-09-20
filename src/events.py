@@ -109,7 +109,15 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
     # -- Ligne virtuelle (définie manuellement, jamais par défaut) --------
     "LINE_VALIDATED": EventSpec(
         required=("p1", "p2", "inside_side", "frame_resolution"),
-        optional=("length_normalized", "display_scale", "confirmed_at", "calibration_path"),
+        # `line_origin` distingue une ligne cliquée par l'opérateur d'une ligne
+        # passée en argument (--line). Sans lui, deux sessions aux compteurs
+        # identiques seraient indiscernables quant à la façon dont leur ligne a
+        # été obtenue — ce qui est exactement ce qu'une mesure reproductible
+        # doit pouvoir établir.
+        optional=(
+            "length_normalized", "display_scale", "confirmed_at",
+            "calibration_path", "line_origin",
+        ),
     ),
     "LINE_CALIBRATION_CANCELLED": EventSpec(
         required=("reason",), optional=("frames_processed",)

@@ -26,7 +26,8 @@ au moment de traiter le lot concerné.
 | Catalogue du corpus (§2) | `docs/correctif_occlusion.md` §11.4 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
 | Contrôle de déterminisme (§2.1) | `docs/correctif_occlusion.md` §11.7 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
 | Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (`docs/correctif_occlusion.md` §12). Métriques dérivées : **à outiller** (§12.3) | non commité | 2026-09-20 |
-| Critères d'acceptation validés (§4) | — | à faire (§11.10.2 ; recalcul du plancher FPS fait en §11.8) | — | — |
+| Critères d'acceptation validés (§4) | — | à faire (§11.10.2) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | non commité | 2026-09-20 |
+| Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | mesuré, en attente d'acceptation (`docs/correctif_occlusion.md` §13). Critère §0.3 **non satisfait** : divergence du harnais de session 0 expliquée et chiffrée (§13.5) | non commité | 2026-09-20 |
 | Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire | — | — |
 | Lot 2 — rétention hors zone | `docs/lot_2_retention.md` | à faire | — | — |
 | Lot 3 — ReID OSNet + galerie | `docs/lot_3_reid_osnet.md` | à faire | — | — |
@@ -219,7 +220,23 @@ occlusion dense :
 | `occupancy_operational` | strictement exact (aucun IN/OUT fantôme) | à valider |
 | Non-régression, vidéo à occlusion faible | aucun compteur dégradé au-delà du bruit mesuré en §2.1 | à valider |
 | FPS moyen, modèle pose actif — plancher absolu | ≥ 3,0 ips | à valider |
-| FPS moyen — contrainte relative | ≥ 80 % du FPS de la baseline mesurée | à valider |
+| FPS moyen — contrainte relative | ≥ 80 % de la baseline, soit **≥ 3,06 ips** | à valider |
+
+**Baseline FPS — FIGÉE (lot 0).** `3,825 ips`, médiane de **trois rejouages
+complets** de `test/fort_occ4.mp4` par le pipeline réel
+(`scripts/measure_corpus.py`, donc `src/main.py` en sous-processus, rendu
+compris) : 3,701 / 3,826 / 3,825 ips. Machine de mesure : CPU seul
+(`torch 2.13.0+cpu`, `cuda_available = False`), `imgsz: 960`, modèle pose
+**inactif**. Détail et protocole : `docs/correctif_occlusion.md` §13.4.
+
+Cette valeur est la référence de la contrainte relative du §4 : le plancher
+relatif vaut **3,06 ips**, il est donc **plus contraignant** que le plancher
+absolu de 3,0 ips. C'est lui qu'il faut opposer aux lots.
+
+**Attention pour le lot 6** : la marge est de 0,8 ips seulement, et
+`yolo11s-pose.pt` est sensiblement plus lourd que `yolo11n.pt`. Le critère FPS
+a de fortes chances d'être violé dès l'activation du modèle pose — à trancher
+avant le lot, pas pendant.
 
 **Origine du plancher de 3,0 ips.** Il se dérive de la contrainte de
 franchissement, il ne se choisit pas. Une personne marche à ≈ 1,3 m/s ; si la

@@ -588,6 +588,14 @@ raisons exactes des rejets sont mesurées au §11.5 (vidéo principale) et au
 §11.6 (vidéo de contrôle).
 
 **(b) Le filtre géométrique s'exécute avant la détection de fusion — lot 5.**
+
+> **CORRECTION APPORTÉE AU LOT 0 (§13.5).** La conclusion de ce paragraphe —
+> « aucune fusion n'est signalée sur le corpus » — est **fausse pour le système
+> livré**. Elle vient d'un harnais de session 0 auquel les stabilisateurs
+> n'étaient pas branchés. Mesuré par le pipeline réel, `fort_occ4` produit
+> **52 `POSSIBLE_MULTI_PERSON_BOX`**, pas 0. Reste exact ci-dessous : l'ordre
+> des opérations, et les 235 rejets de boîtes larges sur `fort_occ.mp4`.
+
 `check_detection_geometry` (`src/geometry.py:413-438`) est appliqué en tête de
 `process_frame` (`src/occupancy_manager.py:365-399`) et rejette toute boîte de
 ratio W/H > `max_aspect_ratio_wh` = 2,5, **avant** que le chemin de détection de
@@ -959,47 +967,133 @@ conservé tel quel, il ne gêne rien.
 `A RENSEIGNER`. Sans conséquence sur les mesures, mais à renseigner pour la
 traçabilité.
 
+**Deux grandeurs distinctes, toutes deux présentes dans le fichier** :
+`count` et `present` comptent les personnes **présentes** ; la **visibilité**,
+elle, est consignée seconde par seconde dans le champ `notes`, en clair
+(« n'est plus visible », « en dehors de la vue », « pas encore visible »). Les
+deux diffèrent sensiblement — 13 présentes contre 11 visibles à la dernière
+seconde — et ce sont deux compteurs distincts du pipeline qui s'y comparent.
+Voir §12.2.1.
+
 ## 12.2 Première confrontation aux mesures de session 0
 
 Confrontation partielle, sur les seules grandeurs déjà mesurées au §11.5.
 **Ce n'est pas encore le tableau complet des métriques du §3** — voir §12.3.
 
+### 12.2.1 « Présente » et « visible » ne sont pas la même grandeur
+
+Distinction qui conditionne toute la lecture de ce paragraphe :
+
+- à la seconde 34, **13 personnes sont présentes** dans la salle — c'est ce que
+  le champ `count` enregistre ;
+- mais **11 seulement sont visibles** à l'image ; parmi elles, plusieurs sont
+  **très floues et de petite taille** (rangs du fond, personnes assises
+  partiellement masquées).
+
+**La visibilité est annotée** : elle figure dans le champ `notes`, seconde par
+seconde, en langage clair. Les deux personnes non visibles à la fin de la
+séquence y sont nommées et datées :
+
+| Étiquette | Dernière mention de visibilité | Notes d'appui | Cause annotée |
+|---|---|---|---|
+| **P9** | non visible à partir de **s25** | « P9 en dehors de la vue » (s25), « n'est plus visible » (s26), « pas encore visible » (s27, s29, s31–s34) | « sorti de la zone de caméra **mais reste dans la salle** » (s33) |
+| **P13** | non visible à partir de **s32** | « P13 n'est plus visible » (s30), réapparaît (s31), « P13 et P9 ne sont pas visibles » (s32) | non précisée |
+
+Règle de lecture appliquée : un état « non visible » **persiste** jusqu'à
+mention explicite du contraire. C'est ce qui donne 13 − 2 = **11 visibles** à
+s34, P13 n'étant jamais annoncé comme redevenu visible après s32.
+
+Les notes distinguent par ailleurs « X occulte Y » (occultation **partielle**,
+Y reste visible) de « Y n'est plus visible » (disparition **totale**). Sans
+cette distinction, s34 — « P4 occulte P12, P12 occulte P3, P2 occulte P10 » —
+compterait 4 personnes non visibles au lieu de 2.
+
+Or les deux compteurs du pipeline ne se comparent pas au même référentiel
+(`CLAUDE.md` §6) :
+
+| Compteur du pipeline | Doit être comparé à | Valeur de référence à la seconde 34 |
+|---|---|---|
+| `occupancy_operational` | personnes **présentes** | **13** |
+| `occupancy_observed` | personnes **visibles** | **11** |
+| `occupancy_uncertain` | présentes non visibles | **2** |
+
+**Ce qui manque n'est pas l'annotation mais sa forme** : la visibilité est
+consignée en texte libre, pas dans un champ structuré. Elle se lit sans
+ambiguïté, mais un calcul automatique de `erreur_comptage_max` sur les 35
+secondes suppose de la dériver des `notes`. C'est une extraction, **pas une
+reprise de l'annotation** : l'information est déjà là.
+
+### 12.2.2 Comparaison, avec le bon référentiel pour chaque compteur
+
+> **RÉSERVE APPORTÉE AU LOT 0 (§13.5).** Les valeurs de pipeline de ce tableau
+> viennent du harnais de session 0, dont le lot 0 a montré qu'il divergeait du
+> système livré. `occupancy_operational` (13) et `occupancy_observed` (3) sont
+> **confirmés identiques** sur le pipeline réel ; les conclusions ci-dessous
+> tiennent donc. Mais le relevé seconde par seconde reste à refaire avec
+> `scripts/measure_corpus.py` avant d'opposer `erreur_comptage_max` aux
+> critères du §4.
+
+
 | Grandeur | Vérité terrain | Pipeline (§11.5) | Écart |
 |---|---|---|---|
-| Personnes réellement présentes en fin de séquence | **13** | — | — |
-| `occupancy_operational` en fin de séquence | — | **13** | **0 — exact** |
-| `occupancy_observed` en fin de séquence | 13 attendues | **3** | **−10** |
+| Personnes **présentes** en fin de séquence | **13** | `occupancy_operational` = **13** | **0 — exact** |
+| Personnes **visibles** en fin de séquence | **11** | `occupancy_observed` = **3** | **−8** |
+| Présentes non visibles | **2** | `occupancy_uncertain` = **10** | **+8** |
 | Identités logiques créées sur la séquence | 13 personnes | **18** | **+5 identifiants surnuméraires** |
 
-Trois enseignements, tous soutenus par la mesure :
+Quatre enseignements, tous soutenus par la mesure :
 
-1. **`occupancy_operational` est exact** sur cette séquence : 13 contre 13. Le
-   bilan officiel ne se trompe pas — cohérent avec le fait que la vérité terrain
-   ne comporte aucune sortie réelle et que le pipeline n'a produit aucun `OUT`
-   fantôme (les 13 purges sont toutes `is_exit=false`, §11.5).
-2. **`occupancy_observed` s'effondre** : 3 personnes vues alors que 13 sont
-   présentes. `erreur_comptage_max` est donc **au moins 10**, contre une cible
-   de ≤ 1 au §4. C'est précisément le compteur que l'assistance tête doit
-   protéger (§6 de `CLAUDE.md`), et l'écart mesuré donne au lot 6 une marge de
-   progression considérable — ainsi qu'une base de comparaison nette.
-3. **18 identités pour 13 personnes** : au moins 5 identifiants surnuméraires,
+1. **`occupancy_operational` est exact** : 13 contre 13. Le bilan officiel ne se
+   trompe pas — cohérent avec le fait que la vérité terrain ne comporte aucune
+   sortie réelle et que le pipeline n'a produit aucun `OUT` fantôme (les 13
+   purges sont toutes `is_exit=false`, §11.5).
+2. **`occupancy_observed` s'effondre** : 3 personnes vues alors que **11** sont
+   visibles. `erreur_comptage_max` vaut donc **au moins 8** sur la dernière
+   seconde, contre une cible de ≤ 1 au §4. C'est précisément le compteur que
+   l'assistance tête doit protéger (`CLAUDE.md` §6).
+3. **L'incertitude est surévaluée d'autant** : le pipeline classe 10 personnes
+   en `occupancy_uncertain` alors que **2** seulement le sont réellement. Il
+   déclare « perdues » 8 personnes qui sont à l'image. L'invariant
+   `observed + uncertain == operational` est bien respecté (3 + 10 = 13) : ce
+   n'est pas un bug d'invariant, c'est une erreur de classement.
+4. **18 identités pour 13 personnes** : au moins 5 identifiants surnuméraires,
    cohérent avec les 5 `TECHNICAL_ID_CHANGED` du §11.5. La fragmentation est
-   donc confirmée par une source indépendante du pipeline.
+   confirmée par une source indépendante du pipeline.
+
+### 12.2.3 Pourquoi ces 8 personnes sont perdues — hypothèse à tester
+
+Le fait que les personnes manquantes soient décrites comme **« très floues et
+petites »** recoupe deux mesures indépendantes de la session 0 :
+
+- **238 rejets `low_confidence`** en écriture de galerie sur cette vidéo
+  (§11.5), contre `gallery_min_confidence: 0.70` — une personne floue produit
+  une détection à faible confiance ;
+- **`gallery_min_crop_height_px: 32`** (`config/pipeline.yaml:136`) — une
+  personne petite produit un crop sous le seuil.
+
+Les deux verrous frappent donc exactement la population décrite. **Ce n'est
+pas encore une conclusion** : la mesure dit que les rejets existent et que les
+personnes manquantes sont floues et petites, elle n'établit pas encore que les
+premiers causent les secondes. Le vérifier demande de relever, pour chaque
+personne visible non comptée, la confiance et la taille de sa boîte — ce qui
+relève de l'outillage évoqué au §12.3 et au §11.10.3.
 
 ## 12.3 Ce qui reste à calculer
 
-Les quatre métriques du §3 ne sont **pas** toutes calculables en l'état :
+Les quatre métriques du §3 ne sont **pas** toutes calculables en l'état — mais
+la donnée manquante vient du **pipeline**, pas de l'annotation :
 
 | Métrique | Calculable ? | Ce qu'il manque |
 |---|---|---|
-| `erreur_comptage_max` | **partiellement** — borne inférieure de 10 établie ci-dessus | `occupancy_observed` relevé **seconde par seconde**, ce qui demande un run instrumenté supplémentaire (le run du §11.5 n'a conservé que l'état final) |
-| `fragments_par_personne` | non | l'association entre identifiant technique et étiquette humaine, qui exige une inspection visuelle des pistes |
+| `erreur_comptage_max` | **presque** — borne inférieure de 8 établie ci-dessus | côté vérité terrain, **rien** : la visibilité est annotée seconde par seconde (§12.2.1). Il manque `occupancy_observed` **relevé seconde par seconde**, que le run du §11.5 n'a pas conservé (état final seulement) : un rejouage instrumenté suffit. |
+| `fragments_par_personne` | non | l'association entre `person_id` du pipeline et étiquette humaine |
 | `id_switches_reels` | non | idem |
 | `fusions_reelles` | non | idem |
 
-Autrement dit : l'annotation fournit le **dénominateur** (qui est réellement là,
-et quand), mais pas encore le **rattachement** entre les `person_id` du pipeline
-et les étiquettes `P1` … `P13`. Trois des quatre métriques en dépendent.
+Autrement dit : l'annotation fournit à la fois **qui est présent** et **qui est
+visible**, seconde par seconde. Ce qui manque est le **rattachement** entre les
+`person_id` du pipeline et les étiquettes `P1` … `P13`. Trois des quatre
+métriques en dépendent ; la quatrième n'attend qu'un relevé par seconde.
 
 Ce rattachement est le travail à faire avant le lot 1 — il est mécanisable
 (rejouer la séquence en journalisant la boîte de chaque `person_id` par seconde,
@@ -1009,3 +1103,301 @@ laissée ouverte au §11.10.3.
 
 Le §0 de `CLAUDE.md` est mis à jour en conséquence : la vérité terrain est
 **fournie**, les métriques dérivées restent **à outiller**.
+
+---
+
+# 13. Lot 0 — outillage de mesure
+
+> **Mention de portée.** Ce lot ne corrige aucun symptôme : il rend les mesures
+> des lots 1 à 7 possibles et représentatives du système livré. Sa seule
+> production chiffrée est la baseline FPS du §4 et le bruit run-à-run du
+> pipeline réel.
+>
+> **Il corrige aussi plusieurs chiffres du §11**, obtenus en session 0 par un
+> harnais qui divergeait du pipeline : voir §13.5. C'est précisément ce que le
+> critère d'acceptation du lot devait détecter.
+
+## 13.1 Vidéos utilisées
+
+| Rôle | Vidéo | Frames | Durée | Occlusion |
+|---|---|---|---|---|
+| Mesure principale | `test/fort_occ4.mp4` | 1 055 | 35,2 s | dense (13 purges, 5 chgID en session 0) |
+| Contrôle de non-régression | `test/rare_occ2.mp4` | 744 | 24,8 s | faible (2 purges) |
+
+Le lot 0 ne modifiant aucun seuil métier, la mesure de non-régression sur
+`rare_occ2` n'a pas été rejouée : il n'y a pas d'avant/après à comparer. Elle
+reprend au lot 1, avec le harnais versionné.
+
+## 13.2 Ce qui a été fait
+
+### 13.2.1 Drapeau `--line` (§0.1)
+
+`src/main.py` accepte désormais `--line x1,y1,x2,y2`, en coordonnées
+normalisées. Comportement, conforme au §0.1 :
+
+| Situation | Comportement | Code |
+|---|---|---|
+| `--line` absent, mode interactif | **inchangé** : première image, deux clics, « C » | — |
+| `--line` fourni | ligne explicite, validée, tracée ; la fenêtre n'est pas ouverte | 0 |
+| `--no-show` **sans** `--line` | refus immédiat, message explicite | **6** |
+| `--line` malformé ou hors bornes | refus avant ouverture de session de comptage | 2 |
+| source illisible malgré un `--line` valide | erreur de source, inchangée | 5 |
+
+**Aucun repli automatique n'a été réintroduit.** L'ancienne ligne implicite à
+60 % reste supprimée : sans `--line`, rien n'est deviné, le pipeline refuse.
+
+**Validation unique.** `line_from_argument` appelle `geometry.validate_line`,
+c'est-à-dire exactement la fonction qu'utilise `LineSelection.confirm` pour la
+ligne cliquée. Il n'existe pas de second chemin de contrôle, et un test vérifie
+que les deux provenances produisent la même `ValidatedLine`.
+
+**Code de sortie 6.** `NonInteractiveLineRequired` hérite de
+`CalibrationUnavailable` — tout code qui rattrapait l'exception historique
+fonctionne encore — mais porte un code distinct : « il manque `--line` » et
+« aucun écran disponible » ne se corrigent pas de la même façon, et les
+confondre ferait chercher au mauvais endroit.
+
+**Traçabilité.** `LINE_VALIDATED` et `calibration.json` portent désormais
+`line_origin` (`argument` ou `operator_clicks`). Sans ce champ, deux sessions
+aux compteurs identiques seraient indiscernables quant à l'origine de leur
+ligne.
+
+### 13.2.2 Harnais versionné `scripts/measure_corpus.py` (§0.2)
+
+Enveloppe mince, **sans aucune logique de comptage** : elle lance `src/main.py`
+en sous-processus, puis relit `summary.json` et `events.jsonl` que le pipeline a
+lui-même écrits. Ce qu'elle mesure est donc, par construction, ce que le système
+livré fait.
+
+```bash
+python scripts/measure_corpus.py --videos test/ --line 0.05,0.6,0.95,0.6 \
+    --repeat 3 --out results/baseline.jsonl
+```
+
+Schéma de sortie, **stable** pour les lots 1 à 7 : `source`, `run_index`,
+`git_sha`, `timestamp`, `time_base`, `line`, `exit_code`, `frames_processed`,
+`processing_fps` (+ médiane et minimum), `duration_s`, `event_counts` (le
+dictionnaire complet), `technical_ids`, `persons_created`,
+`technical_id_changes`, `appearance_discontinuities`, `descriptor_rejections`,
+`long_gaps_count`, `occupancy_operational`, `occupancy_observed`,
+`occupancy_uncertain`, `occupancy_range`, `total_in`, `total_out`, `total_new`.
+
+`measure_tracker_swaps.py` et `diagnose_occlusion.py` sont **inchangés**, ni
+fusionnés ni réécrits.
+
+### 13.2.3 Deux compteurs ajoutés à `summary.json`
+
+Le schéma du §0.2 exige `technical_ids` et `persons_created`, que le résumé de
+session ne publiait pas. Ils sont **accumulés au fil des frames** par la boucle
+d'exécution, et non relus dans l'état final de `IdentityManager` : celui-ci
+supprime les identités expirées de `records` comme de `technical_to_person`
+(`release_expired`, `src/identity_manager.py:1314-1327`), si bien qu'un décompte
+pris à la fin ignorerait précisément les identités perdues — celles qui nous
+intéressent. Aucun attribut interne n'est lu, aucun calcul métier n'est déplacé.
+
+## 13.3 Fichiers modifiés — dont un hors périmètre
+
+| Fichier | Nature | Dans le périmètre du §0.4 ? |
+|---|---|---|
+| `src/main.py` | `--line`, analyse, refus non interactif, traçabilité, totaux d'identité | oui (point d'entrée, arguments) |
+| `scripts/measure_corpus.py` | nouveau harnais | oui (`scripts/`) |
+| `tests/test_line_argument.py` | nouveau | oui |
+| `tests/test_main_units.py`, `tests/test_main_e2e.py` | attentes ajustées (§13.6.2) | oui |
+| **`src/events.py`** | **une ligne : `line_origin` ajouté aux champs optionnels de `LINE_VALIDATED`** | **NON — écart signalé** |
+
+**Sur `src/events.py`.** Le §0.4 limite le lot au point d'entrée, aux arguments
+et à `scripts/` ; `events.py` n'y figure pas. La modification est d'une ligne,
+purement déclarative : elle ajoute `line_origin` à la liste des champs
+**optionnels** de `LINE_VALIDATED`. Aucune logique n'est touchée, aucun champ
+existant n'est modifié, et `validate_event` n'aurait de toute façon pas rejeté
+un champ non déclaré — le journal aurait simplement porté un champ hors schéma.
+J'ai préféré le déclarer plutôt que de laisser un champ non spécifié dans un
+journal qui sert de référence à toutes les mesures. **C'est un écart au
+périmètre, réversible en une ligne** : il revient à la personne responsable de
+le confirmer ou d'en demander le retrait.
+
+`OccupancyManager`, `IdentityManager` et la configuration du tracker n'ont
+**pas** été touchés, conformément au §0.4.
+
+## 13.4 Baseline FPS du §4 — figée
+
+Trois rejouages complets de `fort_occ4` par le pipeline réel, rendu compris.
+
+| Rejouage | Frames | FPS moyen | FPS médian | FPS minimum | Durée |
+|---|---|---|---|---|---|
+| 1 | 1 055 | 3,701 | 3,911 | 2,426 | 298,5 s |
+| 2 | 1 055 | 3,826 | 3,829 | 3,481 | 293,4 s |
+| 3 | 1 055 | 3,825 | 3,921 | 2,793 | 282,1 s |
+
+**Médiane retenue : `3,825 ips`**, inscrite dans `CLAUDE.md` §4.
+
+Conséquences :
+
+- le plancher **relatif** du §4 (≥ 80 %) vaut **3,06 ips**, donc il est **plus
+  contraignant** que le plancher absolu de 3,0 ips : c'est lui qu'il faut
+  opposer aux lots ;
+- la marge réelle avant le plancher absolu est de **0,8 ips**, modèle pose
+  **inactif**, sur CPU seul. Le lot 6 activera `yolo11s-pose.pt`, sensiblement
+  plus lourd : **le critère FPS a de fortes chances d'être violé**, et c'est une
+  décision à prendre avant ce lot, pas pendant ;
+- le `fps_min` descend à **2,426 ips** sur un des rejouages : le plancher absolu
+  est déjà franchi ponctuellement, sans modèle pose.
+
+**Réserve sur « en base de temps vidéo ».** La mesure était demandée en base de
+temps vidéo ; elle n'a pas pu l'être. `src/main.py:913` horodate sur
+`time.perf_counter()` et le pipeline n'offre aucune base de temps vidéo : la lui
+donner **est le lot 1**, pas le lot 0. Le FPS de traitement, lui, ne dépend pas
+de la base de temps interne — c'est un rapport frames / durée réelle — donc la
+baseline ci-dessus est valide telle quelle. Seuls les **compteurs** du §13.5
+sont affectés par cette réserve.
+
+## 13.5 Vérification du lot (§0.3) — le critère n'est pas satisfait, et c'est le résultat
+
+Le §0.3 demande de rejouer `fort_occ4` avec le harnais versionné et de
+**retrouver exactement** les compteurs de la session 0 (§11.5).
+
+| Compteur | Session 0 (harnais ad hoc) | Lot 0 (pipeline réel) | Écart |
+|---|---|---|---|
+| `POSSIBLE_MULTI_PERSON_BOX` | **0** | **52** | **+52** |
+| `PURGE` | 13 | 17 – 19 | +4 à +6 |
+| `TECHNICAL_ID_CHANGED` | 5 | 8 | +3 |
+| `technical_ids` | 15 | 21 | +6 |
+| `persons_created` | 18 | 17 | −1 |
+| `INCONSISTENT_STATE` | 10 | 5 | −5 |
+| `IN` / `NEW` | 6 / 7 | 2 / 7 | −4 / 0 |
+| `occupancy_operational` | 13 | 13 | **0** |
+| `occupancy_observed` | 3 | 3 | **0** |
+| `OCCLUDED` | 49 | 49 | **0** |
+| `TRACK_ID_APPEARANCE_DISCONTINUITY` | 1 | 1 | **0** |
+
+**Deux causes identifiées, toutes deux dans le harnais de session 0 :**
+
+1. **Les stabilisateurs n'étaient pas branchés.** `config/pipeline.yaml` active
+   `stabilization.use_bbox_locker: true`, et `src/main.py:729-734` passe le
+   `BBoxHeightLocker` à `OccupancyManager`. Le harnais de session 0 construisait
+   `OccupancyManager(config, event_sink, line)` **sans** locker ni
+   stabilisateur. Or le verrouillage de hauteur modifie les dimensions de boîte
+   que voit `check_box_width_growth` — d'où **52 fusions signalées au lieu de 0**.
+2. **Le budget de frames était calculé sur le mauvais FPS.** `src/main.py:935`
+   recalcule `frame_budget(fps_estimator.require_fps())` avec le FPS **mesuré**
+   (≈ 3,8 ips), soit une grâce de `round(5,0 × 3,8)` ≈ **19 frames**. Le harnais
+   de session 0 figeait `frame_budget(30)` — le FPS **source** — soit
+   **150 frames**. Les purges ne pouvaient pas tomber aux mêmes instants.
+
+**Conséquence directe : l'observation (b) du §11.4.5 est invalidée.** Elle
+concluait, à partir des 0 `POSSIBLE_MULTI_PERSON_BOX` du corpus, que le signal
+de fusion ne se déclenchait jamais. C'était un artefact du harnais : sur le
+pipeline réel, `fort_occ4` produit **52 fusions signalées**, le signal
+fonctionne. Ce qui reste vrai du §11.4.5(b) est le constat d'ordre des
+opérations — le filtre géométrique précède la détection de fusion — et les
+235 rejets de boîtes larges mesurés sur `fort_occ.mp4`. Ce qui est faux est la
+conclusion qu'aucune fusion n'est détectée.
+
+**Le critère §0.3 n'est donc pas « retrouvé exactement », et c'est exactement ce
+que le lot devait révéler.** La fiche demandait d'expliquer tout écart avant
+d'aller plus loin : c'est fait, les deux causes sont nommées et chiffrées. La
+leçon est celle qu'énonçait le §0.2 : un harnais qui rejoue `process_frame` de
+son côté est un second système, et il diverge sans prévenir.
+
+**Les chiffres du §11 restent valides comme comparaison relative entre vidéos du
+corpus** — toutes mesurées avec le même harnais — **mais ils ne décrivent pas le
+système livré**. La référence pour les lots 1 à 7 est désormais le tableau
+ci-dessus et le §13.4, pas le §11.5.
+
+### 13.5.1 Bruit run-à-run du pipeline réel
+
+Trois rejouages identiques, mêmes arguments, même ligne :
+
+| Compteur | run 1 | run 2 | run 3 | Bruit |
+|---|---|---|---|---|
+| `technical_ids`, `persons_created`, `technical_id_changes` | 21, 17, 8 | 21, 17, 8 | 21, 17, 8 | **0** |
+| `appearance_discontinuities`, `descriptor_rejections` | 1, 268 | 1, 268 | 1, 268 | **0** |
+| `POSSIBLE_MULTI_PERSON_BOX`, `OCCLUDED`, `REID_MATCH` | 52, 49, 8 | 52, 49, 8 | 52, 49, 8 | **0** |
+| `occupancy_operational` / `observed` / `uncertain` | 13 / 3 / 10 | 13 / 3 / 10 | 13 / 3 / 10 | **0** |
+| `IN` / `OUT` / `NEW` | 2 / 0 / 7 | 2 / 0 / 7 | 2 / 0 / 7 | **0** |
+| `PURGE` | 19 | 18 | 17 | **±2** |
+| `STATE_TRANSITION` | 132 | 131 | 130 | **±2** |
+| `OCCUPANCY_SNAPSHOT` | 264 | 261 | 253 | **±11** |
+| `long_gaps_count` | 1 | 3 | 0 | **±3** |
+
+**C'est nettement meilleur que ce que la session 0 laissait craindre.** Le §11.7
+mesurait, en base murale, un bruit de ±1 sur les compteurs d'identité ; ici
+**ils sont strictement stables sur trois rejouages**. Seuls quatre compteurs
+bougent, tous sensibles à la durée murale de la session.
+
+**Seuils de signification pour les lots 1 à 7**, à opposer à tout avant/après :
+
+| Compteur | Écart minimal significatif |
+|---|---|
+| Identité, occupation, fusions, IN/OUT/NEW | **≥ 1** |
+| `PURGE`, `STATE_TRANSITION` | **≥ 3** |
+| `long_gaps_count` | **≥ 4** — et jamais seul, voir ci-dessous |
+| `OCCUPANCY_SNAPSHOT` | **≥ 12** (compteur de cadence, sans portée métier) |
+
+**`long_gaps_count` est le compteur le moins fiable du schéma** : 1, puis 3,
+puis 0 sur trois rejouages identiques. Il est dérivé des événements du journal,
+dont la granularité dépend de la durée murale. Il est publié pour la complétude
+du schéma, mais **aucune conclusion de lot ne doit reposer sur lui seul**. Le
+lot 1, qui traite la base de temps, devrait le stabiliser : à revérifier alors.
+
+## 13.6 Tests
+
+**Suite complète : `639 passed, 1 skipped`, couverture `93,33 %`** (seuil exigé
+85 %). Le test ignoré (`test_calibration_window.py:227`) l'était déjà avant ce
+lot : il exige un serveur X pour vérifier un comportement Qt.
+
+Décompte réel (`grep -rc "^def test_" tests/`) : **445** fonctions de test sur
+**31** fichiers, contre 433 sur 30 avant ce lot.
+
+### 13.6.1 Tests ajoutés — `tests/test_line_argument.py`
+
+Trois groupes, calqués sur les exigences du §0.1 :
+
+- **analyse syntaxique** : forme valide, espaces tolérés, cinq formes malformées
+  (trois valeurs, cinq valeurs, chaîne vide, non numérique, mauvais séparateur),
+  quatre valeurs refusées (hors bornes haut et bas, ligne dégénérée, ligne plus
+  courte que `min_length_ratio`), et source illisible signalée dès la
+  construction de la ligne ;
+- **mode non interactif** : refus sans `--line` ; l'exception reste un
+  `CalibrationUnavailable` ; avec `--line`, la fenêtre n'est pas sollicitée ;
+  sans `--no-show` ni `--line`, le mode interactif reçoit exactement les mêmes
+  paramètres qu'auparavant ;
+- **équivalence** : une ligne cliquée et la même ligne passée en argument
+  produisent des `ValidatedLine` identiques (points, orientation, résolution,
+  longueur). C'est ce test qui rend le harnais légitime : mesurer avec `--line`
+  revient à mesurer ce qu'un opérateur aurait obtenu en cliquant.
+
+### 13.6.2 Tests corrigés — cinq, aucun supprimé ni ignoré
+
+| Test | Pourquoi son attente était devenue fausse | Ajustement |
+|---|---|---|
+| `test_main_units.py::test_no_show_avec_affichage_conserve_la_selection_manuelle`, renommé `test_no_show_sans_ligne_refuse_meme_avec_un_affichage` | Il vérifiait que `--no-show` ouvre **tout de même** la fenêtre de sélection. Le §0.1 fait de `--no-show` un mode non interactif réel, où `--line` est obligatoire : la fenêtre ne doit plus s'ouvrir. | Le test vérifie désormais le refus **et** que `select_line` n'est jamais appelée. L'exigence de fond — aucune ligne n'est jamais devinée — est inchangée ; seule la manière de refuser change. |
+| `test_main_units.py::test_no_show_sans_interface_graphique_annonce_l_erreur` | Il exigeait un message mentionnant « interface graphique » et « deux clics ». Le refus intervient maintenant plus tôt et pour une autre cause : il manque `--line`. L'absence d'écran n'est plus l'obstacle, puisque `--line` permet de s'en passer. | Assertions portées sur le nouveau message (`--line`, « non interactif », « devin »). L'exception attendue reste `CalibrationUnavailable`, ce qui vérifie au passage que la hiérarchie d'exceptions est préservée. Le cas « pas d'écran **sans** `--no-show` » reste couvert, inchangé, par `test_main_e2e.py::test_sans_affichage_refuse_de_demarrer`. |
+| `test_main_e2e.py::test_no_show_sans_affichage_refuse_de_demarrer`, renommé `test_no_show_sans_ligne_refuse_de_demarrer` | Il attendait le code 4 (« calibration indisponible »). Le refus « il manque `--line` » porte un code dédié, 6. | Code attendu porté à 6, assertions de message mises à jour. Tout le reste est conservé : aucun comptage, pas de `calibration.json`, et la même séquence d'événements `SESSION_START` / `LINE_CALIBRATION_UNAVAILABLE` / `SESSION_END`. |
+| `test_main_units.py::test_source_inouvrable_produit_une_erreur_explicite` | Il utilisait `--no-show` seulement pour éviter l'interactivité. Le refus « il manque `--line` » tombe désormais **avant** l'ouverture de la source : le chemin visé — source illisible, code 5 — n'était plus atteint. | Ajout de `--line 0.05,0.6,0.95,0.6`. L'intention est préservée et le test devient plus net : il éprouve la source, non l'absence de ligne. |
+| `test_main_e2e.py::test_source_inouvrable_pendant_la_selection` | Même cause. | Même ajustement. |
+
+Aucun test n'a été supprimé, aucun n'a été passé en `skip`.
+
+## 13.7 Ce qui reste non résolu
+
+1. **Le critère d'acceptation §0.3 n'est pas satisfait** (§13.5). Les deux
+   causes sont identifiées et chiffrées ; la fiche prévoit elle-même de refaire
+   cette vérification après le lot 1, qui change la base de temps. C'est alors
+   que la baseline définitive sera établie.
+2. **La ligne n'est pas publiée dans `config_resolved.yaml`**, contrairement au
+   §0.1. Elle l'est dans `calibration.json` et dans `LINE_VALIDATED`, avec sa
+   provenance. La publier dans la configuration résolue exigerait d'ajouter les
+   deux points à `LineConfig` (`src/config.py`), dont la docstring précise
+   qu'ils n'y figurent **volontairement** pas — et `config.py` est hors du
+   périmètre du §0.4. Point laissé ouvert, à trancher.
+3. **`long_gaps_count` n'est pas fiable** (§13.5.1) : ±3 sur trois rejouages
+   identiques. À réévaluer après le lot 1.
+4. **La modification de `src/events.py` sort du périmètre du lot** (§13.3) et
+   attend confirmation ou retrait.
+5. **Les métriques de vérité terrain du §3 ne sont pas rejouées ici.** Le lot 0
+   ne change aucun seuil métier : il n'y a pas d'avant/après à produire. Mais
+   les chiffres d'`occupancy_observed` du §12.2 proviennent du harnais de
+   session 0, dont le §13.5 montre qu'il divergeait du pipeline. **Ils devront
+   être recalculés avec le pipeline réel avant d'être opposés aux critères du
+   §4.** Le relevé par seconde reste à refaire dans ces conditions.
