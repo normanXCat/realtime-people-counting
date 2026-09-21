@@ -1902,7 +1902,10 @@ reste sur stderr, dans les logs, et la base retenue est publiée dans
 
 # 15. Lot 4 — seuils BoT-SORT
 
-> **Statut : mesuré, en attente d'acceptation.** Un seul seuil est modifié :
+> **Accepté par la personne responsable le 2026-09-21**, avec la réserve de
+> non-régression de `rare_occ2` inscrite au §15.13.3.
+>
+> **Statut : accepté.** Un seul seuil est modifié :
 > `tracker.new_track_thresh` 0,7 → **0,60** (`PROVISOIRE`), décision de la
 > personne responsable du 2026-09-21 après mesure de 0,60, 0,55 et 0,45
 > (**§15.13**, qui remplace les §15.7 à §15.9 pour la valeur appliquée).
