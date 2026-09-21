@@ -28,7 +28,9 @@ model:
   # produit des scores faibles mais des boîtes encore exploitables par
   # l'association BoT-SORT. Filtrer ces détections ici les supprime avant même
   # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
-  # Le garde-fou contre les faux positifs est porté par new_track_thresh.
+  # Le garde-fou contre les faux positifs était porté par new_track_thresh (0,7) ;
+  # depuis le lot 4 (0,45), il l'est par le filtre géométrique et
+  # timing.confirmation_seconds — voir la section tracker.
   confidence: 0.10          # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
   # nms_iou — CONSERVÉ à 0,55 après mesure (lot 1, §1.2). Le lot proposait de
   # le monter à 0,85 ou 0,90, pour récupérer les détections de personnes
@@ -55,8 +57,45 @@ tracker:
   # silencieuse).
   track_high_thresh: 0.4    # plancher de l'association principale
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
-  new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
-  # -- Mesure des trois seuils BoT-SORT : AUCUN n'est modifié ----------------
+  # new_track_thresh — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15).
+  #   valeur précédente : 0.7.
+  #   raison : seul des trois seuils de la fiche à déplacer visible_count sur
+  #     fort_occ4 (base vidéo, bruit nul) : erreur_comptage_max_visible 9 -> 7,
+  #     somme des écarts visibles sur 35 s 143 -> 77, pistes_vues min 2 -> 3,
+  #     4-5 -> 10-12 pistes visibles de s29 à s34 pour 10-11 personnes
+  #     visibles annotées (9-10 même après retrait des boîtes incluses dans une
+  #     autre). Une personne assise partiellement masquée sort à 0,35-0,6 : à
+  #     0,7 elle ne recréait jamais de piste.
+  #   compromis accepté : sur-création d'identités. fort_occ4 : persons_created
+  #     18 -> 38, pistes surnuméraires 6 -> 11. rare_occ2 : persons_created
+  #     7 -> 12, jusqu'à 2 pistes visibles en double (boîte « haut du corps »
+  #     emboîtée dans la boîte entière de la même personne), une personne
+  #     réellement manquée récupérée. LE CRITÈRE DE NON-RÉGRESSION DU §4 N'EST
+  #     PAS TENU sur rare_occ2 : valeur soumise à acceptation.
+  #   garde-fou contre les faux positifs, auparavant porté par 0.7 : reporté sur
+  #     le filtre géométrique (geometry.min/max_aspect_ratio_wh,
+  #     min_box_height_px, min_box_width_px) et sur timing.confirmation_seconds
+  #     (0,5 s de présence avant tout franchissement). MESURÉ INEFFICACE contre
+  #     les doublons observés : une boîte haut du corps a un ratio plausible et
+  #     une présence continue ; aucun rejet géométrique sur les deux vidéos.
+  #   interaction NMS (fiche §A.5) : mesurée avec nms_iou 0,55, la valeur en
+  #     vigueur — le relèvement du lot 1.2 a été écarté, il n'y a pas de seuil
+  #     NMS relevé avec lequel combiner.
+  #   PROVISOIRE : calibré sur l'ensemble de test lui-même, pas sur un corpus
+  #     disjoint.
+  new_track_thresh: 0.45    # plancher exigé pour créer une NOUVELLE piste
+  # -- Lot 4 : mesure isolée des trois seuils (docs/correctif_occlusion.md §15)
+  # Base vidéo, fort_occ4 + rare_occ2, ligne de convention figée. Résultat :
+  #   match_thresh 0,9 -> 0,75 : ÉCARTÉ. Aucun gain visible (erreur visible 9),
+  #     pistes surnuméraires 6 -> 13, TECHNICAL_ID_CHANGED 6 -> 14.
+  #   proximity_thresh 0,5 -> 0,8 : NON APPLIQUÉ. Seul : visible_count
+  #     inchangé (9), fragmentation réduite (surnuméraires 6 -> 4) ; combiné à
+  #     new_track_thresh 0,45 : erreur visible 7 -> 6 mais surnuméraires
+  #     11 -> 13. Effet mitigé, consultation d'un descripteur peu
+  #     discriminant : À REPRENDRE APRÈS LE LOT 3 (OSNet).
+  #   new_track_thresh 0,7 -> 0,45 : appliqué, voir ci-dessus.
+  # -- Historique : mesure antérieure, NON REJOUABLE ------------------------
+  # (Le paragraphe suivant date d'avant le lot 0 ; sa vidéo n'existe plus.)
   # Le correctif « occlusion dense » proposait match_thresh 0,9 -> 0,75,
   # proximity_thresh 0,5 -> 0,8 et new_track_thresh 0,7 -> 0,45 (justification :
   # match_thresh est un seuil de COÛT, `linear_assignment(dists, thresh=...)`
@@ -287,6 +326,10 @@ geometry:
   # perdue : NEW est alors différé, jamais confirmé.
   occlusion_ambiguity_ratio: 0.5
   # Filtre géométrique : élimine les faux positifs tout en acceptant les personnes assises
+  # Lot 4 : porte désormais le garde-fou contre les faux positifs qu'assurait
+  # tracker.new_track_thresh 0,7 (abaissé à 0,45). Valeurs inchangées : ce report
+  # est documenté, pas calibré, et il n'arrête pas les boîtes « haut du corps »
+  # emboîtées observées au lot 4 (docs/correctif_occlusion.md §15).
   min_aspect_ratio_wh: 0.1       # ratio W/H minimum (rejet des artefacts verticaux)
   max_aspect_ratio_wh: 2.5       # ratio W/H maximum plausible (personne assise tolérée)
   min_box_height_px: 10.0        # hauteur minimale de bounding box
@@ -335,6 +378,9 @@ timing:
   # (15 frames vues en 0,15 s).
   warmup_seconds: 0.5
   warmup_min_frames: 15
+  # Lot 4 : second garde-fou reporté depuis tracker.new_track_thresh (0,7 -> 0,45) :
+  # une piste créée à tort doit tenir 0,5 s avant tout franchissement. Valeur
+  # inchangée, voir docs/correctif_occlusion.md §15.
   confirmation_seconds: 0.5
   grace_period_seconds: 5.0
   fps_estimate_window: 30       # frames pour la moyenne glissante du FPS
