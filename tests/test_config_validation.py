@@ -40,7 +40,10 @@ def test_default_config_loads_and_is_valid():
     assert config.stabilization.use_bbox_locker is True
     assert config.stabilization.use_anchor_stabilizer is False
     assert config.reid.long_term.enabled is True
-    assert config.reid.external_reid.enabled is False
+    # Lot 3.a : descripteur OSNet activé (docs/correctif_occlusion.md §17), avec
+    # repli sur l'histogramme si le modèle manque.
+    assert config.reid.external_reid.enabled is True
+    assert config.reid.external_reid.fallback_to_histogram is True
     # Garde-fou de swap : actif, mais purement diagnostique.
     assert config.reid.appearance_continuity.enabled is True
     assert config.reid.appearance_continuity.similarity_threshold == pytest.approx(0.5)

@@ -286,7 +286,15 @@ def test_absent_boxes_are_reported_as_such(tmp_path, monkeypatch):
 def test_default_session_reports_no_configuration_warning(tmp_path, monkeypatch):
     root = run_main(tmp_path, monkeypatch, "session-coherente", lambda: None)
     events = read_events(root / "events.jsonl")
-    assert not [event for event in events if event["type"] == "CONFIG_WARNING"]
+    # Lot 3.a : l'avertissement de repli du descripteur profond dépend de
+    # l'environnement (poids ONNX non versionné), pas de la cohérence de la
+    # configuration que ce test vérifie ; il est éprouvé dans
+    # tests/test_reid_deep_lot3a.py.
+    assert not [
+        event for event in events
+        if event["type"] == "CONFIG_WARNING"
+        and event.get("code") != "reid_deep_descriptor_unavailable"
+    ]
     start = events[0]
     assert start["tracker_low_thresh"] == pytest.approx(
         load_config().tracker.track_low_thresh

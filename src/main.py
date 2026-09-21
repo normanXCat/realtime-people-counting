@@ -1426,6 +1426,9 @@ def _finalize(
                 occupancy.identities.descriptor_rejections
             ),
         },
+        # Lot 3.a : descripteur d'apparence réellement en service (profond ou
+        # repli histogramme), politique de calcul et coût mesuré.
+        "appearance_descriptor": occupancy.identities.descriptor_summary(),
         # Ajout du lot 0 : deux grandeurs d'identité que le schéma de mesure
         # (docs/lot_0_outillage.md §0.2) exige et que le résumé ne publiait pas.
         # `technical_ids` compte les identifiants de BoT-SORT ayant porté une

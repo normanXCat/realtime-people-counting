@@ -54,6 +54,11 @@ ALLOWED_TIME_BASES = ("auto", "video", "wall")
 #: réintroduiraient une estimation de mouvement sur une image immobile, donc une
 #: source d'instabilité gratuite des boîtes et des identifiants techniques.
 ALLOWED_GMC_METHODS = ("none", "sparseOptFlow", "orb", "ecc", "sof")
+#: Moteurs du descripteur profond (lot 3.a) : ONNX via onnxruntime, ou ancien
+#: chemin torchreid (poids ImageNet).
+ALLOWED_EXTERNAL_REID_BACKENDS = ("onnxruntime", "torchreid")
+#: Quand calculer le descripteur d'apparence (lot 3.a, budget FPS).
+ALLOWED_DESCRIPTOR_POLICIES = ("on_demand", "every_frame")
 
 
 class ConfigError(ValueError):
@@ -323,10 +328,43 @@ class SwapCorrectionConfig:
 
 @dataclass(frozen=True)
 class ExternalReidConfig:
+    """Descripteur d'apparence profond (lot 3.a).
+
+    - ``backend`` : ``onnxruntime`` (ONNX lu depuis ``model_path``) ou
+      ``torchreid`` (ancien chemin, poids ImageNet de torchreid).
+    - ``model_path`` : chemin de l'ONNX, relatif à la racine du dépôt.
+    - ``model_expected_sha256`` : empreinte attendue ; une empreinte différente
+      déclenche le repli, jamais un démarrage silencieux sur un autre poids.
+    - ``fallback_to_histogram`` : si le modèle est absent ou illisible, repli
+      sur l'histogramme avec un avertissement ; ``false`` fait échouer le
+      démarrage.
+    - ``descriptor_policy`` : ``on_demand`` ne calcule le descripteur qu'à la
+      ré-identification, à la création d'une identité et au rafraîchissement de
+      galerie ; ``every_frame`` le calcule pour chaque personne à chaque frame
+      (comportement de l'histogramme).
+    - ``gallery_refresh_seconds`` : intervalle minimal, en secondes de scène,
+      entre deux rafraîchissements du descripteur de galerie d'une identité
+      suivie (mode ``on_demand``).
+    - ``describe_on_proximity`` : en mode ``on_demand``, calcule aussi le
+      descripteur des pistes dont les boîtes se touchent ou se recouvrent, pour
+      alimenter la correction des inversions (``_correct_cross_swaps``) là où
+      elles se produisent. Ce descripteur n'est pas écrit en galerie.
+    - ``proximity_margin_ratio`` : marge ajoutée autour de chaque boîte,
+      en fraction de sa hauteur, pour décider que deux boîtes « se touchent »
+      (0 = contact ou recouvrement strict).
+    """
+
     enabled: bool = False
-    model_path: str = "osnet_x0_25_msmt17.pt"
+    backend: str = "onnxruntime"
+    model_path: str = "models/osnet_x0_25_msmt17.onnx"
+    model_expected_sha256: str | None = None
     weights: str = "osnet_x0_25"
     image_size: tuple[int, int] = (256, 128)
+    fallback_to_histogram: bool = True
+    descriptor_policy: str = "on_demand"
+    gallery_refresh_seconds: float = 1.0
+    describe_on_proximity: bool = True
+    proximity_margin_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -975,6 +1013,29 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     if not (isinstance(image_size_pair, (list, tuple)) and len(image_size_pair) == 2):
         problems.append("reid.external_reid.image_size doit être une paire [h, w]")
         image_size_pair = (256, 128)
+    external_backend = str(external_raw.get("backend", "onnxruntime"))
+    if external_backend not in ALLOWED_EXTERNAL_REID_BACKENDS:
+        problems.append(
+            f"reid.external_reid.backend doit être l'un de {ALLOWED_EXTERNAL_REID_BACKENDS} "
+            f"(reçu {external_backend!r})"
+        )
+    descriptor_policy = str(external_raw.get("descriptor_policy", "on_demand"))
+    if descriptor_policy not in ALLOWED_DESCRIPTOR_POLICIES:
+        problems.append(
+            f"reid.external_reid.descriptor_policy doit être l'un de {ALLOWED_DESCRIPTOR_POLICIES} "
+            f"(reçu {descriptor_policy!r})"
+        )
+    gallery_refresh_seconds = _positive(
+        external_raw.get("gallery_refresh_seconds", 1.0),
+        "reid.external_reid.gallery_refresh_seconds",
+        problems,
+    )
+    expected_sha = external_raw.get("model_expected_sha256")
+    proximity_margin_ratio = _non_negative(
+        external_raw.get("proximity_margin_ratio", 0.0),
+        "reid.external_reid.proximity_margin_ratio",
+        problems,
+    )
 
     occupancy_raw = _section(raw, "occupancy")
     disappearance_policy = str(
@@ -1244,9 +1305,20 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
-                model_path=str(external_raw.get("model_path", "osnet_x0_25_msmt17.pt")),
+                backend=external_backend,
+                model_path=str(external_raw.get("model_path", "models/osnet_x0_25_msmt17.onnx")),
+                model_expected_sha256=None if expected_sha is None else str(expected_sha),
                 weights=str(external_raw.get("weights", "osnet_x0_25")),
                 image_size=(int(image_size_pair[0]), int(image_size_pair[1])),
+                fallback_to_histogram=bool(external_raw.get("fallback_to_histogram", True)),
+                descriptor_policy=descriptor_policy,
+                gallery_refresh_seconds=float(
+                    gallery_refresh_seconds if gallery_refresh_seconds is not None else 1.0
+                ),
+                describe_on_proximity=bool(external_raw.get("describe_on_proximity", True)),
+                proximity_margin_ratio=float(
+                    proximity_margin_ratio if proximity_margin_ratio is not None else 0.0
+                ),
             ),
             appearance_continuity=AppearanceContinuityConfig(
                 enabled=bool(continuity_raw.get("enabled", True)),

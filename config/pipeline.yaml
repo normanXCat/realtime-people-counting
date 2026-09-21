@@ -225,7 +225,21 @@ reid:
     # restant très en dessous du p5 intra (0,911). Elle n'est PAS appliquée ici :
     # elle doit être calibrée sur un ensemble DISJOINT de l'ensemble de test
     # avant d'être figée (spec 9.1). Voir docs/correctif_occlusion.md §B.4.
-    similarity_threshold: 0.40   # PROVISOIRE — proposition 0,65, non appliquée
+    # similarity_threshold — MODIFIÉ au lot 3.a (docs/correctif_occlusion.md §17).
+    #   valeur précédente : 0,40 (échelle de l'histogramme HSV, commentaire
+    #     ci-dessus).
+    #   raison : le descripteur passe à OSNet-x0.25 (reid.external_reid), dont
+    #     l'échelle cosinus est différente. Distributions mesurées sur fort_occ4,
+    #     140 découpes des lignes de correspondance validées ou à confiance
+    #     haute (9 étiquettes) : intra médiane 0,678, inter médiane 0,519,
+    #     p95 inter 0,652. 0,66 = juste au-dessus du p95 inter : ~5 % des paires
+    #     inter et ~58 % des paires intra passent.
+    #   compromis accepté : un rattachement correct sur deux environ passe sous
+    #     le seuil et devient une nouvelle identité (plutôt qu'une fusion).
+    #   PROVISOIRE : 9 étiquettes sur 13, ensemble de test, pas de corpus
+    #     disjoint. Valable pour OSNet seulement : si le repli sur l'histogramme
+    #     se déclenche, ce seuil est trop strict pour lui.
+    similarity_threshold: 0.66
     safety_margin: 0.10          # PROVISOIRE — écart minimal au second candidat
     v_max_ratio: 1.5             # hauteurs de bbox / seconde
     spatial_margin_ratio: 0.3    # tolérance additionnelle (fraction de hauteur)
@@ -289,11 +303,45 @@ reid:
       bins_saturation: 8
   # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
   # uniquement : si false, le descripteur léger HSV est utilisé.
+  # -- Descripteur d'apparence profond (lot 3.a, docs/correctif_occlusion.md §16)
+  # OSNet-x0.25 entraîné sur MSMT17, exporté en ONNX FP32 (provenance et SHA-256
+  # au §16.1). L'INT8 dynamique est ÉCARTÉ : 5 fois plus lent sur ce CPU et moins
+  # fidèle (§16.3).
   external_reid:
-    enabled: false
-    model_path: osnet_x0_25_msmt17.pt
-    weights: osnet_x0_25
-    image_size: [256, 128]
+    # enabled — ACTIVÉ au lot 3.a (valeur précédente : false), décision de la
+    # personne responsable du 2026-09-21 après mesure (§17) : fragmentation
+    # 7 -> 2 pistes surnuméraires, TECHNICAL_ID_CHANGED 6 -> 3 sur fort_occ4 ;
+    # visible_count et doublons inchangés ; FPS 4,08 / 3,74 (>= 3,06).
+    enabled: true
+    # backend : onnxruntime (ONNX lu depuis model_path) ; `torchreid` garde
+    # l'ancien chemin, qui charge des poids ImageNet et ignore model_path.
+    backend: onnxruntime
+    model_path: models/osnet_x0_25_msmt17.onnx   # relatif à la racine du dépôt
+    model_expected_sha256: "cc81cd1a28c5588010a662d544d6e88593fe73b542e114c4d1dd70e890b82e16"
+    weights: osnet_x0_25       # utilisé par le seul backend torchreid
+    image_size: [256, 128]     # (h, w) — format ReID standard, crop corps entier
+    # Modèle absent, illisible ou d'empreinte différente : repli sur
+    # l'histogramme avec un avertissement (stderr, journal, CONFIG_WARNING).
+    fallback_to_histogram: true
+    # on_demand : descripteur calculé seulement à la ré-identification, à la
+    # création d'une identité et au rafraîchissement de galerie — jamais pour
+    # chaque personne à chaque frame (10 ms par découpe : le FPS tomberait sous
+    # 3,06 à 10 personnes, §16.3).
+    descriptor_policy: on_demand
+    # Intervalle minimal (secondes de scène) entre deux rafraîchissements du
+    # descripteur de galerie d'une identité suivie. PROVISOIRE : compromis coût /
+    # fraîcheur, non calibré.
+    gallery_refresh_seconds: 1.0
+    # Déclencheur de proximité : en mode on_demand, le descripteur n'existe pas à
+    # chaque frame, donc la correction des inversions (_correct_cross_swaps)
+    # n'aurait rien à comparer. Il est calculé aussi pour les pistes dont les
+    # boîtes se touchent ou se recouvrent — là où les inversions se produisent —
+    # quand les deux personnes ont déjà un descripteur de galerie. Réservé à la
+    # correction, jamais écrit en galerie (découpe prise pendant un croisement).
+    describe_on_proximity: true
+    # Marge autour de chaque boîte, en fraction de sa hauteur (0 = contact ou
+    # recouvrement strict). PROVISOIRE, non calibré.
+    proximity_margin_ratio: 0.0
 
   # -- Garde-fou « inversement d'identifiant » (swap) ----------------------
   # Un swap n'est PAS une perte de piste : deux identifiants BoT-SORT restent

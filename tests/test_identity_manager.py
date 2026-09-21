@@ -404,9 +404,15 @@ def test_deep_extractor_refuses_tiny_crop_without_loading_weights():
     assert extractor._model is None, "aucun poids ne doit être chargé pour un crop invalide"
 
 
-def test_external_reid_flag_selects_deep_extractor():
+def test_external_reid_flag_selects_deep_extractor(monkeypatch):
     from config import ExternalReidConfig as Config
 
+    # Lot 3.a : le descripteur profond est désormais chargé au démarrage, et un
+    # modèle absent déclenche le repli sur l'histogramme. Le poids ONNX n'étant
+    # pas versionné, on neutralise le chargement pour que ce test vérifie
+    # toujours la sélection par le drapeau, indépendamment de l'environnement ;
+    # le repli est éprouvé dans tests/test_reid_deep_lot3a.py.
+    monkeypatch.setattr(DeepAppearanceExtractor, "load", lambda self: None)
     manager = IdentityManager(external_reid=Config(enabled=True))
     assert isinstance(manager.appearance, DeepAppearanceExtractor)
     plain = IdentityManager(external_reid=Config(enabled=False))

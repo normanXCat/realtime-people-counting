@@ -23,7 +23,9 @@ pillow==12.3.0
 # --- Configuration et métriques ------------------------------------------
 PyYAML==6.0.3
 
-# --- ReID externe (variante 5, désactivé par défaut) ----------------------
-# L'extracteur profond utilise MobileNetV3 (torchvision) ; torchreid n'est
-# requis que si `reid.external_reid.weights: osnet_*` est explicitement choisi.
+# --- ReID externe (lot 3.a) ----------------------------------------------
+# Moteur du descripteur profond (backend onnxruntime) : OSNet-x0.25 exporté en
+# ONNX, lu depuis reid.external_reid.model_path (docs/correctif_occlusion.md §16).
+onnxruntime==1.30.0
+# Le backend `torchreid` (ancien chemin, poids ImageNet) reste optionnel.
 # torchreid==0.2.5

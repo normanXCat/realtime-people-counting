@@ -2749,3 +2749,194 @@ plus, `reid.external_reid.model_path` n'est lu nulle part hors de
 `src/config.py`. Tel quel, activer `external_reid` n'utiliserait donc pas les
 poids MSMT17. L'intégration 3.a devra charger l'ONNX ci-dessus, comme le
 prévoit la fiche (`backend: onnxruntime`).
+
+---
+
+# 17. Lot 3.a — descripteur OSNet-x0.25 (ONNX FP32)
+
+> **Statut : appliqué le 2026-09-21** sur décision de la personne responsable :
+> `reid.external_reid.enabled: true`, `similarity_threshold` 0,40 → **0,66**
+> (`PROVISOIRE`), déclencheur de proximité conservé pour l'instant. Les
+> marges (`safety_margin`, `swap_correction.margin`) ne sont **pas** encore
+> recalibrées (§17.6). Référence des mesures : la configuration précédente
+> (`track_high_thresh` 0,30, histogramme HSV). **La 3.b (galerie
+> multi-échantillons) est reportée en perspective**, faute de temps avant le
+> gel du code.
+>
+> **Mention de portée.** Métriques d'identité **non calculées** : la
+> correspondance n'est validée que pour les `person_id` 1 à 6 (planche p0).
+> Recalibrage fait sur 140 découpes, 9 étiquettes sur 13.
+
+## 17.1 Ce qui a été intégré
+
+- `DeepAppearanceExtractor` : moteur `onnxruntime`, qui lit réellement
+  `model_path` et vérifie `model_expected_sha256`. L'ancien chemin torchreid
+  est conservé sous `backend: torchreid`. L'INT8 est écarté (§16.3).
+- **Repli** : modèle absent, illisible ou d'empreinte différente → histogramme,
+  avec avertissement sur stderr, dans le journal Python et en `CONFIG_WARNING`
+  (`reid_deep_descriptor_unavailable`), et raison publiée dans `summary.json`
+  (`appearance_descriptor.fallback_reason`). `fallback_to_histogram: false`
+  fait échouer le démarrage. Vérifié sur un vrai lancement.
+- **Calcul à la demande** (`descriptor_policy: on_demand`) : descripteur calculé
+  pour une piste inconnue (ré-identification), à la création d'une identité, et
+  au rafraîchissement de galerie. Ce rafraîchissement a lieu au plus toutes les
+  `gallery_refresh_seconds` (1,0 s), et seulement si l'échantillon serait
+  accepté en galerie. Un descripteur non calculé à dessein n'est pas compté
+  comme un rejet de qualité.
+
+### 17.1.1 Écart relevé en cours de lot — la correction des inversions était privée de descripteur
+
+**Signalé par la personne responsable, puis vérifié.** En `on_demand`,
+`_correct_cross_swaps` s'exécute en début d'`assign()`, **avant**
+`_assign_one` : aucun descripteur courant n'existait à ce moment-là. La
+première version l'avait seulement rendue « inactive » : la correction des
+inversions, cible du lot 3, ne pouvait plus rien corriger.
+
+**Correctif : déclencheur de proximité** (`describe_on_proximity: true`,
+`proximity_margin_ratio: 0.0`). Le descripteur est calculé aussi pour les
+pistes dont les boîtes se touchent ou se recouvrent, quand les deux personnes
+ont déjà un descripteur de galerie, et si l'échantillon passe les critères de
+galerie. Ce descripteur est **réservé à la correction** et n'est jamais écrit
+en galerie (découpe prise pendant un croisement). Un test vérifie qu'une
+inversion croisée est corrigée en `on_demand`. Les mesures ci-dessous sont
+données **sans** et **avec** ce déclencheur.
+
+## 17.2 Recalibrage de `similarity_threshold`
+
+Découpes des lignes de correspondance validées ou à confiance haute, une seule
+étiquette (boîtes fusionnées exclues) : 140 découpes, 9 étiquettes (P8 : une
+seule). Paires de secondes différentes.
+
+| | Intra médiane / p10 / p5 | Inter médiane / p95 / p99 | Paires intra sous le p95 inter |
+|---|---|---|---|
+| **OSNet** | 0,678 / 0,537 / 0,510 | 0,519 / **0,652** / 0,700 | **41 %** |
+| Histogramme HSV | 0,492 / 0,223 / 0,177 | 0,344 / 0,630 / 0,747 | 69 % |
+
+Histogrammes (pas de 0,05, de 0 à 1), OSNet :
+
+- intra : `0,0,0,0,0,0,0,1,6,44,133,155,227,220,195,176,81,64,70,29` ;
+- inter : `0,0,0,0,0,0,27,254,960,2022,2271,1534,789,373,73,11,0,0,0,0`.
+
+| Seuil | Intra acceptées | Inter acceptées |
+|---|---|---|
+| 0,60 | 75,8 % | 15,0 % |
+| **0,66** (proposé : juste au-dessus du p95 inter) | ≈ 58 % | ≈ 5 % |
+| 0,70 | 43,9 % | 1,0 % |
+
+## 17.3 Mesures
+
+`fort_occ4` :
+
+| | Histogramme (en vigueur) | OSNet 0,66 sans déclencheur | **OSNet 0,66 avec déclencheur** | OSNet 0,60 avec déclencheur |
+|---|---|---|---|---|
+| `erreur_comptage_max_visible` / somme des écarts | 7 / 95 | 7 / 95 | **7 / 95** | 7 / 95 |
+| `pistes_vues` min / max | 3 / 10 | 3 / 10 | 3 / 10 | 3 / 10 |
+| Pistes surnuméraires / `person_id` fragmentés | 7 / 7 | 2 / 2 | **2 / 2** | 3 / 3 |
+| Identifiants techniques partagés | 3 | 1 | 1 | 1 |
+| `TECHNICAL_ID_CHANGED` | 6 | 3 | **3** | 4 |
+| Identités créées (13 personnes réelles) | 29 | 31 | **31** | 30 |
+| … dont provisoires / sous le seuil | 14 / 6 | 13 / 10 | 13 / 10 | 18 / 4 |
+| `REID_AMBIGUOUS` | 14 | 13 | 13 | 18 |
+| `IDENTITY_SWAP_CORRECTED` | 1 (**fausse**, §17.4) | 0 | **0** | 0 |
+| Doublons emboîtés | 8 | 8 | 8 | 8 |
+| Descripteurs calculés (dont croisements) | à chaque frame | 184 | **1 550 (1 366)** | 1 550 (1 366) |
+| Étape `reid`, p95 / max (ms) | 6,4 / 18 | 16 / 50 | **67 / 140** | 67 / 139 |
+| FPS moyen, mesuré seul sur la machine | 3,32 (§15.15.5) | 4,22 | **4,08** (min instantané 3,26) | — |
+| *IN / OUT / NEW / `occupancy_operational`, non interprété* | *7/0/8/18* | *7/0/9/19* | *7/0/9/19* | *7/0/9/19* |
+
+`rare_occ2` :
+
+| | Histogramme | OSNet 0,66 sans | **OSNet 0,66 avec** | OSNet 0,60 avec |
+|---|---|---|---|---|
+| Identités créées / `technical_ids` | 10 / 11 | 10 / 11 | **10 / 11** | 9 / 11 |
+| `REID_AMBIGUOUS` | 4 | 1 | **1** | 0 |
+| Doublons emboîtés | 9 | 9 | 9 | 8 |
+| `visible_count` | identique dans les quatre colonnes | | | |
+| Descripteurs (dont croisements) | — | 59 | **233 (174)** | 235 (176) |
+| FPS moyen, seul | 3,82 (§15.15.5) | 3,85 | **3,74** (min 3,16) | — |
+
+Coût d'OSNet : 15 ms par descripteur, prétraitement compris. Avec le
+déclencheur, cela fait en moyenne 22 ms par image sur `fort_occ4` (1,5
+descripteur par image). Le critère FPS (≥ 3,06) est tenu sur les deux vidéos.
+
+## 17.4 Lecture
+
+- **`visible_count` et les doublons ne bougent pas**, dans aucune variante.
+  C'est attendu : la ré-identification rattache des pistes, elle n'en crée ni
+  n'en retire. Ces deux points relèvent du tracker et du détecteur (§15.12.3,
+  §15.14), pas du lot 3.
+- **La fragmentation baisse nettement** : pistes surnuméraires 7 → 2,
+  changements d'identifiant technique divisés par deux.
+- **Les identités créées ne baissent pas** (29 → 31). Sur les 31, 13 sont des
+  identités provisoires : le meilleur candidat dépasse le seuil (0,69 à 0,77),
+  mais le second est à moins de `safety_margin` (0,10). Cette marge a été
+  réglée pour l'histogramme et **n'est pas recalibrée** pour l'échelle
+  d'OSNet. 10 autres tombent sous le seuil (0,45 à 0,65).
+- **La seule correction de swap de l'histogramme était fausse** : à s27, elle a
+  échangé les pistes 12 et 13. C'est elle qui fait passer le `person_id` 13 de
+  P4 à P11 dans la proposition de correspondance.
+- **Le déclencheur de proximité alimente bien la correction** (1 366
+  descripteurs de croisement), mais **aucune inversion n'a été corrigée** avec
+  OSNet : aucun croisement n'a dépassé la marge `swap_correction.margin`
+  (0,12). Cette marge a elle aussi été réglée pour l'histogramme. Le
+  déclencheur ne change donc aucune métrique sur ces deux vidéos ; il en
+  multiplie le coût par huit, dans le budget FPS. **Non concluant** : on ne
+  sait pas encore si c'est l'absence d'inversion réelle corrigeable, ou une
+  marge inadaptée. Les métriques d'identité validées (`id_switches_reels`)
+  sont nécessaires pour trancher.
+- **Garde-fou de continuité d'apparence** : il reste inactif en `on_demand`
+  (0 discontinuité, contre 2), faute de deux descripteurs à moins de
+  `max_gap_frames` d'écart.
+
+## 17.5 Tests
+
+Suite complète : **684 tests collectés, 683 passés, 1 ignoré** (serveur X,
+déjà ignoré), couverture **93,67 %**. Décompte réel : **487** fonctions sur
+**35** fichiers.
+
+- Ajouté : `tests/test_reid_deep_lot3a.py` (20 tests). Validation de la
+  configuration, repli (modèle absent, repli interdit, empreinte fausse,
+  modèle illisible), moteur ONNX réel sur un petit réseau exporté dans le test,
+  politique `on_demand` (piste suivie, échantillon refusable, piste inconnue,
+  coût publié), politique `every_frame`, déclencheur de proximité (pistes
+  proches ou éloignées, pas d'écriture en galerie, inversion croisée corrigée,
+  déclencheur désactivable).
+- Corrigé : `test_identity_manager.py::test_external_reid_flag_selects_deep_extractor`.
+  Il supposait que le modèle profond se charge toujours. Le poids ONNX n'étant
+  pas versionné, une machine sans lui déclencherait le repli et ferait échouer
+  le test selon l'environnement. Le chargement y est neutralisé ; ce qu'il
+  vérifie (la sélection par le drapeau) ne change pas.
+- Dépendances : `onnxruntime==1.30.0` dans `requirements.txt`, `onnx==1.23.0`
+  dans `requirements-dev.txt`.
+
+## 17.6 Non résolu
+
+1. `safety_margin` (0,10) et `swap_correction.margin` (0,12) ne sont pas
+   recalibrés pour OSNet. Le premier est la cause principale des identités
+   provisoires.
+2. Métriques d'identité en attente de la validation des planches p1 à p4.
+3. Le recalibrage de `similarity_threshold` repose sur 9 étiquettes sur 13 et
+   n'a pas été fait sur un corpus disjoint : la valeur reste `PROVISOIRE`.
+4. Le garde-fou de continuité est inactif en `on_demand`.
+
+## 17.7 Confirmation sur la configuration versionnée
+
+`scripts/measure_corpus.py` sans `--config`, une vidéo à la fois, seul sur la
+machine :
+
+| Vidéo | `technical_ids` / identités / `TECHNICAL_ID_CHANGED` / `IN` / `OUT` / `NEW` / `occupancy_operational` / `PURGE` / `OCCLUDED` / `STATE_TRANSITION` / `REID_AMBIGUOUS` / `IDENTITY_SWAP_CORRECTED` | Contre la variante mesurée (OSNet 0,66 avec déclencheur) | FPS moyen |
+|---|---|---|---|
+| `fort_occ4` | 32 / 31 / 3 / 7 / 0 / 9 / 19 / 21 / 78 / 247 / 13 / 0 | **identiques** | 3,988 |
+| `rare_occ2` | 11 / 10 / 1 / 3 / 0 / 2 / 5 / 2 / 15 / 91 / 1 / 0 | **identiques** | 3,673 |
+
+Tests après activation : **684 collectés, 683 passés, 1 ignoré**, couverture
+**93,70 %**. La suite a aussi été passée **sans le poids ONNX** (repli sur
+l'histogramme) : elle est verte. Deux tests ont été ajustés pour l'activation :
+
+- `test_config_validation.py::test_default_config_loads_and_is_valid` attend
+  désormais `external_reid.enabled` vrai et `fallback_to_histogram` vrai ;
+- `test_track_diagnostics.py::test_default_session_reports_no_configuration_warning`
+  ignore le seul avertissement `reid_deep_descriptor_unavailable`. Il vérifie
+  la cohérence de la configuration ; or cet avertissement dépend de
+  l'environnement (poids non versionné), et il est éprouvé dans
+  `tests/test_reid_deep_lot3a.py`.

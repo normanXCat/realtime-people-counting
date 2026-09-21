@@ -6,3 +6,6 @@
 pytest==9.1.1
 pytest-cov==7.1.0
 coverage==7.16.1
+# Export ONNX du petit réseau de tests/test_reid_deep_lot3a.py (et de l'export
+# d'OSNet, results/lot4/osnet_export.py).
+onnx==1.23.0

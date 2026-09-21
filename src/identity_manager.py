@@ -29,8 +29,12 @@ déclenchement « à l'occlusion imminente », l'assignation hongroise, l'état
 
 from __future__ import annotations
 
+import logging
+import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import cv2
@@ -169,12 +173,25 @@ class HistogramAppearanceExtractor:
         return None if norm < 1e-8 else concatenated / norm
 
 
-class DeepAppearanceExtractor:
-    """Descripteur d'apparence profond (ex-``reid.py``), ablation de la section 9.
+class DeepAppearanceUnavailable(RuntimeError):
+    """Le descripteur profond ne peut pas être chargé (modèle absent, empreinte
+    différente, moteur indisponible). Déclenche le repli sur l'histogramme."""
 
-    Chargement paresseux : aucun poids n'est téléchargé à l'import. OSNet
-    (``torchreid``) est utilisé si disponible, sinon le repli MobileNetV3 Small
-    tronqué — exactement le comportement consolidé des deux modules supprimés.
+
+class DeepAppearanceExtractor:
+    """Descripteur d'apparence profond (lot 3.a).
+
+    Deux moteurs (``reid.external_reid.backend``) :
+
+    - ``onnxruntime`` : OSNet exporté en ONNX, lu depuis ``model_path`` (chemin
+      relatif à la racine du dépôt). Crop **corps entier**, redimensionné à
+      ``image_size`` (h, w), normalisation ImageNet, vecteur L2-normalisé ;
+    - ``torchreid`` : ancien chemin, conservé tel quel (poids **ImageNet** de
+      torchreid, repli MobileNetV3) — il n'utilise pas ``model_path``.
+
+    Le chargement est explicite (:meth:`load`) : un modèle absent, illisible ou
+    d'empreinte différente lève :class:`DeepAppearanceUnavailable`, que
+    :class:`IdentityManager` transforme en repli annoncé.
     """
 
     name = "deep_mobilenetv3"
@@ -189,6 +206,45 @@ class DeepAppearanceExtractor:
         self._model: Any = None
         self._transform: Any = None
         self._device: Any = None
+        self._session: Any = None
+        self._input_name: str | None = None
+
+    def load(self) -> None:
+        """Charge le moteur ; lève :class:`DeepAppearanceUnavailable` en cas d'échec."""
+        if self.config.backend == "onnxruntime":
+            self._load_onnx()
+        else:
+            self._ensure_model()
+
+    def _load_onnx(self) -> None:
+        if self._session is not None:
+            return
+        import hashlib
+
+        from config import REPO_ROOT
+
+        path = Path(self.config.model_path)
+        if not path.is_absolute():
+            path = REPO_ROOT / path
+        if not path.is_file():
+            raise DeepAppearanceUnavailable(f"modèle ReID absent : {path}")
+        expected = self.config.model_expected_sha256
+        if expected:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if digest.lower() != str(expected).lower():
+                raise DeepAppearanceUnavailable(
+                    f"empreinte du modèle ReID différente : {digest} (attendue {expected})"
+                )
+        try:
+            import onnxruntime as ort  # import local : dépendance du seul chemin profond
+        except ImportError as error:  # pragma: no cover - dépend de l'environnement
+            raise DeepAppearanceUnavailable(f"onnxruntime indisponible : {error}") from error
+        try:
+            self._session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        except Exception as error:  # modèle illisible
+            raise DeepAppearanceUnavailable(f"modèle ReID illisible : {error}") from error
+        self._input_name = self._session.get_inputs()[0].name
+        self.name = f"onnx_{path.stem}"
 
     def _ensure_model(self) -> None:
         if self._model is not None:
@@ -234,20 +290,34 @@ class DeepAppearanceExtractor:
             # Crop inexploitable : on refuse **avant** de charger un modèle, ce
             # qui évite tout téléchargement de poids pour rien.
             return None
-        import torch
+        if self.config.backend == "onnxruntime":
+            self._load_onnx()
+            out_h, out_w = self.config.image_size
+            crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            crop = cv2.resize(crop, (int(out_w), int(out_h)), interpolation=cv2.INTER_LINEAR)
+            tensor = (crop.astype(np.float32) / 255.0 - _IMAGENET_MEAN) / _IMAGENET_STD
+            tensor = np.ascontiguousarray(tensor.transpose(2, 0, 1)[None], dtype=np.float32)
+            vector = self._session.run(None, {self._input_name: tensor})[0][0].astype(np.float32)
+        else:
+            import torch
 
-        self._ensure_model()
-        crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            vector = (
-                self._model(self._transform(crop).unsqueeze(0).to(self._device))
-                .squeeze()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
+            self._ensure_model()
+            crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            with torch.no_grad():
+                vector = (
+                    self._model(self._transform(crop).unsqueeze(0).to(self._device))
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
         norm = float(np.linalg.norm(vector))
         return None if norm < 1e-6 else vector / norm
+
+
+#: Normalisation ImageNet, celle de l'entraînement d'OSNet (torchreid).
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +390,10 @@ class IdentityRecord:
     #: Dernière raison de rejet d'apparence (`REID_DESCRIPTOR_REJECTED`). Sert à
     #: ne journaliser qu'un changement de situation, jamais une ligne par frame.
     last_rejection: str | None = None
+    #: Instant (secondes de scène) de la dernière écriture du descripteur de
+    #: galerie. En mode ``on_demand`` (lot 3.a), le descripteur d'une identité
+    #: suivie n'est recalculé qu'au bout de ``gallery_refresh_seconds``.
+    feature_updated_s: float | None = None
 
     @property
     def age_s(self) -> float:
@@ -378,12 +452,30 @@ class IdentityManager:
             if configured_retention is None
             else float(configured_retention)
         )
-        self.appearance: AppearanceExtractor = appearance or (
-            DeepAppearanceExtractor(self.external_reid)
-            if self.external_reid.enabled
-            else HistogramAppearanceExtractor.from_config(self.long_term.descriptor)
-        )
         self.event_sink = event_sink
+        #: Raison du repli sur l'histogramme quand le descripteur profond est
+        #: demandé mais indisponible (lot 3.a) ; ``None`` sinon.
+        self.appearance_fallback_reason: str | None = None
+        self.appearance: AppearanceExtractor = appearance or self._build_appearance()
+        #: Politique « à la demande » (lot 3.a) : active seulement si le
+        #: descripteur profond est réellement en service. Un extracteur injecté
+        #: (tests, ablations) garde le calcul à chaque frame.
+        self.on_demand_descriptors = bool(
+            appearance is None
+            and self.external_reid.enabled
+            and self.appearance_fallback_reason is None
+            and self.external_reid.descriptor_policy == "on_demand"
+        )
+        #: Coût du descripteur (publié dans le résumé de session).
+        self.descriptors_computed = 0
+        self.descriptor_seconds = 0.0
+        #: Dont les descripteurs calculés pour la correction des inversions,
+        #: déclenchés par la proximité de deux pistes (mode ``on_demand``).
+        self.proximity_descriptors_computed = 0
+        #: Descripteurs de la frame courante réservés à la correction des
+        #: inversions : jamais écrits en galerie (découpes prises pendant un
+        #: croisement, donc potentiellement mêlées).
+        self._swap_features: dict[int, np.ndarray] = {}
         # Le momentum vit dans la configuration (``reid.long_term.feature_momentum``)
         # et non plus en dur ici : il était impossible de le régler sans toucher au
         # code, alors qu'il gouverne la vitesse de dérive du descripteur de galerie
@@ -448,7 +540,84 @@ class IdentityManager:
     def describe(self, frame: np.ndarray | None, bbox: Sequence[float]) -> np.ndarray | None:
         if frame is None:
             return None
-        return self.appearance.describe(frame, bbox)
+        start = time.perf_counter()
+        feature = self.appearance.describe(frame, bbox)
+        self.descriptor_seconds += time.perf_counter() - start
+        self.descriptors_computed += 1
+        return feature
+
+    def _build_appearance(self) -> AppearanceExtractor:
+        """Descripteur profond si demandé et disponible, sinon histogramme.
+
+        Le repli n'est jamais silencieux : avertissement sur la journalisation
+        Python et sur stderr, événement ``CONFIG_WARNING``, et raison conservée
+        pour le résumé. ``fallback_to_histogram: false`` fait échouer le
+        démarrage au lieu de replier.
+        """
+        histogram = HistogramAppearanceExtractor.from_config(self.long_term.descriptor)
+        if not self.external_reid.enabled:
+            return histogram
+        deep = DeepAppearanceExtractor(self.external_reid)
+        try:
+            deep.load()
+        except DeepAppearanceUnavailable as error:
+            if not self.external_reid.fallback_to_histogram:
+                raise
+            self.appearance_fallback_reason = str(error)
+            logging.getLogger(__name__).warning(
+                "ReID profond indisponible (%s) : repli sur l'histogramme", error
+            )
+            print(f"[REID] AVERTISSEMENT : {error} -- repli sur l'histogramme", file=sys.stderr)
+            self._emit(
+                "CONFIG_WARNING", 0.0, 0,
+                code="reid_deep_descriptor_unavailable",
+                details=f"{error} ; repli sur l'histogramme",
+                source="reid",
+            )
+            return histogram
+        return deep
+
+    def _insertable(self, observation: Observation) -> bool:
+        """Critères de galerie vérifiables **sans** descripteur (lot 3.a).
+
+        Mêmes seuils que :meth:`_gallery_rejection`, avant l'étape qui exige le
+        descripteur : en mode ``on_demand``, on ne paie pas un réseau pour un
+        échantillon qui serait refusé de toute façon.
+        """
+        limits = self.long_term
+        bbox = np.asarray(observation.bbox, dtype=float)
+        return (
+            observation.confidence >= limits.gallery_min_confidence
+            and float(bbox[3] - bbox[1]) >= limits.gallery_min_crop_height_px
+            and float(bbox[2] - bbox[0]) >= limits.gallery_min_crop_width_px
+            and not getattr(observation, "possible_multi_person", False)
+            and observation.anchor_reliable
+        )
+
+    def _gallery_refresh_due(
+        self, record: IdentityRecord, observation: Observation, timestamp_s: float, frame_index: int
+    ) -> bool:
+        """En mode ``on_demand`` : faut-il recalculer le descripteur de galerie ?"""
+        if record.feature is not None and record.feature_updated_s is not None and (
+            float(timestamp_s) - record.feature_updated_s
+        ) < float(self.external_reid.gallery_refresh_seconds):
+            return False
+        if self._appearance_is_frozen(record, frame_index):
+            return False
+        return self._insertable(observation)
+
+    def descriptor_summary(self) -> dict[str, Any]:
+        """Descripteur en service et coût mesuré (résumé de session)."""
+        count = int(self.descriptors_computed)
+        return {
+            "name": str(getattr(self.appearance, "name", type(self.appearance).__name__)),
+            "policy": "on_demand" if self.on_demand_descriptors else "every_frame",
+            "fallback_reason": self.appearance_fallback_reason,
+            "computed": count,
+            "computed_for_swap_correction": int(self.proximity_descriptors_computed),
+            "total_ms": round(self.descriptor_seconds * 1000.0, 1),
+            "mean_ms": round(self.descriptor_seconds * 1000.0 / count, 3) if count else None,
+        }
 
     # -- Qualité du descripteur avant écriture en galerie -------------------
     @staticmethod
@@ -517,7 +686,11 @@ class IdentityManager:
     ) -> np.ndarray | None:
         """Extrait le descripteur d'une observation s'il respecte les critères de qualité."""
         feature = observation.feature
-        if feature is None and frame is not None:
+        if feature is None:
+            # Mode ``on_demand`` : descripteur calculé par le déclencheur de
+            # proximité (:meth:`_describe_close_tracks`), réservé à la correction.
+            feature = self._swap_features.get(int(observation.technical_track_id))
+        if feature is None and frame is not None and not self.on_demand_descriptors:
             feature = self.describe(frame, observation.bbox)
             if feature is not None:
                 observation.feature = feature
@@ -610,6 +783,63 @@ class IdentityManager:
                     )
                     break
 
+    @staticmethod
+    def _boxes_touch(a: Sequence[float], b: Sequence[float], margin_ratio: float) -> bool:
+        """Deux boîtes se touchent-elles ou se recouvrent-elles ?
+
+        Chaque boîte est élargie de ``margin_ratio`` × sa propre hauteur ; 0
+        signifie contact ou recouvrement strict.
+        """
+        ma = margin_ratio * float(a[3] - a[1])
+        mb = margin_ratio * float(b[3] - b[1])
+        return not (
+            float(a[2]) + ma < float(b[0]) - mb
+            or float(b[2]) + mb < float(a[0]) - ma
+            or float(a[3]) + ma < float(b[1]) - mb
+            or float(b[3]) + mb < float(a[1]) - ma
+        )
+
+    def _describe_close_tracks(
+        self, observations: Sequence[Observation], frame: np.ndarray | None
+    ) -> None:
+        """Mode ``on_demand`` : descripteur des pistes proches, pour la correction.
+
+        Les inversions se produisent quand deux personnes se croisent : c'est là,
+        et seulement là, que la correction a besoin du descripteur courant. Une
+        piste n'est décrite que si sa boîte touche celle d'une autre piste et que
+        **les deux** portent une identité vivante dotée d'un descripteur de
+        galerie (sans quoi la correction ne peut rien comparer), et si
+        l'échantillon passe les critères de galerie vérifiables sans descripteur
+        (même règle que :meth:`_extract_valid_feature`). Coût borné par le nombre
+        de pistes en contact.
+        """
+        if frame is None:
+            return
+
+        def eligible(obs: Observation) -> bool:
+            person = self.technical_to_person.get(int(obs.technical_track_id))
+            record = self.records.get(person) if person is not None else None
+            return (
+                record is not None
+                and record.purged_at_s is None
+                and record.feature is not None
+                and self._insertable(obs)
+            )
+
+        candidates = [obs for obs in observations if eligible(obs)]
+        margin = float(self.external_reid.proximity_margin_ratio)
+        close: set[int] = set()
+        for i, a in enumerate(candidates):
+            for j in range(i + 1, len(candidates)):
+                if self._boxes_touch(a.bbox, candidates[j].bbox, margin):
+                    close.update((i, j))
+        for index in sorted(close):
+            obs = candidates[index]
+            feature = self.describe(frame, obs.bbox)
+            self.proximity_descriptors_computed += 1
+            if feature is not None:
+                self._swap_features[int(obs.technical_track_id)] = feature
+
     # -- Affectation -------------------------------------------------------
     def assign(
         self,
@@ -629,7 +859,10 @@ class IdentityManager:
         self._prune_track_appearance(frame_index)
 
         # Correction active des inversions d'identité (swap)
+        self._swap_features = {}
         if self.swap_correction.enabled:
+            if self.on_demand_descriptors and self.external_reid.describe_on_proximity:
+                self._describe_close_tracks(observations, frame)
             self._correct_cross_swaps(observations, frame_index, timestamp_s, frame=frame)
 
         for record in self.records.values():
@@ -652,7 +885,17 @@ class IdentityManager:
         technical_id = int(observation.technical_track_id)
         feature = observation.feature
         if feature is None:
-            feature = self.describe(frame, observation.bbox)
+            if not self.on_demand_descriptors:
+                feature = self.describe(frame, observation.bbox)
+            else:
+                # Lot 3.a : descripteur calculé seulement pour une ré-identification
+                # (piste inconnue) ou un rafraîchissement de galerie dû.
+                locked = self.technical_to_person.get(technical_id)
+                locked_record = self.records.get(locked) if locked is not None else None
+                if locked_record is None or self._gallery_refresh_due(
+                    locked_record, observation, timestamp_s, frame_index
+                ):
+                    feature = self.describe(frame, observation.bbox)
 
         # Indépendant du chemin d'affectation : la continuité d'apparence d'une
         # piste technique est vérifiée même quand elle est verrouillée sur une
@@ -1050,6 +1293,9 @@ class IdentityManager:
         deferred: bool = False,
         frame: np.ndarray | None = None,
     ) -> Assignment:
+        if feature is None and self.on_demand_descriptors and frame is not None:
+            # Lot 3.a : la création d'une identité est une insertion en galerie.
+            feature = self.describe(frame, observation.bbox)
         person_id = self._next_person_id
         self._next_person_id += 1
         # L'apparence initiale passe le même contrôle de qualité que les mises
@@ -1061,6 +1307,7 @@ class IdentityManager:
             person_id=person_id,
             technical_track_id=int(observation.technical_track_id),
             feature=feature if rejection is None else None,
+            feature_updated_s=float(timestamp_s) if rejection is None else None,
             anchor=observation.anchor,
             bbox_height=observation.bbox_height,
             bbox=np.asarray(observation.bbox, dtype=float),
@@ -1201,6 +1448,10 @@ class IdentityManager:
         # REID_MATCH et par la transition d'état depuis ABSENTE.
         record.purged_at_s = None
         record.purge_reason = None
+        if feature is None and self.on_demand_descriptors:
+            # Descripteur volontairement non calculé sur cette frame (lot 3.a) :
+            # ce n'est pas un rejet de qualité, l'apparence connue est conservée.
+            return
         rejection, threshold, measured = self._gallery_rejection(observation, feature, frame)
         if rejection is None:
             record.last_rejection = None
@@ -1210,6 +1461,7 @@ class IdentityManager:
                 # `last_seen_s` ont déjà été mis à jour ci-dessus.
                 return
             record.feature = _blend(record.feature, feature, self.feature_momentum)
+            record.feature_updated_s = float(timestamp_s)
             return
         # Apparence refusée : l'apparence connue est conservée telle quelle.
         self._report_descriptor_rejection(
