@@ -1414,6 +1414,12 @@ Aucun test n'a été supprimé, aucun n'a été passé en `skip`.
 
 # 14. Lot 1 — base de temps, `track_buffer` en secondes, seuil NMS
 
+> **Accepté par la personne responsable le 2026-09-21**, avec trois réserves
+> inscrites et non bloquantes : `track_buffer_seconds: 15.0` reste `PROVISOIRE`
+> et son effet propre n'est pas isolé (§14.8) ; le chemin caméra de la
+> conversion n'est couvert qu'unitairement (§14.10.5) ; `bootstrap_frames`
+> reste exprimé en frames (§14.10.8, dette à traiter au lot 2).
+
 > **Mention de portée.** Mesuré sur `test/fort_occ4.mp4` (mesure principale,
 > 1 055 frames, 35,2 s) et `test/rare_occ2.mp4` (non-régression), ligne figée
 > `--line 0.05,0.6,0.95,0.6` (`CLAUDE.md` §2). Le corpus contient **13
@@ -1761,8 +1767,47 @@ mesure** : le warm-up se termine désormais à 0,5 s de **scène** au lieu de
 compteur est plus exact en base murale par accident — la lenteur du traitement
 laissait le temps à la quatrième personne d'être vue.
 
+### 14.7.2.1 Ventilation des 12 — d'où vient chaque personne comptée
+
+`occupancy_operational = initial + IN + NEW − OUT`. Après le lot 1, sur
+`fort_occ4` :
+
+| Origine | Mesuré | Attendu d'après la vérité terrain | Écart |
+|---|---|---|---|
+| `initial` (warm-up) | **3** | **0** | +3 |
+| `IN` (franchissement confirmé) | **2** | **13** | −11 |
+| `NEW` (apparition intérieure) | **7** | **0** | +7 |
+| `OUT` | 0 | 0 | 0 |
+| **Total** | **12** | **13** | −1 |
+
+**L'écart de 1 sur le total masque une erreur de structure bien plus grande.**
+La vérité terrain est sans ambiguïté : à la seconde 0, **aucune personne n'est
+dans la salle**. La note de `t01.jpg` dit « *Une partie de P1 et P4 sont
+derrières une porte* » — les quatre sont en train d'entrer, pas installées.
+`P5` « entre dans la salle » à la seconde 3, `P1` à la seconde 5, `P7` à la
+seconde 8, et ainsi de suite jusqu'à `P13` à la seconde 29 : la salle se
+remplit de 0 à 13 par la porte, sans jamais se vider (§12.1).
+
+Le comptage attendu est donc **0 initial et 13 franchissements**. Le pipeline
+en produit 3, 2 et 7 : il place trois personnes au warm-up alors qu'elles sont
+encore dans l'embrasure, et il rattrape ensuite la majorité des autres par
+`NEW`, c'est-à-dire comme des apparitions intérieures — des personnes
+considérées comme déjà là, jamais comme entrées.
+
+Que le total tombe à 12 relève de la compensation : trois personnes comptées
+trop tôt, onze entrées manquées, sept apparitions intérieures. **Un total
+presque juste n'est pas un comptage juste**, et c'est précisément pourquoi le
+§4 exige `occupancy_operational` exact *et* aucun IN/OUT fantôme.
+
+**Aucun correctif dans ce lot** : le §8 de `CLAUDE.md` interdit de toucher à la
+logique IN / OUT / NEW, et la question relève du périmètre du lot 2 (warm-up,
+rétention, bord du cadre). Ce qui est établi ici est le **chiffre**, pas la
+solution.
+
 **À verser au lot 2** : le warm-up ne devrait pas figer l'effectif initial sur
-une seule frame quand des personnes sont partiellement masquées à l'entrée.
+une seule frame quand des personnes sont partiellement masquées à l'entrée, et
+la question de fond est de savoir pourquoi onze entrées réelles sont vues comme
+des apparitions intérieures.
 
 ### 14.7.3 Ce que le lot 1 n'a pas déplacé, et c'est l'essentiel
 
@@ -1842,4 +1887,14 @@ reste sur stderr, dans les logs, et la base retenue est publiée dans
    se mesurer dans cette base, sans quoi les tableaux ne sont pas comparables.
 7. **Reporté du lot 0** : la ligne n'est toujours pas publiée dans
    `config_resolved.yaml` (§13.7.2). Inchangé, toujours ouvert.
+8. **`bootstrap_frames` est encore compté en frames** (`occupancy_manager.py:321`,
+   publié dans `summary.json`) : même défaut d'unité que `track_buffer` avant ce
+   lot. Il compte les frames traitées avant qu'un budget existe ; sa durée réelle
+   dépend donc de la source, ce que le §1.0 vient précisément de corriger
+   ailleurs. **Dette inscrite, à traiter au lot 2** : l'exprimer en secondes de
+   scène.
+9. **Le comptage est structurellement faux sur `fort_occ4`** alors que son total
+   est presque juste : 3 initial + 2 IN + 7 NEW au lieu de 0 + 13 + 0
+   (§14.7.2.1). Aucun correctif ici — la logique IN/OUT/NEW est interdite de
+   modification (§8 de `CLAUDE.md`) et la question relève du lot 2.
 

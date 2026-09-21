@@ -28,7 +28,7 @@ au moment de traiter le lot concerné.
 | Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (§12). **Outillage fait** (`2f15649`) : relevé par seconde + `scripts/gt_matching.py`. Métriques de **comptage** disponibles ; métriques d'**identité** en attente de la validation du rattachement, prévue **au lot 2** (`tests/fixtures/gt_matching_fort_occ4.json`, statut `proposition`) | `2f15649` | 2026-09-21 |
 | Critères d'acceptation validés (§4) | — | **validés** le 2026-09-21 ; `erreur_comptage_max` scindée en deux (operational / visible) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | — | 2026-09-21 |
 | Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | **accepté** le 2026-09-21 (`docs/correctif_occlusion.md` §13). Critère §0.3 non satisfait mais divergence expliquée et chiffrée (§13.5) ; ajout `line_origin` dans `src/events.py` **conservé** ; publication de la ligne dans `config_resolved.yaml` **reste ouverte** | `435804c` | 2026-09-20 |
-| Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | **mesuré, en attente d'acceptation** (`docs/correctif_occlusion.md` §14). §1.0 et §1.1 appliqués ; §1.2 **mesuré et écarté** (0,85 et 0,90 dégradent, `nms_iou` reste 0,55) ; §1.3 **investigation conclue, aucun correctif** (235 rejets = une seule personne au ras de l'objectif, pas une fusion). **Le symptôme visé n'a pas bougé** : `erreur_comptage_max_visible` = 9 avant comme après | à commiter | 2026-09-21 |
+| Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | **accepté** le 2026-09-21 (`docs/correctif_occlusion.md` §14). §1.0 et §1.1 appliqués ; §1.2 **mesuré et écarté** (`nms_iou` reste 0,55) ; §1.3 **investigation conclue, aucun correctif**. **Le symptôme visé n'a pas bougé** : `erreur_comptage_max_visible` = 9 avant comme après. Trois réserves non bloquantes, voir ci-dessous | `5cc1c8e` | 2026-09-21 |
 | Lot 4 — seuils BoT-SORT (**avancé**) | `docs/lot_4_seuils_botsort.md` | à faire | — | — |
 | Lot 2 — rétention hors zone (+ bord du cadre) | `docs/lot_2_retention.md` | à faire | — | — |
 | Lot 3 — ReID OSNet + galerie | `docs/lot_3_reid_osnet.md` | à faire | — | — |
@@ -68,6 +68,25 @@ mesure du précédent dans cet ordre :
 Statuts possibles : `à faire` / `en cours` / `mesuré, en attente d'acceptation`
 / `accepté`. Un lot ne démarre que si le précédent **dans l'ordre ci-dessus**
 est `accepté`.
+
+**Réserves ouvertes après l'acceptation du lot 1** (inscrites, non bloquantes) :
+
+1. `tracker.track_buffer_seconds: 15.0` reste `PROVISOIRE` : mesuré en même
+   temps que `time_base`, son effet propre n'est **pas** isolé
+   (`docs/correctif_occlusion.md` §14.8). À figer quand la plus longue
+   occlusion du corpus aura été mesurée en base vidéo.
+2. La conversion de `track_buffer` sur source **caméra** n'est couverte
+   qu'unitairement : le corpus ne contient que des fichiers (§14.10.5).
+3. **Dette — `bootstrap_frames` est encore exprimé en frames**
+   (`occupancy_manager.py:321`, publié dans `summary.json`) : même défaut
+   d'unité que `track_buffer` avant le lot 1, donc une durée qui dépend de la
+   source. **À traiter au lot 2**, en secondes de scène (§14.10.8).
+
+**Dette de comptage relevée au lot 1, à traiter au lot 2** : sur `fort_occ4`,
+le pipeline compte 3 `initial` + 2 `IN` + 7 `NEW` là où la vérité terrain
+donne **0 initial et 13 franchissements** — la salle est vide à la seconde 0 et
+se remplit entièrement par la porte. Le total (12 contre 13) est presque juste
+par compensation ; la structure du comptage, elle, ne l'est pas (§14.7.2.1).
 
 ---
 
