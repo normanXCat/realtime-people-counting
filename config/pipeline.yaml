@@ -55,7 +55,32 @@ tracker:
   # Seuils BoT-SORT, DISTINCTS du seuil YOLO et synchronisés avec le YAML lu par
   # Ultralytics (un test vérifie la synchronisation, sinon la divergence serait
   # silencieuse).
-  track_high_thresh: 0.4    # plancher de l'association principale
+  # track_high_thresh — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15.15).
+  #   valeur précédente : 0.4. Valeurs mesurées : 0,30 / 0,25.
+  #   raison : dans BoT-SORT (Ultralytics 8.4.126, byte_tracker.py), les pistes
+  #     PERDUES ne participent qu'à la première association, qui ne reçoit que
+  #     les détections >= track_high_thresh ; le second étage ne confronte les
+  #     détections faibles qu'aux pistes encore suivies. Le diagnostic du §15.14
+  #     montre que la moitié des personnes non redétectées sont vues par YOLO
+  #     entre 0,10 et 0,40. À 0,30, une détection entre 0,30 et 0,40 peut
+  #     rejoindre sa piste perdue sans pouvoir créer d'identité (la création
+  #     reste gouvernée par new_track_thresh 0,60).
+  #   effet mesuré (fort_occ4, base vidéo) : erreur_comptage_max_visible 8 -> 7 ;
+  #     TECHNICAL_ID_CHANGED 14 -> 6 ; pistes surnuméraires 12 -> 7 ;
+  #     fragmentation max 4 -> 2 ; la personne assise à gauche (s30 à s35) garde
+  #     sa piste au lieu de la perdre au profit de l'enfant devant elle.
+  #   compromis accepté : identités créées 22 -> 29 (identités PROVISOIRES de la
+  #     galerie, reid_ambiguous_provisional 8 -> 14 : le descripteur HSV ne
+  #     départage pas des candidats plus nombreux ; à traiter au lot 3) ;
+  #     doublons emboîtés 4 -> 8 ; rare_occ2 : +2 doublons, +1 piste surnuméraire.
+  #   0,25 ÉCARTÉ : erreur visible 8 (pas de gain), doublons 12, et les
+  #     détections faibles de l'enfant volent la piste de la personne assise dès
+  #     s27.
+  #   invariant : new_track_thresh (0,60) >= track_high_thresh (0,30) >
+  #     track_low_thresh (0,1) >= model.confidence (0,10) — vérifié par
+  #     src/config.py et par les tests.
+  #   PROVISOIRE : calibré sur l'ensemble de test lui-même.
+  track_high_thresh: 0.30   # plancher de l'association principale
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
   # new_track_thresh — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15).
   #   valeur précédente : 0.7. Valeurs mesurées : 0,60 / 0,55 / 0,45.

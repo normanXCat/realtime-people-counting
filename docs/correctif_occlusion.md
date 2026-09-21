@@ -2569,3 +2569,120 @@ retirés.
 **Limites** : une image par seconde ; attribution visuelle dans une foule dense
 (incertitude d'environ ±1 personne par seconde) ; les boîtes couvrant deux
 personnes ne sont attribuées à personne.
+
+## 15.15 `track_high_thresh` 0,4 → **0,30** (décision du 2026-09-21)
+
+> Complément du lot 4, décidé par la personne responsable après le diagnostic
+> du §15.14. `PROVISOIRE`. **0,25 mesuré et écarté.**
+
+### 15.15.1 Mécanisme visé
+
+Vérifié dans le code d'Ultralytics 8.4.126 (`trackers/byte_tracker.py`) :
+
+- les pistes **perdues** ne participent qu'à la **première association**
+  (l. 282), qui ne reçoit que les détections ≥ `track_high_thresh` (l. 316) ;
+- le **second étage** confronte les détections faibles aux seules pistes
+  **encore suivies** (l. 427) ;
+- une piste n'est **créée** que si la confiance est ≥ `new_track_thresh`
+  (l. 479).
+
+À 0,30, une détection entre 0,30 et 0,40 peut donc rejoindre sa piste perdue,
+sans pouvoir créer d'identité : `new_track_thresh` reste à 0,60. L'invariant
+`new_track_thresh (0,60) ≥ track_high_thresh (0,30) > track_low_thresh (0,1) ≥
+model.confidence (0,10)` est tenu ; la configuration se valide sans
+avertissement.
+
+### 15.15.2 Mesure
+
+Relevés par seconde, base vidéo, `new_track_thresh` 0,60 dans les trois
+colonnes. Doublons et « net » : méthode du §15.12, classement visuel des
+paires nouvelles.
+
+**`fort_occ4`**
+
+| | 0,40 (avant) | **0,30** | 0,25 |
+|---|---|---|---|
+| `erreur_comptage_max_visible` brute / nette | 8 / 8 | **7 / 7** | 8 / 8 |
+| Somme des \|écarts visibles\| brute / nette | 99 / 102 | **95 / 100** | 96 / 105 |
+| Secondes où \|écart\| ≤ 1 (nettes, sur 35) | 13 | 13 | 13 |
+| `pistes_vues` min / max | 3 / 10 | 3 / 10 | 3 / 10 |
+| Fragmentation max / pistes surnuméraires | 4 / 12 | **2 / 7** | 2 / 5 |
+| `person_id` fragmentés | 9 | 7 | 5 |
+| `TECHNICAL_ID_CHANGED` | 14 | **6** | 6 |
+| `technical_ids` | 32 | 32 | 34 |
+| Identités créées | 22 | **29** | 31 |
+| … dont `reid_ambiguous_provisional` | 8 | **14** | 16 |
+| Doublons emboîtés | 4 | **8** | 12 |
+| `REID_AMBIGUOUS` / `PURGE` / `OCCLUDED` | 8 / 15 / 70 | 14 / 20 / 78 | 16 / 22 / 85 |
+| *`IN` / `OUT` / `NEW` / `occupancy_operational` — non interprété* | *6 / 0 / 5 / 14* | *7 / 0 / 8 / 18* | *6 / 0 / 8 / 17* |
+
+**Cas type du §15.14 — la personne assise à gauche, s26 à s35**
+
+| | s26 à s29 | s30 à s35 |
+|---|---|---|
+| 0,40 | suivie | **perdue** : sa piste passe sur l'enfant devant elle |
+| **0,30** | suivie | **suivie sans interruption, même piste technique**, détections entre 0,34 et 0,47 |
+| 0,25 | suivie à s26 seulement | perdue dès s27 : les détections de l'enfant (0,25 à 0,37) entrent en première association et prennent sa piste |
+
+**`rare_occ2`**
+
+| | 0,40 | **0,30** | 0,25 |
+|---|---|---|---|
+| Pistes visibles nettes, max (5 personnes réelles) | 5 | 5 | 5 |
+| Identités créées / `technical_ids` | 10 / 10 | 10 / 11 | 10 / 10 |
+| Doublons emboîtés | 7 | 9 | 7 |
+| Fragmentation max / pistes surnuméraires | 1 / 0 | 2 / 1 | 1 / 0 |
+
+### 15.15.3 Lecture et décision
+
+- **Continuité des pistes nettement meilleure** à 0,30 : les changements
+  d'identifiant technique sont divisés par plus de deux, la fragmentation est
+  presque divisée par deux, et le cas type est résolu.
+- **Gain modeste sur `visible_count`** : 8 → 7. Seule la part du diagnostic
+  entre 0,30 et 0,40 est concernée, et seulement quand une piste perdue est
+  assez proche pour être retrouvée.
+- **0,25 écarté** : pas de gain visible, 12 doublons, et le cas type redevient
+  un échec, parce que les détections faibles d'une personne voisine volent la
+  piste.
+
+### 15.15.4 Réserve inscrite — identités provisoires et doublons
+
+Acceptée par la personne responsable le 2026-09-21. **À traiter au lot 3.**
+
+| Ce qui se dégrade (0,40 → 0,30, `fort_occ4`) | |
+|---|---|
+| Identités créées | 22 → 29 |
+| … dont identités provisoires (`reid_ambiguous_provisional`) | 8 → 14 |
+| Doublons emboîtés | 4 → 8 |
+| `rare_occ2` : doublons / pistes surnuméraires | 7 → 9 / 0 → 1 |
+
+**Attribution** : le nombre d'identifiants techniques est inchangé (32). Les
+identités en plus ne viennent donc pas du tracker : ce sont surtout des
+identités **provisoires** de la galerie, créées quand l'appariement est ambigu.
+Interprétation, non vérifiée : les pistes vivent plus longtemps, la galerie
+compte donc plus de candidats simultanés, et le descripteur HSV ne les départage
+pas (§4.1.4 de `docs/diagnostic.md`). C'est exactement le périmètre du lot 3
+(descripteur OSNet, puis galerie multi-échantillons).
+
+### 15.15.5 Confirmation sur la configuration versionnée
+
+`scripts/measure_corpus.py` sans `--config`, une vidéo à la fois, seul sur la
+machine :
+
+| Vidéo | `technical_ids` / identités / `TECHNICAL_ID_CHANGED` / `IN` / `OUT` / `NEW` / `occupancy_operational` / `PURGE` / `OCCLUDED` / `STATE_TRANSITION` / `REID_AMBIGUOUS` | Contre le relevé à 0,30 | FPS moyen |
+|---|---|---|---|
+| `fort_occ4` | 32 / 29 / 6 / 7 / 0 / 8 / 18 / 20 / 78 / 248 / 14 | **identiques** | 3,320 |
+| `rare_occ2` | 11 / 10 / 1 / 4 / 0 / 2 / 6 / 2 / 15 / 104 / 4 | **identiques** | 3,821 |
+
+Critère FPS (≥ 3,06) tenu. La marge de `fort_occ4` (0,26 ips) reste dans le
+bruit de 0,5 à 1 ips relevé au §15.2 : non concluant sur une seule exécution,
+à surveiller au lot 3, qui ajoute un réseau par personne suivie.
+
+### 15.15.6 Tests
+
+Suite complète : **664 tests collectés, 663 passés, 1 ignoré** (`test_calibration_window.py:227`, serveur X, déjà ignoré), couverture **93,39 %**. Décompte réel (`grep -rc "^def test_" tests/`) : **469** fonctions sur **34** fichiers, inchangé. Deux tests corrigés, aucun ajouté :
+
+| Test | Correction | Raison |
+|---|---|---|
+| `test_config_validation.py::test_yolo_threshold_is_low_enough_for_the_tracker_low_stage` | attente `track_high_thresh` 0,4 → **0,30**, et ajout de l'invariant `track_low_thresh < track_high_thresh` | la valeur de production change par décision ; l'exigence de fond (ordre des seuils) est désormais vérifiée explicitement |
+| `test_track_loss_recovery.py::test_threshold_matrix_on_the_same_blurred_scenario`, cas `(0,10 ; 0,30 ; 0,12 ; False)` | `track_low_thresh` d'ablation 0,30 → **0,20** | le cas simulait un plancher d'association au-dessus du flou (0,12) ; avec `track_high_thresh` à 0,30, la valeur 0,30 viole l'ordre strict `track_low < track_high` validé par `src/config.py`, et le test levait une `ConfigError` au lieu de vérifier son scénario. 0,20 garde l'intention (au-dessus de 0,12, sous 0,30). Aucun test supprimé ni ignoré |

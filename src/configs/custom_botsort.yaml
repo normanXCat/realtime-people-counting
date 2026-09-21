@@ -20,7 +20,7 @@
 tracker_type: botsort
 
 # Association et conservation des pistes pendant les occlusions.
-track_high_thresh: 0.4
+track_high_thresh: 0.30  # lot 4, PROVISOIRE — valeur précédente 0.4 (voir pipeline.yaml)
 track_low_thresh: 0.1
 new_track_thresh: 0.60   # lot 4, PROVISOIRE — valeur précédente 0.7
 track_buffer: 150

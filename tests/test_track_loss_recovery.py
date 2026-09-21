@@ -545,7 +545,10 @@ def association_gate(config, detections):
     [
         (0.25, 0.10, 0.12, False),  # ancien réglage : perte à l'inférence
         (0.10, 0.10, 0.12, True),  # réglage retenu : piste maintenue
-        (0.10, 0.30, 0.12, False),  # seuil tracker trop haut exigé pour associer
+        # track_low 0,30 -> 0,20 au lot 4 : track_high_thresh vaut désormais 0,30 et
+        # l'ordre strict track_low < track_high est validé ; 0,20 reste au-dessus du
+        # flou (0,12), ce que ce cas vérifie.
+        (0.10, 0.20, 0.12, False),  # seuil tracker trop haut exigé pour associer
         (0.10, 0.10, 0.08, False),  # sous le plancher d'exploitation du tracker
     ],
 )
@@ -560,7 +563,7 @@ def test_threshold_matrix_on_the_same_blurred_scenario(
     ==================  ==============  ==============  =================
     0,25                0,10            0,12            non (filtrée amont)
     0,10                0,10            0,12            oui
-    0,10                0,30            0,12            non (seuil tracker)
+    0,10                0,20            0,12            non (seuil tracker)
     0,10                0,10            0,08            non (sous le plancher)
     ==================  ==============  ==============  =================
 
