@@ -87,6 +87,7 @@ from geometry import (
 )
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
+from second_trace import SecondTraceUnavailable, SecondTracer, source_fps
 from track_diagnostics import (
     BOXES_EMPTY,
     BOXES_MISSING,
@@ -147,6 +148,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
              "fournie subit exactement la même validation que la ligne cliquée.",
     )
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
+    parser.add_argument(
+        "--trace-per-second", action="store_true",
+        help="Outillage de mesure : relevé de l'état du pipeline à la première "
+             "frame de chaque seconde vidéo (trace_per_second.jsonl + images), "
+             "pour le rattachement à la vérité terrain. Fichier vidéo uniquement.",
+    )
     parser.add_argument("--max-frames", type=int, default=None, help="Arrêt après N frames (diagnostic)")
     parser.add_argument("--model", default=None, help="Surcharge du chemin des poids YOLO")
     parser.add_argument("--conf", type=float, default=None, help="Surcharge du seuil de confiance")
@@ -601,6 +608,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.close()
         return 3
 
+    # Relevé par seconde (outillage de vérité terrain) : lecture seule, jamais
+    # consulté par le comptage. Refusé sur caméra plutôt que produit faux.
+    second_tracer: SecondTracer | None = None
+    if args.trace_per_second:
+        try:
+            second_tracer = SecondTracer(session_root, source_fps(source))
+        except SecondTraceUnavailable as error:
+            print(f"[TRACE] {error}", file=sys.stderr)
+            logger.close()
+            return 2
+
     logger.emit(
         "SESSION_START",
         0.0,
@@ -789,6 +807,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             diagnostics=diagnostics,
             identity_totals={"technical_ids": 0, "persons_created": 0},
         )
+        if second_tracer is not None:
+            second_tracer.close()
         logger.close()
         return 5
 
@@ -974,6 +994,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
 
             occupancy.process_frame(detections, frame, timestamp_s, frame_index)
+            if second_tracer is not None:
+                second_tracer.observe(
+                    frame_index, frame, occupancy,
+                    (d.technical_track_id for d in detections),
+                )
 
             # Totaux d'identité cumulés (lot 0, schéma de mesure §0.2). Relevés
             # ici parce que les identités expirées disparaissent de l'état du
@@ -1053,6 +1078,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[CONTROL] Interruption clavier : arrêt propre")
     finally:
+        if second_tracer is not None:
+            second_tracer.close()
         if writer is not None:
             writer.release()
         if display_enabled:
