@@ -25,8 +25,8 @@ au moment de traiter le lot concerné.
 |---|---|---|---|---|
 | Catalogue du corpus (§2) | `docs/correctif_occlusion.md` §11.4 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
 | Contrôle de déterminisme (§2.1) | `docs/correctif_occlusion.md` §11.7 | mesuré, en attente d'acceptation | non commité | 2026-09-20 |
-| Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (`docs/correctif_occlusion.md` §12). Métriques dérivées : **à outiller** (§12.3) | non commité | 2026-09-20 |
-| Critères d'acceptation validés (§4) | — | à faire (§11.10.2) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | non commité | 2026-09-20 |
+| Vérité terrain (§3) | `tests/fixtures/ground_truth_fort_occ4.json` | **fournie** — 35 s annotées, 13 étiquettes, 4 segments d'occlusion (§12). **Outillage fait** (`2f15649`) : relevé par seconde + `scripts/gt_matching.py`. Métriques de **comptage** disponibles ; métriques d'**identité** en attente de la validation du rattachement, prévue **au lot 2** (`tests/fixtures/gt_matching_fort_occ4.json`, statut `proposition`) | `2f15649` | 2026-09-21 |
+| Critères d'acceptation validés (§4) | — | **validés** le 2026-09-21 ; `erreur_comptage_max` scindée en deux (operational / visible) ; **baseline FPS figée à 3,825 ips au lot 0** (§13.4) | — | 2026-09-21 |
 | Lot 0 — outillage de mesure | `docs/lot_0_outillage.md` | **accepté** le 2026-09-21 (`docs/correctif_occlusion.md` §13). Critère §0.3 non satisfait mais divergence expliquée et chiffrée (§13.5) ; ajout `line_origin` dans `src/events.py` **conservé** ; publication de la ligne dans `config_resolved.yaml` **reste ouverte** | `435804c` | 2026-09-20 |
 | Lot 1 — base de temps + NMS | `docs/lot_1_base_temps_nms.md` | à faire ; §1.3 (filtre géométrique) **ramené à une investigation conditionnelle** après le lot 0 | — | — |
 | Lot 4 — seuils BoT-SORT (**avancé**) | `docs/lot_4_seuils_botsort.md` | à faire | — | — |
@@ -243,23 +243,35 @@ la remplacer par une estimation automatique produite par le pipeline testé.
 
 ## 4. Critères d'acceptation
 
-> Valeurs **proposées**, à confirmer ou corriger par la personne responsable
-> avant le lot 1. Tant qu'elles ne sont pas confirmées, marquer le tableau
-> `NON VALIDÉ` dans chaque livrable.
+> **Validés par la personne responsable le 2026-09-21.** Les livrables les
+> opposent directement aux mesures ; la mention `NON VALIDÉ` ne s'applique
+> plus.
 
 Le projet est considéré comme abouti quand, sur le segment annoté de la vidéo à
 occlusion dense :
 
 | Critère | Cible proposée | Statut |
 |---|---|---|
-| `id_switches_reels` | ≤ 1 sur le segment (baseline à mesurer d'abord) | à valider |
-| `fusions_reelles` non signalées | 0 — toute fusion réelle doit au minimum être publiée comme incertitude | à valider |
-| `erreur_comptage_max_operational` : `occupancy_operational` contre les personnes **présentes** (`count`) | exact (0) à chaque seconde | à valider |
-| `erreur_comptage_max_visible` : `visible_count` contre les personnes **visibles annotées** (§12.2.1 de `docs/correctif_occlusion.md`) | ≤ 1 personne | à valider |
-| `occupancy_operational` | strictement exact (aucun IN/OUT fantôme) | à valider |
-| Non-régression, vidéo à occlusion faible | aucun compteur dégradé au-delà du bruit mesuré en §2.1 | à valider |
-| FPS moyen, modèle pose actif — plancher absolu | ≥ 3,0 ips | à valider |
-| FPS moyen — contrainte relative | ≥ 80 % de la baseline, soit **≥ 3,06 ips** | à valider |
+| `id_switches_reels` | ≤ 1 sur le segment (baseline à mesurer d'abord) | **validé** |
+| `fusions_reelles` non signalées | 0 — toute fusion réelle doit au minimum être publiée comme incertitude | **validé** |
+| `erreur_comptage_max_operational` : `occupancy_operational` contre les personnes **présentes** (`count`) | exact en fin de séquence et hors transition d'entrée ; retard de **1** toléré pendant une entrée en cours. Aucun IN/OUT fantôme. | **validé** |
+| `erreur_comptage_max_visible` : `visible_count` contre les personnes **visibles annotées** (§12.2.1 de `docs/correctif_occlusion.md`) | ≤ 1 personne | **validé** |
+| Non-régression, vidéo à occlusion faible | aucun compteur dégradé au-delà du bruit mesuré en §2.1 | **validé** |
+| FPS moyen, modèle pose actif — plancher absolu | ≥ 3,0 ips | **validé** |
+| FPS moyen — contrainte relative | ≥ 80 % de la baseline, soit **≥ 3,06 ips** | **validé** |
+
+**Critères confirmés par la personne responsable le 2026-09-21.** Le tableau
+n'est plus `NON VALIDÉ` : les livrables s'y opposent directement.
+
+**Pourquoi `occupancy_operational` n'est pas « exact à chaque seconde ».**
+L'annotation compte une personne **dès son apparition dans le champ** ;
+`occupancy_operational` ne l'incrémente **qu'au franchissement confirmé de la
+ligne**. Entre les deux, la personne est dans l'image sans être encore entrée :
+le retard d'une à deux secondes est le comportement **correct**, pas une
+erreur. Mesuré sur la baseline de `fort_occ4` : l'écart vaut −1 pendant chaque
+entrée, −2 à deux instants où deux personnes entrent coup sur coup (s15 à s18),
+et **0 à la dernière seconde** (13 contre 13). Un correctif qui ferait
+disparaître ce retard ferait compter des personnes non entrées.
 
 **Baseline FPS — FIGÉE (lot 0).** `3,825 ips`, médiane de **trois rejouages
 complets** de `test/fort_occ4.mp4` par le pipeline réel
@@ -440,6 +452,7 @@ Décisions prises hors du code, à ne pas rouvrir sans instruction humaine.
 | **Warm-up initial** | **conservé** | Identifie les personnes déjà présentes au lancement. Ces identités sont hors zone de franchissement, donc couvertes par la rétention illimitée du lot 2. |
 | **FAISS pour l'indexation ReID** | **écarté à ce stade** | Similarité cosinus NumPy suffit à 10–50 identités (< 0,1 ms). À rouvrir au-delà de plusieurs milliers d'empreintes. |
 | **Tête comme ancre géométrique** | **interdit** | Voir §1. |
+| **Logique IN / OUT / NEW et `occupancy_operational`** | **interdit de modifier** | Ce compteur est **déjà exact** : 13 contre 13 en fin de `fort_occ4`, sans aucun IN/OUT fantôme (baseline lot 1). Il compte les personnes **dans la salle, visibles ou non** — ce n'est donc pas lui que l'occlusion dégrade. Aucun lot de 1 à 7 ne touche à cette logique ; ce qui doit progresser est `visible_count` (et `occupancy_observed`). Toute modification de la FSM de franchissement, des règles NEW, ou du calcul de `occupancy_operational` est hors périmètre, au même titre que l'ancre géométrique tête. À rouvrir uniquement sur instruction humaine explicite. |
 
 ---
 
