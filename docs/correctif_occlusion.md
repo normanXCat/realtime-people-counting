@@ -2528,3 +2528,44 @@ track_high_thresh` qu'il vérifie est inchangé (0,60 ≥ 0,4).
 5. **Correction apportée au §15.12.3, point 2**, dans le même commit que cette
    section : la première version affirmait sans vérification qu'une signature
    « bord haut partagé » épargnerait le cas de l'enseignant ; c'est faux (s6).
+
+## 15.14 Diagnostic préalable au lot 2 — pourquoi les personnes ne sont pas redétectées
+
+> Lecture seule, aucun correctif. Configuration en vigueur (`new_track_thresh`
+> 0,60). Script et images : `results/lot4/diag_redetection.py`,
+> `results/lot4/diag/` (non versionnés : personnes identifiables).
+
+**Méthode.** Pour chaque seconde de `fort_occ4`, à l'image relevée :
+inférence YOLO brute avec les réglages du pipeline, `conf` abaissé à 0,01 ;
+retrait des détections déjà portées par une piste vue ; localisation à l'œil de
+chaque personne visible annotée sans piste, et meilleure détection à son
+emplacement. « Manquantes » = visibles annotées − pistes visibles, doublons
+retirés.
+
+| Cas | s20 à s28 (52 manquantes) | s29 à s34 (16) |
+|---|---|---|
+| Détectée ≥ 0,60 (pas bloquée par un seuil) | 0 | 1 |
+| Détectée entre 0,40 et 0,60 : bloquée par `new_track_thresh` | 6 (12 %) | 5 (31 %) |
+| Détectée entre 0,10 et 0,40 : bloquée **aussi** par `track_high_thresh` (0,40) | 27 (52 %) | 8 (50 %) |
+| Détectée sous 0,10 seulement (écartée par `model.confidence`) | 11 (21 %) | 2 (12 %) |
+| Aucune détection, même à 0,01 | 1 (2 %) | 0 |
+| Non localisée à l'œil (s20 à s23, foule très dense) | 7 (13 %) | 0 |
+
+**Lecture.**
+
+- **Le premier frein est le seuil de création du tracker, pas le détecteur** :
+  63 % des manquantes de s20 à s28, 81 % en fin de vidéo, sont détectées mais
+  sous 0,60. La part du détecteur (sous 0,10 ou rien) est de 23 % puis 12 %.
+- **La moitié des cas est sous 0,40**, donc hors de portée de
+  `new_track_thresh` seul : la validation de la configuration impose
+  `new_track_thresh ≥ track_high_thresh`.
+- **Cas type du symptôme d'origine** : la femme en rouge assise à gauche. Elle
+  est visible de s30 à s35 et détectée entre 0,34 et 0,47 à chaque seconde,
+  mais n'a jamais de piste. Sa piste (`person_id` 19) a sauté sur l'enfant
+  assis devant elle à s30.
+- **Part du détecteur** : surtout la posture, par exemple la personne accroupie
+  sous une table de s23 à s28 (0,04 à 0,06, ou rien).
+
+**Limites** : une image par seconde ; attribution visuelle dans une foule dense
+(incertitude d'environ ±1 personne par seconde) ; les boîtes couvrant deux
+personnes ne sont attribuées à personne.
