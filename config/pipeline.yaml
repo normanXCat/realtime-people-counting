@@ -338,7 +338,16 @@ reid:
     # boîtes se touchent ou se recouvrent — là où les inversions se produisent —
     # quand les deux personnes ont déjà un descripteur de galerie. Réservé à la
     # correction, jamais écrit en galerie (découpe prise pendant un croisement).
-    describe_on_proximity: true
+    # DÉSACTIVÉ le 2026-09-21 (valeur précédente : true), décision de la personne
+    # responsable après mesure (docs/correctif_occlusion.md §17.8) : sur
+    # fort_occ4 et rare_occ2, 0 inversion corrigée, avec les marges actuelles
+    # comme recalibrées ; aucun croisement validé ne ressemble à une inversion
+    # (écart croisé - direct toujours < -0,03). Coût : 1 366 descripteurs sur
+    # fort_occ4 (~20 ms par image en moyenne) et étape reid à 67 ms au p95, qui
+    # rapprochait rare_occ2 du plancher FPS (3,09 ips). Le mécanisme reste
+    # disponible et testé ; à réévaluer sur une vidéo contenant de vraies
+    # inversions entre pistes proches.
+    describe_on_proximity: false
     # Marge autour de chaque boîte, en fraction de sa hauteur (0 = contact ou
     # recouvrement strict). PROVISOIRE, non calibré.
     proximity_margin_ratio: 0.0

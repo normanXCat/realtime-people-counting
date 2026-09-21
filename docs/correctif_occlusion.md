@@ -2940,3 +2940,144 @@ l'histogramme) : elle est verte. Deux tests ont été ajustés pour l'activation
   la cohérence de la configuration ; or cet avertissement dépend de
   l'environnement (poids non versionné), et il est éprouvé dans
   `tests/test_reid_deep_lot3a.py`.
+
+## 17.8 Marges, déclencheur de proximité et métriques d'identité (2026-09-21)
+
+### 17.8.1 Recalibrage des marges — mesuré, **marges inchangées**
+
+**Simulation hors ligne** : 204 découpes des lignes validées, 13 étiquettes ;
+galerie simulée par le dernier descripteur antérieur de chaque étiquette ;
+filtre spatio-temporel du pipeline.
+
+- `safety_margin` : 174 décisions au-dessus du seuil de 0,66 (166 correctes,
+  8 incorrectes). À 0,10, 74 % des correctes et 25 % des incorrectes sont
+  rattachées ; à 0,05, 87 % et 50 %.
+- `swap_correction.margin` : sur 73 croisements validés (boîtes en contact),
+  δ = croisé − direct est **toujours négatif** (médiane −0,378, maximum
+  −0,031). Aucun croisement réel ne ressemble à une inversion. À 0,12 : 0 %
+  de fausses corrections, 94,5 % des inversions simulées détectées.
+
+**Dans le pipeline** (`fort_occ4`), variantes M1 (0,05 / 0,12), M2 (0,07 /
+0,12) et M3 (0,05 / 0,08), contre 0,10 / 0,12 :
+
+| | 0,10 / 0,12 | M1 | M2 | M3 |
+|---|---|---|---|---|
+| Identités créées | 31 | 30 | 30 | 30 |
+| `REID_AMBIGUOUS` | 13 | 12 | 12 | 12 |
+| `IDENTITY_SWAP_CORRECTED` | 0 | 0 | 0 | 0 |
+| Pistes surnuméraires | 2 | 2 | 2 | 2 |
+| `visible_count` (erreur max / somme) | 7 / 95 | 7 / 95 | 7 / 95 | 7 / 95 |
+
+`rare_occ2` : identités 10 → 9, `REID_AMBIGUOUS` 1 → 0, aucune correction.
+
+**Pourquoi la marge ne change presque rien.** Dans le pipeline, l'écart entre
+le meilleur candidat et le second vaut **0,001 à 0,044** pour 12 des 13
+ambiguïtés. La galerie réelle compte jusqu'à 15 candidats, dont les
+descripteurs sont rarement rafraîchis. La simulation en comptait un par
+étiquette, avec un descripteur récent. **La marge protège** : sur les 13
+ambiguïtés, le candidat en tête n'est la bonne personne que dans **2 cas sur
+10** jugeables. La baisser produirait surtout des rattachements faux.
+
+**Décision de la personne responsable : marges inchangées** (`safety_margin`
+0,10, `swap_correction.margin` 0,12).
+
+### 17.8.2 Déclencheur de proximité — **désactivé**
+
+`describe_on_proximity: true → false`. Aucune inversion corrigée sur les deux
+vidéos, avec les marges actuelles comme avec les marges recalibrées. Coût :
+1 366 descripteurs sur `fort_occ4` (environ 20 ms par image en moyenne) et
+étape `reid` à 67 ms au p95, contre 15 ms sans lui. Le mécanisme reste
+disponible et testé ; à réévaluer sur une vidéo contenant de vraies inversions
+entre deux pistes vivantes proches.
+
+### 17.8.3 Confirmation sur la configuration versionnée (`soutenance-osnet2`)
+
+| Vidéo | Compteurs (`technical_ids` / identités / `TECHNICAL_ID_CHANGED` / `REID_AMBIGUOUS` / `IDENTITY_SWAP_CORRECTED`) | FPS moyen, seul sur la machine |
+|---|---|---|
+| `fort_occ4` | 32 / 31 / 3 / 13 / 0 | 3,474 |
+| `rare_occ2` | 11 / 10 / 1 / 1 / 0 | **2,746**, puis rejoué : **4,134** et **4,046** (compteurs identiques) |
+
+Le 2,746 venait d'une charge extérieure au pipeline (navigateur actif pendant
+la mesure). Les deux rejouages tiennent le critère (≥ 3,06). **Leçon** : une
+mesure de FPS isolée n'est pas probante sur cette machine ; il faut au moins
+trois rejouages et la médiane, comme au lot 0.
+
+Descripteurs sur `fort_occ4` : 184 (aucun pour la correction), 13,8 ms en
+moyenne ; étape `reid` à 15 ms au p95. Tests : **684 collectés, 683 passés,
+1 ignoré**, couverture **93,70 %**.
+
+### 17.8.4 Métriques d'identité — correspondance complète
+
+La correspondance est **validée** (planches p0 à p4 ; deux lignes exclues, non
+tranchées : `person_id` 17 à s19 et `person_id` 6 à s14). Fichier :
+`results/gt_matching_fort_occ4_seuils.json` (non versionné). « Avant » = relevé
+de la configuration `soutenance-seuils` (histogramme). « Après » = relevé de
+`soutenance-osnet2`, étiqueté **par transfert** (IoU > 0,5 à la même seconde) :
+248 boîtes sur 250. Deux boîtes restent sans étiquette : s14 `person_id` 14
+(aucune boîte ancienne à IoU > 0,5) et s19 `person_id` 19 (ligne exclue).
+
+**Deux comptages, et pourquoi le second fait foi.** `scripts/gt_matching.py`
+donne 42 (avant) et 43 (après). Ce chiffre est **gonflé par un artefact** :
+quand deux `person_id` portent la même personne à la même seconde (les
+doublons, par exemple P2 = `person_id` 26 et 27), le script ne garde qu'une
+ligne par seconde. Il compte alors une « inversion » à chaque alternance.
+Le comptage robuste (`results/lot4/identity_mechanisms.py`) ne compte un
+changement que si **aucun** identifiant de la seconde précédente ne continue,
+et compte les doublons à part.
+
+| Métrique (`fort_occ4`, 35 s, 13 personnes) | Avant (histogramme) | Après (OSNet) | Cible §4 |
+|---|---|---|---|
+| `id_switches_reels` (tous changements d'identifiant) | 36 | 36 | ≤ 1 |
+| … dont **inversions** (l'identifiant portait une autre personne) | **14** | **13** | — |
+| … dont nouvelles identités (fragments de la même personne) | 18 | 18 | — |
+| … dont retours à une identité antérieure | 4 | 5 | — |
+| `fragments_par_personne` : max / total pour 13 personnes | 9 / 52 | 9 / 51 | — |
+| Doublons (secondes où deux identifiants portent la même personne) | 23 | 23 | — |
+| `fusions_reelles` / dont signalées | 1 / **0** | 1 / **0** | 0 non signalée |
+| Comptage de `gt_matching.py` (avec l'artefact) | 42 | 43 | — |
+
+La fusion réelle (s12, `person_id` 2 : P8, P5 et P1) n'est **pas signalée** :
+les seuls `POSSIBLE_MULTI_PERSON_BOX` autour de s12 concernent une autre boîte
+(piste 1, embrasure). Le critère du §4 n'est tenu ni avant ni après.
+
+### 17.8.5 Mécanisme de chaque inversion restante (après, 13)
+
+| Personne | Seconde | Identifiant : ancien → nouveau | Mécanisme |
+|---|---|---|---|
+| P4 | s5 → s6 | 5 → 3 | échange entre deux pistes proches (portait P3) |
+| P4 | s7 → s8 | 3 → 7 | échange entre deux pistes proches (portait P3) |
+| P1 | s10 → s11 | 4 → 2 | reprise d'une piste perdue sur une autre personne (portait P5) |
+| P7 | s10 → s11 | 6 → 4 | échange entre deux pistes proches (portait P1) |
+| P3 | s10 → s13 | 3 → 11 | échange entre deux pistes proches (portait P4) |
+| P8 | s13 → s14 | 8 → 2 | échange entre deux pistes proches (portait P5) |
+| P11 | s16 → s17 | 17 → 11 | reprise d'une piste perdue sur une autre personne (portait P10) |
+| P2 | s17 → s18 | 1 → 4 | échange entre deux pistes proches (portait P7) |
+| P6 | s16 → s18 | 10 → 12 | échange entre deux pistes proches (portait P9) |
+| P11 | s22 → s23 | 11 → 22 | reprise d'une piste perdue sur une autre personne (portait P6) |
+| P1 | s20 → s24 | 18 → 23 | reprise d'une piste perdue sur une autre personne (portait P5) |
+| P12 | s24 → s25 | 17 → 11 | échange entre deux pistes proches (portait P10) |
+| P12 | s25 → s26 | 11 → 13 | échange entre deux pistes proches (portait P4) |
+
+**Bilan : 9 échanges entre pistes proches, 4 reprises d'une piste perdue.**
+Les 13 se produisent **au niveau de la piste technique** : l'identifiant
+BoT-SORT glisse d'une personne à l'autre, et l'identité, verrouillée sur la
+piste (`technical_track_locked`), suit. Aucune n'est décidée par la galerie.
+
+**Ce qu'OSNet a changé.** La seule inversion décidée au niveau de l'identité
+avant (s27, P11 ↔ P12, la fausse correction de swap de l'histogramme) a
+disparu. Les 4 rattachements faux de la galerie de l'histogramme ont aussi
+disparu (§17.4). Le reste est inchangé : il se joue dans le tracker, en amont.
+
+**Pourquoi la correction de swap ne les rattrape pas**, même alimentée par le
+déclencheur de proximité. Elle compare deux pistes vivantes, chacune rattachée
+à une identité dotée d'un descripteur de galerie. Or ces glissements ont lieu
+surtout dans l'embrasure et au passage des rangées : détections faibles (sous
+`gallery_min_confidence` 0,70, donc sans descripteur), personnes entrées
+depuis peu (galerie vide), et l'une des deux pistes est souvent perdue ou
+recréée au même moment. Non vérifié cas par cas.
+
+**Ce lot ne rapproche pas `id_switches_reels` de la cible du §4 (≤ 1).** Il
+supprime les erreurs propres à la couche d'identité ; celles du tracker
+demanderaient d'agir sur l'association de BoT-SORT (seuils ou ReID natif), sur
+la galerie multi-échantillons (3.b, reportée) ou sur la détection elle-même
+(§8, détection têtes / haut du corps, en réserve).
