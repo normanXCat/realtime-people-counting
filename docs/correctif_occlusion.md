@@ -1903,14 +1903,19 @@ reste sur stderr, dans les logs, et la base retenue est publiée dans
 # 15. Lot 4 — seuils BoT-SORT
 
 > **Statut : mesuré, en attente d'acceptation.** Un seul seuil est modifié :
-> `tracker.new_track_thresh` 0,7 → **0,45** (`PROVISOIRE`). `match_thresh` est
-> mesuré et **écarté** ; `proximity_thresh` est mesuré et **non appliqué**, à
-> reprendre après le lot 3.
+> `tracker.new_track_thresh` 0,7 → **0,60** (`PROVISOIRE`), décision de la
+> personne responsable du 2026-09-21 après mesure de 0,60, 0,55 et 0,45
+> (**§15.13**, qui remplace les §15.7 à §15.9 pour la valeur appliquée).
+> `match_thresh` est mesuré et **écarté** ; `proximity_thresh` est mesuré et
+> **non appliqué**, à reprendre après le lot 3. Le filtre d'inclusion est
+> **écarté** (§15.12).
 >
-> **Le critère de non-régression du §4 n'est pas tenu sur `rare_occ2`** :
-> 7 → 12 identités créées, dont des pistes visibles en double (§15.5). La
-> valeur appliquée améliore la vidéo principale au prix de la vidéo de
-> contrôle. C'est à la personne responsable de trancher (§15.9).
+> **Réserve inscrite** : la non-régression de `rare_occ2` n'est pas tenue
+> (identités 7 → 10, doublons 1 → 7) ; elle est **acceptée en connaissance
+> de cause**, car la mesure qui compte s'améliore : 5 personnes réelles vues
+> sur 5 au lieu de 4 (§15.13.3).
+>
+> *Les §15.1 à §15.11 décrivent la première passe, qui avait appliqué 0,45.*
 
 > **Mention de portée.** Mesuré sur `test/fort_occ4.mp4` (mesure principale,
 > 1 055 frames, 35,2 s, 13 personnes annotées, 4 segments d'occlusion dont 3 de
@@ -2352,9 +2357,171 @@ antérieure. Le constat ci-dessus ne dépend pas de cette explication.
    directement sur ce cas, §14.6).
 2. Sur les détections brutes, la boîte tête-épaules est incluse à 100 % dans
    la boîte entière et partage son bord haut. C'est une signature plus étroite
-   que l'inclusion seule, qui écarterait sans doute le cas de l'enseignant
-   (bords hauts éloignés). **Elle n'a pas été mesurée.** Si elle devait l'être,
-   ce serait au lot 5 (retouches locales), et après le lot 3.
+   que l'inclusion seule, mais **elle ne suffirait pas** à épargner le cas de
+   l'enseignant : à s6 de `rare_occ2`, l'enfant placé derrière lui a le même
+   bord haut que sa boîte (156 px pour les deux). *Correction : la première
+   version de ce paragraphe affirmait le contraire sans l'avoir vérifié.*
+   **Non mesurée.** Si elle devait l'être, ce serait au lot 5 (retouches
+   locales), et après le lot 3.
 3. Ces boîtes tête-épaules sont précisément ce que le §8 de `CLAUDE.md` met
    en réserve (« détection dédiée têtes / haut du corps »). Elles sont ici un
    sous-produit non voulu de `yolo11n`, pas une détection dédiée.
+
+## 15.13 Décision du 2026-09-21 : `new_track_thresh` = **0,60**
+
+> **Ce paragraphe remplace les §15.7 à §15.9 pour la valeur appliquée.** Ces
+> sections restent en place parce qu'elles documentent la mesure à 0,45 ; la
+> valeur en vigueur est 0,60 (`PROVISOIRE`).
+
+La personne responsable a demandé deux valeurs de plus, 0,55 et 0,60, puis a
+retenu **0,60** : le gain visible réel est acquis dès 0,60, et descendre plus
+bas quadruple les doublons pour un gain marginal.
+
+### 15.13.1 Mesure de 0,60 et 0,55
+
+Relevés par seconde, base vidéo, lancés en parallèle (les compteurs sont
+déterministes, §15.2). Le FPS de ces exécutions n'est pas utilisé ; celui de
+0,60 est donné par la confirmation du §15.13.4. « Doublons emboîtés » : paires
+de boîtes vues incluses à plus de 80 % l'une dans l'autre, classées à l'œil
+comme deux boîtes sur **la même** personne (méthode du §15.12). « Net » : après
+retrait de ces doublons.
+
+**`fort_occ4`**
+
+| | 0,7 (avant) | **0,60** | 0,55 | 0,45 |
+|---|---|---|---|---|
+| `erreur_comptage_max_visible` brute / nette | 9 / 9 | **8 / 8** | 7 / 7 | 7 / 7 |
+| Somme des \|écarts visibles\|, brute / nette | 143 / 144 | **99 / 102** | 88 / 94 | 77 / 81 |
+| Secondes où \|écart\| ≤ 1 (nettes, sur 35) | 12 | **13** | 14 | 17 |
+| Surcompte visible maximal (brut) | +1 | **+1** | +1 | +2 |
+| `visible_count` brut à s16 / s20 / s24 / s28 | 7 / 5 / 3 / 2 | **8 / 6 / 4 / 5** | 9 / 6 / 5 / 5 | 10 / 7 / 5 / 6 |
+| `visible_count` net de s29 à s34 (10 à 11 visibles annotées) | 4–5 | **7–9** | 7–9 | 8–10 |
+| `pistes_vues` min / max | 2 / 9 | **3 / 10** | 3 / 11 | 3 / 13 |
+| **Doublons emboîtés** | 1 | **4** | 7 | 16 |
+| Personnes réelles emboîtées (masquées derrière une autre) | 2 | 7 | 8 | 8 |
+| Identités créées | 18 | **22** | 27 | 38 |
+| `technical_ids` | 21 | **32** | 38 | 46 |
+| Fragmentation max / pistes surnuméraires | 5 / 6 | **4 / 12** | 4 / 14 | 4 / 11 |
+| `person_id` fragmentés / identifiants techniques partagés | 3 / 2 | **9 / 3** | 8 / 3 | 9 / 2 |
+| `TECHNICAL_ID_CHANGED` | 6 | **14** | 15 | 12 |
+| `TRACK_ID_APPEARANCE_DISCONTINUITY` | 1 | **4** | 4 | 5 |
+| `IDENTITY_SWAP_CORRECTED` | 0 | **0** | 0 | 0 |
+| `REID_AMBIGUOUS` | 4 | **8** | 14 | 22 |
+| `PURGE` | 14 | **15** | 18 | 28 |
+| `OCCLUDED` | 52 | **70** | 78 | 84 |
+| `POSSIBLE_MULTI_PERSON_BOX` | 55 | **66** | 66 | 52 |
+| `INCONSISTENT_STATE` | 9 | **13** | 11 | 20 |
+| `DETECTION_REJECTED_GEOMETRY` | 0 | **0** | 0 | 0 |
+| *`IN` / `OUT` / `NEW` — non interprété* | *2 / 0 / 7* | ***6 / 0 / 5*** | *7 / 0 / 10* | *8 / 0 / 7* |
+| *`occupancy_operational` / `observed` — non interprété* | *12 / 2* | ***14 / 7*** | *20 / 7* | *18 / 6* |
+| *`erreur_comptage_max_operational` — non interprété* | *4* | ***4*** | *7* | *5* |
+
+**`rare_occ2`** (pas de vérité terrain ; 5 personnes réellement visibles à s20,
+comptées à l'œil)
+
+| | 0,7 (avant) | **0,60** | 0,55 | 0,45 |
+|---|---|---|---|---|
+| Pistes visibles à s20, brutes / nettes | 4 / 4 | **7 / 5** | 7 / 5 | 7 / 5 |
+| Pistes visibles au maximum, brutes / nettes | 5 / 4 | **7 / 5** | 7 / 5 | 7 / 5 |
+| **Doublons emboîtés** | 1 | **7** | 9 | 11 |
+| Identités créées / `technical_ids` | 7 / 7 | **10 / 10** | 10 / 11 | 12 / 12 |
+| Pistes surnuméraires (relevé par seconde) | 0 | **0** | 1 | 0 |
+| `TECHNICAL_ID_CHANGED` | 0 | **0** | 1 | 0 |
+| `REID_AMBIGUOUS` | 0 | **4** | 4 | 6 |
+| `PURGE` | 2 | **2** | 2 | 3 |
+| `OCCLUDED` | 6 | **13** | 18 | 20 |
+| `INCONSISTENT_STATE` | 0 | **1** | 1 | 1 |
+| *`IN` / `OUT` / `NEW` — non interprété* | *4 / 1 / 2* | ***4 / 1 / 2*** | *6 / 3 / 2* | *5 / 2 / 2* |
+| *`occupancy_operational` / `observed` — non interprété* | *5 / 3* | ***5 / 3*** | *5 / 3* | *5 / 2* |
+
+### 15.13.2 Lecture
+
+- **Le gain visible réel est acquis dès 0,60.** Une fois les doublons retirés,
+  les trois valeurs abaissées voient les 5 personnes de `rare_occ2`, là où la
+  production en voit 4. Sur `fort_occ4`, 0,60 fait passer la fin de séquence
+  de 4–5 à 7–9 personnes nettes, et 0,45 n'ajoute qu'une personne nette de plus
+  (8–10).
+- **Le coût croît vite sous 0,60** : doublons emboîtés 4 → 7 → 16 sur
+  `fort_occ4`, identités 22 → 27 → 38.
+- **Sur `rare_occ2`, les doublons apparaissent dès 0,60** (1 → 7), toujours sur
+  les deux mêmes garçons (boîte partielle, sans les pieds, dans la boîte
+  entière). Aucune des trois valeurs ne les évite.
+- **Écart résiduel** : `erreur_comptage_max_visible` vaut 8 à 0,60 pour une
+  cible ≤ 1. Le creux se situe entre s20 et s28 (4 à 7 personnes vues pour 10 à
+  12 visibles, écart maximal à s23–s24 : 4 pour 12). Ce lot ne l'atteint pas.
+
+### 15.13.3 Réserve inscrite — non-régression de `rare_occ2`
+
+**Acceptée en connaissance de cause par la personne responsable
+(2026-09-21).** Au sens strict du §4 (« aucun compteur dégradé au-delà du
+bruit », bruit nul en base vidéo), la non-régression de `rare_occ2` **n'est pas
+tenue** à 0,60 :
+
+| Ce qui se dégrade | 0,7 → 0,60 |
+|---|---|
+| Identités créées | 7 → 10 |
+| Doublons emboîtés (pistes visibles en double) | 1 → 7 |
+| Pistes visibles au maximum, brutes | 5 → 7, pour 5 personnes |
+| `OCCLUDED` / `REID_AMBIGUOUS` | 6 → 13 / 0 → 4 |
+
+| Ce qui s'améliore — la mesure qui compte | 0,7 → 0,60 |
+|---|---|
+| Personnes réellement présentes et suivies, à s20 | **4 sur 5 → 5 sur 5** |
+
+**Condition de réouverture** : un correctif des doublons tête-épaules / boîte
+partielle (§15.12.3, point 2), s'il est traité au lot 5, doit ramener les
+doublons emboîtés de `rare_occ2` près de leur niveau de production (1) sans
+reperdre la cinquième personne. Sinon, la réserve reste ouverte jusqu'à la
+clôture et doit figurer dans `docs/rapport_final.md`.
+
+### 15.13.4 Confirmation sur la configuration versionnée
+
+`scripts/measure_corpus.py`, **sans** `--config`, donc `config/pipeline.yaml` et
+`src/configs/custom_botsort.yaml` tels que commités, une vidéo à la fois, seul
+sur la machine :
+
+| Vidéo | Compteurs (`technical_ids` / identités / `TECHNICAL_ID_CHANGED` / `PURGE` / `OCCLUDED` / `STATE_TRANSITION` / `IN` / `OUT` / `NEW` / `occupancy_operational`) | Contre le relevé à 0,60 | FPS moyen |
+|---|---|---|---|
+| `fort_occ4` | 32 / 22 / 14 / 15 / 70 / 218 / 6 / 0 / 5 / 14 | **identiques** | 3,737 |
+| `rare_occ2` | 10 / 10 / 0 / 2 / 13 / 91 / 4 / 1 / 2 / 5 | **identiques** | 3,191 ; rejoué : **4,151** (compteurs identiques) |
+
+La configuration versionnée reproduit exactement la variante mesurée.
+
+**FPS** : le 3,191 de la première exécution sur `rare_occ2` n'est qu'à 0,13 ips
+du plancher relatif de 3,06. Le rejouage donne 4,151 avec les mêmes compteurs :
+c'est le bruit de 0,5 à 1 ips déjà relevé au §15.2, pas un effet du seuil.
+**Critère FPS tenu** sur toutes les exécutions du lot (minimum 3,191), mais
+avec une marge qu'une exécution unique ne suffit pas à établir. Pour le
+lot 6, où la marge est faible, il faudra plusieurs rejouages par mesure de FPS.
+
+### 15.13.5 Seuils — état final du lot 4
+
+| Paramètre | Avant | Après | Statut |
+|---|---|---|---|
+| `tracker.new_track_thresh` (`config/pipeline.yaml` **et** `src/configs/custom_botsort.yaml`) | 0.7 | **0.60** | `PROVISOIRE` — calibré sur l'ensemble de test ; valeurs 0,55 et 0,45 mesurées et écartées |
+| `tracker.match_thresh` | 0.9 | 0.9 | 0,75 mesuré et écarté |
+| `tracker.proximity_thresh` | 0.5 | 0.5 | 0,8 mesuré, **à reprendre après le lot 3** |
+| Filtre géométrique, `timing.confirmation_seconds` | — | inchangés | report du garde-fou documenté, mesuré inefficace contre les doublons |
+| Filtre d'inclusion (§15.12) | — | non implémenté | **écarté** |
+
+### 15.13.6 Tests
+
+Suite complète : **664 tests collectés, 663 passés, 1 ignoré** (`test_calibration_window.py:227`, serveur X, déjà ignoré), couverture **93,39 %**. Décompte réel (`grep -rc "^def test_" tests/`) : **469** fonctions sur **34** fichiers, inchangé.
+
+Un seul test ajusté, le même qu'au §15.10.1 :
+`test_config_validation.py::test_yolo_threshold_is_low_enough_for_the_tracker_low_stage`.
+Son attente passe de 0,45 à **0,60**, pour la même raison (la valeur de
+production change par décision). L'invariant `new_track_thresh >=
+track_high_thresh` qu'il vérifie est inchangé (0,60 ≥ 0,4).
+
+### 15.13.7 Ce qui reste non résolu (complète le §15.11)
+
+1. **`erreur_comptage_max_visible` = 8** (cible ≤ 1) : creux entre s20 et s28.
+2. **Doublons tête-épaules** : 4 sur `fort_occ4` et 7 sur `rare_occ2` à 0,60.
+   Leur origine est établie (§15.12.3), aucun correctif n'est fait.
+3. **Réserve de non-régression de `rare_occ2`** (§15.13.3), ouverte.
+4. **`proximity_thresh`** à reprendre après le lot 3. **Métriques d'identité**
+   toujours non publiées (rattachement à valider au lot 2).
+5. **Correction apportée au §15.12.3, point 2**, dans le même commit que cette
+   section : la première version affirmait sans vérification qu'une signature
+   « bord haut partagé » épargnerait le cas de l'enseignant ; c'est faux (s6).
