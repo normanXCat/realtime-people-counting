@@ -176,3 +176,58 @@ def test_comptage_compare_chaque_compteur_a_son_referentiel(truth):
     assert counting["erreur_comptage_max_operational"] == 0
     assert counting["erreur_comptage_max_visible"] == 0
     assert counting["par_seconde"][2]["visibles_annotees"] == 1
+
+
+def test_fragmentation_de_piste_sans_rattachement():
+    """Une personne logique qui traverse plusieurs identifiants techniques.
+
+    Mesure disponible **sans** validation du rattachement aux étiquettes
+    humaines : c'est ce qui la rend utilisable dès les lots 1 et 4. Cas repris
+    de la baseline de `fort_occ4`, où `person_id` 5 passe par les identifiants
+    techniques 5, 7 puis 9.
+    """
+    trace = [
+        _trace_row(3, [_person(5, technical_id=5)]),
+        _trace_row(4, [_person(5, technical_id=5)]),
+        _trace_row(7, [_person(5, technical_id=7)]),
+        _trace_row(9, [_person(5, technical_id=9), _person(6, technical_id=6)]),
+    ]
+
+    frag = gt_matching.track_fragmentation(trace)
+
+    # La séquence ne répète pas un identifiant inchangé d'une seconde à l'autre.
+    assert frag["sequences_technical_ids"][5] == [5, 7, 9]
+    assert frag["technical_ids_distincts_par_person_id"] == {5: 3, 6: 1}
+    assert frag["fragmentation_max"] == 3
+    assert frag["person_ids_fragmentes"] == [5]
+    # Trois pistes pour une personne = deux pistes surnuméraires.
+    assert frag["pistes_surnumeraires"] == 2
+
+
+def test_identifiant_technique_partage_est_signale():
+    """Le phénomène symétrique : un identifiant technique repris par deux personnes."""
+    trace = [
+        _trace_row(0, [_person(1, technical_id=3)]),
+        _trace_row(5, [_person(2, technical_id=3)]),
+    ]
+
+    frag = gt_matching.track_fragmentation(trace)
+
+    assert frag["technical_ids_partages"] == {3: [1, 2]}
+    # Vu du côté person_id, aucune fragmentation : les deux mesures sont
+    # distinctes et ne se déduisent pas l'une de l'autre.
+    assert frag["fragmentation_max"] == 1
+
+
+def test_piste_sans_identifiant_technique_ignoree():
+    """Une piste occultée (identifiant -1) ne compte pas comme un fragment."""
+    trace = [
+        _trace_row(0, [_person(1, technical_id=4)]),
+        _trace_row(1, [_person(1, technical_id=-1)]),
+        _trace_row(2, [_person(1, technical_id=4)]),
+    ]
+
+    frag = gt_matching.track_fragmentation(trace)
+
+    assert frag["sequences_technical_ids"][1] == [4]
+    assert frag["pistes_surnumeraires"] == 0

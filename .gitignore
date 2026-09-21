@@ -19,6 +19,12 @@ data/videos/
 # responsable (voir docs/correctif_occlusion.md §12.1).
 annotation/
 results/
+# Relevés par seconde et propositions de rattachement NON agrégés : ils
+# portent les boîtes englobantes des personnes des vidéos ci-dessus, donc le
+# même régime de confidentialité. Seule la version agrégée (compteurs par
+# seconde, sans tableau « persons ») est versionnée.
+tests/fixtures/trace_baseline_fort_occ4.jsonl
+tests/fixtures/gt_matching_*.json
 
 # Médias et fragments temporaires
 *.mp4

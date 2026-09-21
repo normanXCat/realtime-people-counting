@@ -28,18 +28,23 @@ elle est déposée dans le fichier de proposition, sous ``non_visibles``, pour
 Entrée : ``trace_per_second.jsonl`` écrit par ``src/main.py --trace-per-second``
 (le pipeline réel, jamais un rejeu), et ``tests/fixtures/ground_truth_*.json``.
 
+**Confidentialité** : le relevé complet et le fichier de correspondance portent
+les boîtes englobantes des personnes filmées. Ils restent dans ``results/``,
+non versionné, comme ``test/`` et ``annotation/``. Seule une trace **agrégée**
+(compteurs par seconde, sans le tableau ``persons``) est versionnée.
+
 Usage
 -----
 
     python scripts/gt_matching.py propose \\
         --trace results/<session>/trace_per_second.jsonl \\
         --ground-truth tests/fixtures/ground_truth_fort_occ4.json \\
-        --out tests/fixtures/gt_matching_fort_occ4.json
+        --out results/gt_matching_fort_occ4.json
 
     python scripts/gt_matching.py metrics \\
         --trace results/<session>/trace_per_second.jsonl \\
         --ground-truth tests/fixtures/ground_truth_fort_occ4.json \\
-        --matching tests/fixtures/gt_matching_fort_occ4.json
+        --matching results/gt_matching_fort_occ4.json
 """
 
 from __future__ import annotations
@@ -210,6 +215,58 @@ def visible_labels(truth: dict, matching: dict) -> dict[int, set[str]]:
     }
 
 
+def track_fragmentation(trace: list[dict]) -> dict:
+    """Fragmentation de piste — **sans aucun rattachement humain**.
+
+    Deux grandeurs symétriques, toutes deux lisibles dans le seul relevé par
+    seconde :
+
+    - ``technical_ids_par_person_id`` : une personne logique qui traverse
+        plusieurs identifiants BoT-SORT a vu sa piste mourir et renaître. Sur la
+        baseline de ``fort_occ4``, ``person_id 5`` passe par 5, 7, 9, 11 puis
+        12 : cinq pistes pour une personne.
+    - ``person_ids_par_technical_id`` : un identifiant technique réutilisé par
+        plusieurs personnes logiques. C'est le même phénomène vu de l'autre
+        côté, et il ne se déduit pas du premier.
+
+    Aucune de ces deux mesures ne dépend de la validation du rattachement aux
+    étiquettes humaines : c'est ce qui les rend utilisables dès les lots 1 et 4.
+    Elles ne les remplacent pas — elles ignorent les swaps entre deux personnes
+    qui gardent chacune leur identifiant.
+    """
+    par_person: dict[int, list[int]] = defaultdict(list)
+    par_technique: dict[int, set[int]] = defaultdict(set)
+    for row in trace:
+        for person in row["persons"]:
+            if not person["seen_this_frame"]:
+                continue
+            technical = int(person["technical_track_id"])
+            if technical < 0:
+                continue
+            person_id = int(person["person_id"])
+            # Séquence sans répétition consécutive : on veut les changements,
+            # pas une ligne par seconde.
+            if not par_person[person_id] or par_person[person_id][-1] != technical:
+                par_person[person_id].append(technical)
+            par_technique[technical].add(person_id)
+
+    sequences = {pid: seq for pid, seq in sorted(par_person.items())}
+    distincts = {pid: len(set(seq)) for pid, seq in sequences.items()}
+    partages = {
+        tid: sorted(pids)
+        for tid, pids in sorted(par_technique.items())
+        if len(pids) > 1
+    }
+    return {
+        "sequences_technical_ids": sequences,
+        "technical_ids_distincts_par_person_id": distincts,
+        "fragmentation_max": max(distincts.values(), default=None),
+        "person_ids_fragmentes": sorted(pid for pid, n in distincts.items() if n > 1),
+        "pistes_surnumeraires": sum(max(0, n - 1) for n in distincts.values()),
+        "technical_ids_partages": partages,
+    }
+
+
 def counting_metrics(trace: list[dict], truth: dict, matching: dict) -> dict:
     """Métriques de comptage : aucun rattachement nécessaire."""
     present = {int(e["seconde"]): int(e["count"]) for e in truth["secondes"]}
@@ -309,6 +366,7 @@ def cmd_metrics(args: argparse.Namespace) -> int:
         "matching": str(args.matching).replace("\\", "/"),
         "statut_matching": matching.get("statut"),
         "comptage": counting_metrics(trace, truth, matching),
+        "fragmentation": track_fragmentation(trace),
     }
     if matching.get("statut") == VALIDATED:
         report["identite_person_id"] = identity_metrics(matching, "person_id")
@@ -335,6 +393,14 @@ def cmd_metrics(args: argparse.Namespace) -> int:
     print(
         f"[MÉTRIQUES] pistes_vues : min {counting['pistes_vues_min']}, "
         f"max {counting['pistes_vues_max']} (diagnostic, sans cible)"
+    )
+    frag = report["fragmentation"]
+    print(
+        f"[MÉTRIQUES] fragmentation de piste : max {frag['fragmentation_max']} "
+        f"identifiants techniques pour un person_id, "
+        f"{frag['pistes_surnumeraires']} pistes surnuméraires, "
+        f"{len(frag['technical_ids_partages'])} identifiant(s) technique(s) "
+        "partagé(s) par plusieurs person_id"
     )
     if "identite" in report:
         print(f"[MÉTRIQUES] {report['identite']}")
