@@ -2686,3 +2686,66 @@ Suite complète : **664 tests collectés, 663 passés, 1 ignoré** (`test_calibr
 |---|---|---|
 | `test_config_validation.py::test_yolo_threshold_is_low_enough_for_the_tracker_low_stage` | attente `track_high_thresh` 0,4 → **0,30**, et ajout de l'invariant `track_low_thresh < track_high_thresh` | la valeur de production change par décision ; l'exigence de fond (ordre des seuils) est désormais vérifiée explicitement |
 | `test_track_loss_recovery.py::test_threshold_matrix_on_the_same_blurred_scenario`, cas `(0,10 ; 0,30 ; 0,12 ; False)` | `track_low_thresh` d'ablation 0,30 → **0,20** | le cas simulait un plancher d'association au-dessus du flou (0,12) ; avec `track_high_thresh` à 0,30, la valeur 0,30 viole l'ordre strict `track_low < track_high` validé par `src/config.py`, et le test levait une `ConfigError` au lieu de vérifier son scénario. 0,20 garde l'intention (au-dessus de 0,12, sous 0,30). Aucun test supprimé ni ignoré |
+
+---
+
+# 16. Lot 3 — préparation de l'environnement 3.a (aucune intégration)
+
+> Préparation demandée par la personne responsable le 2026-09-21, avant le
+> lot 2 : **ordre du §0 de `CLAUDE.md` modifié sur instruction**. Rien n'est
+> câblé dans le pipeline, aucune configuration n'est modifiée.
+
+## 16.1 Poids OSNet-x0.25 — provenance et empreintes (§2 de `CLAUDE.md`)
+
+| Fichier (non versionné, `models/`) | Source | SHA-256 |
+|---|---|---|
+| `osnet_x0_25_msmt17.pth` (3,06 Mo) | model zoo de torchreid (deep-person-reid, K. Zhou), Google Drive, identifiant `1sSwXSUlj4_tHZequ_iZ8w_Jh0VaRQMqF`, téléchargé avec `gdown` 6.4.0 | `6f57607fed9f502b9efed546108132ee715df5a5b6e6932c6269bacb47f59f99` |
+| `osnet_x0_25_msmt17.onnx` (0,89 Mo) | export local, `torch.onnx.export`, opset 17, lot dynamique | `cc81cd1a28c5588010a662d544d6e88593fe73b542e114c4d1dd70e890b82e16` |
+| `osnet_x0_25_msmt17_int8.onnx` (0,62 Mo) | `onnxruntime.quantization.quantize_dynamic`, poids QInt8 | `ab20208142e9fcebe1a7c751745541069b12dacfab805a390d966796239e2b93` |
+
+Vérification du checkpoint : architecture OSNet-x0.25 (canaux 16 / 64 / 96 /
+128, vecteur de 512), et classifieur de **1 041** classes, soit le nombre
+d'identités d'entraînement de MSMT17. Le classifieur est écarté à l'export :
+seul le vecteur de 512 sert à la ré-identification.
+
+L'architecture est chargée directement depuis `torchreid/reid/models/osnet.py`
+(paquet `torchreid` 0.2.5 installé sans dépendances). Son `__init__` importe
+`tensorboard`, qui n'est pas installé. Script : `results/lot4/osnet_export.py`
+(non versionné).
+
+## 16.2 Environnement
+
+`onnx` 1.23.0, `onnxruntime` 1.30.0, `gdown` 6.4.0 et `torchreid` 0.2.5
+(`--no-deps`) ajoutés à l'environnement Python ; `torch` 2.13.0+cpu inchangé.
+**Aucun fichier de dépendances du dépôt n'est modifié** : ce sera à faire à
+l'intégration.
+
+## 16.3 Contrôle d'équivalence et coût (CPU, entrée 256 × 128)
+
+| Modèle | Cosinus contre PyTorch (8 découpes) | ms par découpe | ms par lot de 8 |
+|---|---|---|---|
+| ONNX FP32 | **1,00000** | **10,1** | 79,7 |
+| ONNX INT8 dynamique | 0,98614 | 54,2 | 427,5 |
+
+- **L'INT8 dynamique est à écarter** : plus lent et moins fidèle. Sur ce CPU,
+  la quantification dynamique des convolutions n'est pas accélérée. Une
+  quantification statique, calibrée sur de vraies découpes, reste possible
+  mais n'a pas été essayée.
+- **Budget FPS, point d'attention pour 3.a** : à 10 ms par découpe, décrire
+  10 personnes à chaque frame coûte environ 100 ms. Avec une frame d'environ
+  260 ms aujourd'hui (3,8 ips), le FPS tomberait vers 2,8 ips, sous le plancher
+  de 3,06. L'intégration devra donc limiter les découpes décrites (par exemple
+  seulement à l'insertion en galerie et à la ré-identification), et non les
+  décrire à chaque frame. Mesures faites sur des entrées aléatoires : le coût
+  réel reste à mesurer avec le profileur du pipeline, comme le prévoit la
+  fiche.
+
+## 16.4 Constat sur le code existant, pour l'intégration
+
+`DeepAppearanceExtractor` (`src/identity_manager.py:172`) appelle
+`torchreid.models.build_model(name=..., pretrained=True)`. Cela charge des
+poids **ImageNet** (classification), pas des poids de ré-identification. De
+plus, `reid.external_reid.model_path` n'est lu nulle part hors de
+`src/config.py`. Tel quel, activer `external_reid` n'utiliserait donc pas les
+poids MSMT17. L'intégration 3.a devra charger l'ONNX ci-dessus, comme le
+prévoit la fiche (`backend: onnxruntime`).
