@@ -2252,3 +2252,109 @@ aucune décision automatique.
    `config_resolved.yaml` (lot 0) ; `bootstrap_frames` est encore en frames
    (lot 1, dette du lot 2) ; `track_buffer_seconds` 15,0 est toujours
    `PROVISOIRE`.
+
+## 15.12 Filtre « boîte incluse dans une boîte plus confiante » — **écarté**
+
+> **Décision de la personne responsable, 2026-09-21 : écarté, chiffres à
+> l'appui.** Simulation en lecture seule, **aucun correctif** : aucune ligne de
+> code ni de configuration n'a été modifiée pour cette section.
+
+### 15.12.1 Ce qui a été simulé
+
+La règle simulée : supprimer toute boîte vue incluse à **plus de 80 %** dans une
+autre boîte vue de la même frame et **plus confiante**. Elle vise les doublons
+du §15.5, c'est-à-dire une boîte partielle emboîtée dans la boîte entière de la
+même personne.
+
+- **Données** : les relevés par seconde avec `new_track_thresh` 0,45 (36 frames
+  de `fort_occ4`, 25 de `rare_occ2`), sur les boîtes que le pipeline associe aux
+  pistes. C'est une **approximation** d'un filtre réel, qui agirait sur chaque
+  frame et en amont du tracker ; retirer une détection change aussi le suivi
+  des frames suivantes, ce que la simulation ne reproduit pas.
+- **Classement doublon / personne réelle** : à l'œil, sur des découpes de la
+  vidéo brute où la boîte incluse et la boîte hôte sont tracées
+  (`results/lot4/filtre_*_p*.jpg`, non versionnés : personnes identifiables).
+  Deux cas sur 46 sont incertains et signalés.
+- Scripts ad hoc, non versionnés : `results/lot4/filter_candidates.py`,
+  `filter_missed.py`, `filter_effect.py`, `label_pairs.py`.
+
+### 15.12.2 Résultat à 0,45
+
+| | `fort_occ4` | `rare_occ2` |
+|---|---|---|
+| Boîtes que le filtre supprimerait | 22 | 24 |
+| … dont **doublons** (suppression correcte) | **15** (1 incertain) | **9** |
+| … dont **personnes réelles** (suppression à tort) | **7** (1 incertain) | **15** |
+| Doublons laissés en place (la boîte partielle est la plus confiante) | 1 sur 16 | 2 sur 11 |
+| Somme des écarts visibles à la vérité terrain | 77 → **89** (pire) | — |
+| Secondes où \|écart visible\| ≤ 1 | 20 → **15** | — |
+| Pistes visibles au maximum | — | 7 → 5 |
+
+**Qui sont les personnes supprimées à tort :**
+
+- **`rare_occ2`** : pour 13 des 15, la boîte hôte est celle de l'**enseignant,
+  filmé de dos au premier plan**. Sa boîte couvre presque la moitié de l'image,
+  donc tout enfant placé derrière lui y est inclus. Les deux autres sont une
+  enfant derrière un camarade, à deux secondes différentes.
+- **`fort_occ4`** : des personnes debout dans l'embrasure ou assises au fond,
+  masquées par quelqu'un qui passe devant elles.
+
+**Même à 0,7, le filtre ferait des dégâts** : sur `fort_occ4`, il supprimerait 2
+personnes réelles et aucun doublon ; sur `rare_occ2`, 14 personnes réelles
+pour 1 doublon.
+
+**Conclusion.** Le critère « incluse + moins confiante » ne distingue pas un
+doublon d'une personne masquée derrière une autre. Le masquage est justement
+la situation que le projet doit traiter (§1 de `CLAUDE.md`). Sur la scène
+calme, le filtre ferait plus de mal que de bien. **Écarté.**
+
+### 15.12.3 Origine des doublons de `fort_occ4` : le détecteur, pas une piste Kalman
+
+Sur `fort_occ4`, la plupart des doublons ne ressemblent pas à des boîtes
+« haut du corps ». Ce sont **deux pistes aux boîtes quasi identiques** (IoU des
+boîtes publiées : 0,75 à 0,95) sur la même personne assise : l'homme au t-shirt
+vert (`technical_track_id` 50 et 55, s29 à s35) et la jeune femme en rouge (49
+et 56, s31 à s35). Une NMS à 0,55 aurait dû en supprimer une. Hypothèse
+examinée : une piste perdue maintenue par le filtre de Kalman pendant qu'une
+nouvelle naît sur la même personne.
+
+**Hypothèse réfutée.** Vérification en lecture seule
+(`results/lot4/dup_origin.py`) : `seen_this_frame` des deux pistes, puis
+inférence YOLO **brute** sur les mêmes frames, avec les réglages du pipeline
+(`conf` 0,10, `iou` 0,55, `imgsz` 960, classe 0).
+
+| Constat | Mesure |
+|---|---|
+| `seen_this_frame` des deux pistes de chaque doublon | **vrai pour les deux, dans les 16 cas** : aucune n'est une piste maintenue sans observation |
+| Détections brutes de YOLO sur la personne | **deux par frame** : une boîte **entière** (hauteur ≈ 150 à 200 px) et une boîte **tête-épaules** (hauteur ≈ 70 à 85 px, une fois 123 px), dont le haut coïncide avec celui de la boîte entière |
+| IoU entre ces deux détections | **0,31 à 0,50** : sous `nms_iou` 0,55, la NMS les conserve **toutes les deux** |
+| Confiance des détections tête-épaules | 0,13 à 0,59, donc au-dessus de 0,45 pour une partie d'entre elles : elles créent une piste |
+| Piste associée à la détection tête-épaules | identifiée par sa confiance (exemple à s30 : piste 50, confiance 0,591 = détection tête-épaules 0,59 ; piste 55, 0,367 = détection entière 0,37) |
+| Boîte **publiée** pour cette piste | **pleine hauteur** (s30, piste 50 : `[988, 377, 1052, 537]`, alors que sa détection vaut `[988, 377, 1052, 448]`) |
+
+**Ce que cela établit.** Le doublon **naît dans le détecteur** : deux boîtes
+par personne assise, trop peu recouvrantes pour la NMS. Il **devient une
+piste** parce que `new_track_thresh` est abaissé. Le tracker ne le crée pas, il
+le **masque** : la boîte publiée pour la piste tête-épaules garde la hauteur
+d'une personne entière. C'est pour cela que ces doublons apparaissent comme
+« quasi identiques » dans le relevé, et non comme emboîtés.
+
+**Déduit, non vérifié dans le code d'Ultralytics** : la boîte publiée semble
+être l'état lissé du filtre de Kalman de la piste, et non la détection
+associée. La hauteur lissée de la piste 50 conserverait ainsi une valeur
+antérieure. Le constat ci-dessus ne dépend pas de cette explication.
+
+**Conséquences pour une suite éventuelle, sans correctif ici :**
+
+1. Remonter `nms_iou` n'aide pas, puisque les deux boîtes sont sous 0,55.
+   L'abaisser jusqu'à 0,30 les fusionnerait, mais supprimerait aussi des
+   personnes réelles côte à côte (le lot 1 a montré que la NMS agit
+   directement sur ce cas, §14.6).
+2. Sur les détections brutes, la boîte tête-épaules est incluse à 100 % dans
+   la boîte entière et partage son bord haut. C'est une signature plus étroite
+   que l'inclusion seule, qui écarterait sans doute le cas de l'enseignant
+   (bords hauts éloignés). **Elle n'a pas été mesurée.** Si elle devait l'être,
+   ce serait au lot 5 (retouches locales), et après le lot 3.
+3. Ces boîtes tête-épaules sont précisément ce que le §8 de `CLAUDE.md` met
+   en réserve (« détection dédiée têtes / haut du corps »). Elles sont ici un
+   sous-produit non voulu de `yolo11n`, pas une détection dédiée.
