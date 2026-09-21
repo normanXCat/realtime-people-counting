@@ -1409,3 +1409,437 @@ Aucun test n'a été supprimé, aucun n'a été passé en `skip`.
    session 0, dont le §13.5 montre qu'il divergeait du pipeline. **Ils devront
    être recalculés avec le pipeline réel avant d'être opposés aux critères du
    §4.** Le relevé par seconde reste à refaire dans ces conditions.
+
+---
+
+# 14. Lot 1 — base de temps, `track_buffer` en secondes, seuil NMS
+
+> **Mention de portée.** Mesuré sur `test/fort_occ4.mp4` (mesure principale,
+> 1 055 frames, 35,2 s) et `test/rare_occ2.mp4` (non-régression), ligne figée
+> `--line 0.05,0.6,0.95,0.6` (`CLAUDE.md` §2). Le corpus contient **13
+> personnes annotées, 4 segments d'occlusion documentés dont 3 de plus de 3 s**
+> (§12). Les métriques d'**identité** (`id_switches_reels`,
+> `fragments_par_personne`, `fusions_reelles`) ne sont **pas** publiées ici : le
+> rattachement `person_id` ↔ étiquettes est une proposition non validée, et sa
+> validation est reportée au lot 2 (décision de la personne responsable,
+> 2026-09-21). Ce lot se mesure donc sur les compteurs internes et sur les
+> métriques de **comptage** de la vérité terrain.
+
+## 14.1 Outillage ajouté avant le lot (commits `2f15649`, `5aeb689`)
+
+| Élément | Rôle |
+|---|---|
+| `src/second_trace.py` + `src/main.py --trace-per-second` | Relevé de l'état du pipeline à la première frame de chaque seconde **vidéo**, plus une image par seconde. Lecture seule : aucune logique de comptage. |
+| `scripts/gt_matching.py` | Propose le rattachement `person_id` ↔ `P1…P13`, chaque ligne portant sa méthode et sa confiance ; **refuse** de publier les métriques d'identité tant que le fichier ne porte pas `statut: valide`. |
+| `tests/fixtures/trace_baseline_fort_occ4.jsonl` | Relevé de référence **avant** le lot 1. |
+| `tests/fixtures/gt_matching_fort_occ4.json` | Proposition de rattachement, **non validée** : 8 `person_id` sur 17 rattachés, 5 étiquettes orphelines, 2 rattachements automatiques contredits par l'inspection des découpes. |
+
+La seconde vidéo est dérivée de l'**index de frame** (`frame k × fps_source`),
+jamais de l'horloge du pipeline : c'est ce qui permet de comparer le relevé aux
+images `annotation/t{k+1}.jpg` quelle que soit la base de temps interne.
+
+## 14.2 Ce qui a été changé dans le code
+
+### 14.2.1 §1.0 — une seule horloge, choisie par la source
+
+`src/main.py` horodatait **toutes** ses observations sur `time.perf_counter()`,
+y compris sur fichier vidéo (`src/main.py:913` avant ce lot). Désormais :
+
+| Source | Base retenue (`timing.time_base: auto`) | Horodatage |
+|---|---|---|
+| Fichier vidéo | `video` | `(frame_index − 1) / fps_source` |
+| Caméra | `wall` | `time.perf_counter() − start` |
+
+- `video` et `wall` restent forçables, pour comparer les deux régimes.
+- La base retenue est **publiée** dans `summary.json` (`time_base`) et dans
+  `config_resolved.yaml` ; elle est affichée au démarrage (`[TEMPS] base=…`).
+- **Le budget de frames suit la même base** : en base vidéo il est calculé une
+  fois sur la cadence source (5 s de grâce = 150 frames à 30 ips), au lieu
+  d'être recalculé à chaque frame sur le FPS de traitement (≈ 19 frames à
+  3,8 ips). C'est le mécanisme précis que le §13.5 avait identifié comme cause
+  de la divergence du harnais de session 0.
+- Si le FPS de la source est illisible, le pipeline retombe sur la base murale
+  **en le journalisant** (`CONFIG_WARNING`, code `time_base_video_unavailable`) :
+  aucune cadence n'est devinée.
+
+Le FPS de **traitement** continue d'être mesuré sur l'horloge murale et publié
+à part : c'est une propriété de la machine, pas de la scène, et le critère FPS
+du §4 s'y oppose inchangé.
+
+### 14.2.2 §1.1 — `track_buffer` exprimé en secondes
+
+`tracker.track_buffer_seconds: 15.0` (`PROVISOIRE`) devient la valeur de
+référence ; `track_buffer` en frames en est **déduit** au démarrage, une seule
+fois, par `track_buffer_frames_from_seconds()` — une seule implémentation pour
+les deux sources, car deux arrondis divergents donneraient deux horizons
+différents pour la même configuration.
+
+| Source | FPS de conversion | Moment | Mécanisme |
+|---|---|---|---|
+| Fichier | cadence de la source (connue d'avance) | avant le premier appel au tracker | copie `tracker_resolved.yaml` dans la session, lue par Ultralytics |
+| Caméra | FPS mesuré sur `fps_warm_up_frames` (60) | une fois, après le warm-up | ajustement de `max_time_lost` sur le tracker vivant |
+
+- **Aucune réévaluation continue** : sur caméra le FPS dérive, et réévaluer
+  changerait l'horizon du tracker sans prévenir — le défaut même qu'on corrige.
+- Valeur convertie journalisée en INFO, et en `CONFIG_WARNING` si elle sort de
+  `[15, 1200]` frames (avertir, pas refuser).
+- Si `track_buffer_seconds` vaut `null`, repli sur la valeur en frames avec un
+  `CONFIG_WARNING` explicite (compatibilité ascendante).
+- Si Ultralytics ne se laisse pas ajuster (structure interne absente), la
+  valeur du YAML reste en vigueur et l'échec est journalisé : la mesure est
+  dégradée, le comptage ne l'est pas.
+
+**Écart assumé avec la fiche** : elle prévoyait de mesurer le FPS sur
+`fps_warm_up_frames` dans tous les cas. Sur fichier, la cadence est connue
+d'avance et le tracker est construit **avant** la première frame : attendre
+60 frames pour convertir laisserait le tracker tourner 60 frames avec le mauvais
+horizon. La conversion y est donc faite avant le premier appel.
+
+### 14.2.3 §1.2 — seuil NMS : valeur réellement en vigueur
+
+La fiche demandait de **relever** la valeur appliquée avant de la changer, 0,7
+n'étant que le défaut Ultralytics. Relevé :
+
+| Source | Clé | Valeur |
+|---|---|---|
+| `config/pipeline.yaml:33` | `model.nms_iou` | **0,55** — marquée `PROVISOIRE — à calibrer` |
+| `src/main.py` (appel `model.track`) | `iou=config.model.nms_iou` | la même, aucune valeur codée en dur |
+
+**Le point de départ n'est donc pas 0,7 mais 0,55**, c'est-à-dire un seuil
+*plus* agressif que le défaut : deux boîtes qui se recouvrent à plus de 55 %
+sont réduites à une seule avant que le tracker les voie. Sur des personnes
+assises côte à côte, c'est précisément la configuration qui détruit une
+détection valide. L'écart à mesurer (0,55 → 0,85) est donc plus grand que ce que
+la fiche supposait.
+
+## 14.3 Mesure — compteurs internes, avant / après §1.0 + §1.1
+
+Protocole : `scripts/measure_corpus.py`, donc `src/main.py` en sous-processus,
+ligne `0.05,0.6,0.95,0.6`, un rejouage par ligne. « Avant » = `HEAD` au commit
+`2f15649` (outillage seul, aucun seuil métier modifié), mesuré dans un worktree
+séparé pour que l'écriture du code du lot ne perturbe pas la mesure.
+
+### 14.3.1 Mesure principale — `fort_occ4`
+
+| Compteur | Avant (base murale) | Après (base vidéo) | Écart | Significatif ? (§13.5.1) |
+|---|---|---|---|---|
+| `occupancy_operational` | 14 | **12** | −2 | oui (seuil ≥ 1) |
+| `occupancy_observed` | 4 | 2 | −2 | oui |
+| `OUT` | 1 | **0** | −1 | oui |
+| `NEW` | 9 | 7 | −2 | oui |
+| `TECHNICAL_ID_CHANGED` | 9 | **6** | −3 | oui |
+| `PURGE` | 20 | 14 | −6 | oui (seuil ≥ 3) |
+| `POSSIBLE_MULTI_PERSON_BOX` | 58 | 55 | −3 | oui |
+| `OCCLUDED` | 49 | 52 | +3 | oui |
+| `INCONSISTENT_STATE` | 4 | 9 | +5 | oui |
+| `REID_MATCH` | 9 | 6 | −3 | oui |
+| `REID_NEW` | 16 | 18 | +2 | oui |
+| `long_gaps_count` | 1 | 0 | −1 | non (bruit ±3) |
+| `OCCUPANCY_SNAPSHOT` | 273 | 36 | −237 | mécanique, voir ci-dessous |
+| FPS moyen | 3,559 | **3,816** | +0,257 | ≥ 3,06 : critère tenu |
+
+**`OCCUPANCY_SNAPSHOT` n'est pas une dégradation** : `snapshot_interval_seconds`
+vaut 1,0 s. En base murale, 35 s de vidéo traitées en ≈ 290 s murales
+produisaient ≈ 273 instantanés ; en base vidéo, elles en produisent 36, soit un
+par seconde **de scène**. C'est le comportement attendu, et c'est la
+démonstration la plus directe que l'horloge a changé de référentiel.
+
+**Le `OUT` fantôme disparaît.** La vérité terrain ne contient **aucune sortie**
+sur les 35 secondes (§12.1) ; la baseline en produisait une, le pipeline corrigé
+n'en produit aucune. C'est le seul compteur de ce tableau qui se compare
+directement à une observation humaine, et il va dans le bon sens.
+
+### 14.3.2 Non-régression — `rare_occ2`
+
+| Compteur | Avant | Après | Écart |
+|---|---|---|---|
+| `IN` / `OUT` / `NEW` | 4 / 1 / 2 | **4 / 1 / 2** | 0 |
+| `occupancy_operational` | 5 | 5 | 0 |
+| `occupancy_observed` | 3 | 3 | 0 |
+| `technical_ids` / `persons_created` | 7 / 7 | 7 / 7 | 0 |
+| `TECHNICAL_ID_CHANGED` | 1 | **0** | −1 |
+| `INCONSISTENT_STATE` | 1 | 0 | −1 |
+| `PURGE` | 2 | 2 | 0 |
+| FPS moyen | 3,836 | 3,712 | −0,124 (≥ 3,06) |
+
+**Aucun compteur dégradé au-delà du bruit** : le critère de non-régression du
+§4 est tenu sur cette vidéo. Le seul écart net est favorable (un changement
+d'identifiant technique en moins).
+
+## 14.4 §1.3 — investigation du filtre géométrique : **aucun correctif appliqué**
+
+La fiche prescrivait de trancher entre trois hypothèses avant de toucher à quoi
+que ce soit. Elles le sont.
+
+### 14.4.1 Hypothèse 1 (artefact du harnais) — **écartée pour les rejets**
+
+| Mesure sur `fort_occ.mp4` | Session 0 (harnais ad hoc) | Lot 1 (pipeline réel) |
+|---|---|---|
+| `DETECTION_REJECTED_GEOMETRY` | 235 | **235** |
+| dont `aspect_ratio_out_of_range` | 235 | **235** |
+| `POSSIBLE_MULTI_PERSON_BOX` | 0 | **6** |
+
+Les 235 rejets sont **réels** : ils se retrouvent au rejet près sur le pipeline
+réel. En revanche le « 0 fusion » de la session 0 était bien un artefact : le
+pipeline en signale 6. La nuance compte — le §13.5 avait raison sur les fusions,
+il ne dit rien des rejets, et ceux-ci ne s'expliquent pas par le harnais.
+
+Sur `fort_occ2.mp4` : 26 rejets, tous `aspect_ratio_out_of_range`, 1 fusion
+signalée, sur 328 frames.
+
+### 14.4.2 Hypothèses 2 et 3 — tranchées en regardant les boîtes
+
+Dix boîtes rejetées ont été extraites et inspectées
+(`results/geom_crops/rejets_fort_occ.jpg`, non versionné : personnes
+identifiables) : les cinq plus larges (ratio 3,85 à 3,45) et cinq médianes
+(ratio 2,66).
+
+**Les dix montrent la même chose : le haut du crâne d'une personne placée au
+ras de l'objectif**, en bas de l'image, jamais deux personnes côte à côte.
+
+Le décompte confirme ce que l'œil voit :
+
+| Fait mesuré | Valeur |
+|---|---|
+| Pistes techniques concernées par les 235 rejets | **une seule**, la n° 15 |
+| Étendue | frames 137 à 988 (sur 1 057) |
+| Boîte médiane | **396 × 147 px** dans une image 1920 × 1080 |
+| Ratio médian W/H | 2,66 (seuil `max_aspect_ratio_wh` = 2,5) |
+| Confiance médiane | 0,67 — ce ne sont pas des détections douteuses |
+
+- **Hypothèse 3 (fusions réellement perdues) : écartée.** Une boîte unique,
+  attachée à une piste unique pendant 851 frames, n'est pas deux personnes
+  côte à côte. Router ces boîtes vers le chemin fusion ne produirait rien.
+- **Hypothèse 2 (rejets légitimes) : vraie sur la forme, fausse sur le fond.**
+  La boîte est bien aberrante — plus large que haute — mais l'objet derrière
+  est une **vraie personne**, pas un reflet ni un fragment. Le filtre écarte
+  une personne réelle, systématiquement, pendant 80 % de la vidéo.
+
+### 14.4.3 Décision : ne rien corriger dans ce lot
+
+**Le correctif conditionnel prévu par la fiche n'est pas appliqué**, parce que
+la condition qui l'autorisait (hypothèse 3 confirmée) est fausse. C'est le
+résultat de l'investigation, pas un renoncement.
+
+Ce que la mesure a révélé est un **autre** problème, non prévu par la fiche :
+une personne trop proche de l'objectif présente une silhouette plus large que
+haute et se fait écarter avant tout suivi. Il est consigné ici et **pas
+corrigé** :
+
+- il ne concerne pas la vidéo de mesure principale (`fort_occ4` : **0** rejet
+  géométrique) ni la vidéo de contrôle (`rare_occ2` : **0**) ;
+- relâcher `max_aspect_ratio_wh` pour l'absorber changerait le filtre pour tout
+  le corpus, sans mesure à l'appui sur la vidéo de référence ;
+- la bonne réponse est probablement une règle de **bord d'image** (une boîte
+  tronquée par le bord n'a pas de ratio interprétable), ce qui relève du lot 2,
+  qui traite déjà le bord du cadre.
+
+**À verser au lot 2** : une boîte coupée par le bord bas de l'image ne devrait
+pas être jugée sur son ratio W/H.
+
+## 14.5 Déterminisme — ce que le §1.0 change vraiment
+
+Le §2.1 de `CLAUDE.md` exige de connaître le bruit avant de conclure quoi que
+ce soit. Deux exécutions de `fort_occ4`, **mêmes arguments, même ligne**, mais
+sous des charges machine différentes : l'une par `scripts/measure_corpus.py`,
+l'autre par `src/main.py --trace-per-second`, qui écrit en plus 36 images.
+
+| Base de temps | Compteurs différant entre les deux exécutions |
+|---|---|
+| **Murale (avant)** | **13** : `IN` (2 vs 1), `OUT` (1 vs 0), `NEW` (9 vs 8), `TECHNICAL_ID_CHANGED` (9 vs 7), `POSSIBLE_MULTI_PERSON_BOX` (58 vs 52), `PURGE` (20 vs 18), `STATE_TRANSITION` (137 vs 126), `REID_MATCH` (9 vs 7), `REID_NEW` (16 vs 17), `REID_AMBIGUOUS`, `INCONSISTENT_STATE`, `STABILIZATION`, `OCCUPANCY_SNAPSHOT` |
+| **Vidéo (après)** | **aucun** — les 21 types d'événements sont identiques au comptage près |
+
+**C'est le résultat principal du §1.0.** Le §13.5.1 avait conclu ces compteurs
+« strictement stables » à partir de trois rejouages lancés à la suite, dans les
+mêmes conditions de charge : cette stabilité était une propriété de la
+**mesure**, pas du système. Dès que la charge change — et écrire 36 images
+suffit — la base murale déplace `IN`, `OUT` et `NEW`, c'est-à-dire le bilan
+officiel lui-même.
+
+**Conséquence pour les lots suivants** : les seuils de signification du §13.5.1
+(`PURGE` ±2, `STATE_TRANSITION` ±2, `OCCUPANCY_SNAPSHOT` ±11, `long_gaps_count`
+±3) ont été établis en base murale. En base vidéo, le bruit mesuré ici est
+**nul sur tous les compteurs**. Tout écart avant/après devient donc un signal,
+à condition d'être mesuré dans cette base. Cette table remplace celle du
+§13.5.1 pour les lots 4, 2, 3, 5, 6 et 7.
+
+## 14.6 §1.2 — seuil NMS : les valeurs proposées sont **mesurées et rejetées**
+
+Chaque valeur isolément, sur `fort_occ4`, en base vidéo (donc sans bruit de
+mesure, §14.5), toutes choses égales par ailleurs.
+
+| Compteur | **0,55** (en vigueur) | 0,85 (proposé) | 0,90 (proposé) |
+|---|---|---|---|
+| `technical_ids` | **21** | 35 | 65 |
+| `persons_created` | **18** | 22 | 45 |
+| `TECHNICAL_ID_CHANGED` | **6** | 14 | 21 |
+| `PURGE` | **14** | 20 | 42 |
+| `OCCLUDED` | **52** | 101 | 135 |
+| `POSSIBLE_MULTI_PERSON_BOX` | **55** | 79 | 88 |
+| `REID_NEW` | **18** | 22 | 45 |
+| `occupancy_operational` (réel : 13) | 12 | 13 | **16** |
+| `visible_count` max (visibles réels : jusqu'à 12) | 9 | 9 | 11 |
+| `erreur_comptage_max_visible` | **9** | **9** | **9** |
+| Pistes surnuméraires (§14.7) | **6** | 13 | 7 |
+| FPS moyen | 4,189 | 4,157 | 4,279 |
+
+**Décision : `nms_iou` reste à 0,55. Les deux valeurs de la fiche sont
+écartées par la mesure**, pas par principe.
+
+L'hypothèse du §1.2 était que la NMS détruisait des détections de personnes
+assises côte à côte, et qu'en relâchant le seuil on les récupérerait. La mesure
+dit le contraire de ce qui était attendu :
+
+- le nombre d'identifiants techniques **triple** à 0,90 (21 → 65) et les
+  identités créées passent de 18 à 45, pour 13 personnes réelles ;
+- `occupancy_operational` passe de 12 à **16**, soit trois personnes comptées
+  en trop là où la baseline en manquait une ;
+- `POSSIBLE_MULTI_PERSON_BOX` **augmente** (55 → 88) au lieu de diminuer : les
+  boîtes supplémentaires ne séparent pas les personnes, elles se superposent ;
+- et surtout **`erreur_comptage_max_visible` ne bouge pas** : 9 dans les trois
+  configurations. Les personnes manquantes ne manquaient pas par suppression
+  NMS.
+
+Le risque que la fiche demandait de surveiller — « des doublons survivent la
+NMS et sont promus en identités distinctes → sur-comptage » — est donc
+**réalisé, et mesuré**. Il l'est déjà à `new_track_thresh: 0.7` ; l'abaisser à
+0,45 au lot 4 l'aggraverait.
+
+**Aucune modification de `config/pipeline.yaml` pour ce point** : la valeur en
+vigueur est conservée, et son commentaire `PROVISOIRE — à calibrer` est
+complété par le résultat ci-dessus, pour qu'une session ultérieure ne refasse
+pas cette mesure.
+
+## 14.7 Métriques de vérité terrain — et ce que ce lot **n'a pas** déplacé
+
+Relevé par seconde du pipeline réel contre `tests/fixtures/ground_truth_fort_occ4.json`.
+Les métriques d'**identité** ne figurent pas ici : le rattachement
+`person_id` ↔ étiquettes est une proposition non validée, et sa validation est
+reportée au lot 2 (décision du 2026-09-21). Ce qui suit ne dépend d'aucun
+rattachement.
+
+| Métrique (§3, §4) | Avant | Après §1.0 + §1.1 | Cible §4 | Verdict |
+|---|---|---|---|---|
+| `occupancy_operational` à la dernière seconde (réel : 13) | 13 *(ou 14 selon le run)* | **12** | exact | **non tenu**, écart 1 |
+| `erreur_comptage_max_operational` | 4 | 4 | voir ci-dessous | inchangé |
+| `erreur_comptage_max_visible` | **9** | **9** | ≤ 1 | **non tenu**, inchangé |
+| `pistes_vues` minimum | 2 | 2 | diagnostic | inchangé |
+| Fragmentation max (identifiants techniques par `person_id`) | 5 | 5 | — | inchangé |
+| Pistes surnuméraires | 7 | **6** | — | −1 |
+| Identifiants techniques partagés par plusieurs `person_id` | 2 | 2 | — | inchangé |
+| FPS moyen | 3,559 | **3,816** | ≥ 3,06 | tenu |
+
+### 14.7.1 `erreur_comptage_max_operational` = 4 : ce que ce chiffre est
+
+Il est **entièrement porté par la seconde 0**, où l'annotation compte 4
+personnes et le pipeline 0 : le warm-up n'est pas terminé. Hors seconde 0,
+l'écart vaut −1 pendant chaque entrée et −2 aux secondes 15 à 18, où deux
+personnes entrent coup sur coup. C'est le retard d'entrée documenté au §4 de
+`CLAUDE.md`, et c'est le comportement correct : `occupancy_operational`
+n'incrémente qu'au franchissement confirmé, l'annotation compte dès
+l'apparition dans le champ.
+
+### 14.7.2 Le point qui n'est pas tenu : 12 au lieu de 13 en fin de séquence
+
+`WARMUP_END` explique l'écart, et il vient du §1.0 lui-même :
+
+| | Avant (base murale) | Après (base vidéo) |
+|---|---|---|
+| Fin du warm-up | frame 17, t = 33,2 s **murales** | frame 16, t = 0,5 s **vidéo** |
+| `initial_occupancy` | **4** | **3** |
+| Bilan final | 4 + 1 IN + 8 NEW − 0 OUT = 13 | 3 + 2 IN + 7 NEW − 0 OUT = **12** |
+
+La note d'annotation de la seconde 0 dit : « *Une partie de P1 et P4 sont
+derrières une porte* ». Quatre personnes sont présentes, mais deux ne sont que
+partiellement visibles ; à la frame 16 le pipeline n'en place que trois. La
+quatrième, déjà à l'intérieur, ne franchira jamais la ligne, donc rien ne la
+rattrape ensuite.
+
+**Ce n'est pas une régression du comptage, c'est un changement d'instant de
+mesure** : le warm-up se termine désormais à 0,5 s de **scène** au lieu de
+33 s d'horloge murale, c'est-à-dire beaucoup plus tôt dans l'action. Le
+compteur est plus exact en base murale par accident — la lenteur du traitement
+laissait le temps à la quatrième personne d'être vue.
+
+**À verser au lot 2** : le warm-up ne devrait pas figer l'effectif initial sur
+une seule frame quand des personnes sont partiellement masquées à l'entrée.
+
+### 14.7.3 Ce que le lot 1 n'a pas déplacé, et c'est l'essentiel
+
+`visible_count` est **identique seconde par seconde** avant et après, sauf à la
+seconde 0 (0 → 3). L'effondrement décrit au §12.2.2 est intact : 5 personnes
+vues à la seconde 34 pour 11 visibles annotées, `erreur_comptage_max_visible`
+toujours à 9.
+
+**Ce lot n'est donc pas un succès au regard du §4** : il ne rapproche d'aucun
+critère visible. Il rend les mesures suivantes interprétables et déterministes
+(§14.5), ce qui était sa raison d'être, mais il ne corrige pas le symptôme.
+Le décrochage reste au niveau des pistes — `pistes_vues` descend à 2 pour 10
+personnes visibles à la seconde 28, inchangé — ce qui confirme l'analyse ayant
+conduit à avancer le lot 4 avant le lot 2.
+
+## 14.8 Seuils modifiés
+
+| Paramètre | Avant | Après | Effet mesuré | Compromis accepté | Statut |
+|---|---|---|---|---|---|
+| `timing.time_base` | n'existait pas (temps mural systématique) | `auto` | bruit run-à-run : 13 compteurs divergents → **0** (§14.5) ; `OUT` fantôme supprimé ; `TECHNICAL_ID_CHANGED` 9 → 6 ; `PURGE` 20 → 14 | sur fichier, les durées ne reflètent plus le temps de calcul ; le warm-up se termine plus tôt dans l'action, d'où 12 au lieu de 13 (§14.7.2) | **figé** — ce n'est pas un réglage mais une correction de référentiel |
+| `tracker.track_buffer_seconds` | n'existait pas | `15.0` | non isolable de `time_base` dans cette mesure (voir ci-dessous) | horizon plus long = plus de mémoire, risque accru de réassociation erronée | `PROVISOIRE` |
+| `tracker.fps_warm_up_frames` | n'existait pas | `60` | aucun sur fichier (conversion faite avant le premier appel au tracker) | — | `PROVISOIRE` |
+| `tracker.track_buffer` | `150` (frames, écrit à la main) | **déduit** : 450 frames sur fichier à 30 ips | horizon réel porté de 5 s à 15 s de scène | — | déduit, plus réglé à la main |
+| `model.nms_iou` | `0.55` | **`0.55`, inchangé** | 0,85 et 0,90 mesurés et écartés (§14.6) | — | `PROVISOIRE`, commentaire complété |
+
+**Limite de méthode, à dire clairement** : `time_base` et
+`track_buffer_seconds` ont été mesurés **ensemble**, pas isolément. Le §7 de
+`CLAUDE.md` demande l'inverse. La raison est que les deux sont indissociables
+ici : convertir `track_buffer` en secondes suppose de savoir quelle horloge
+fait foi, et mesurer la base de temps sans corriger `track_buffer` laisserait
+l'horizon du tracker à 150 frames, soit 5 s de scène au lieu de 15. L'effet
+propre de `track_buffer_seconds` n'est donc **pas** établi par ce lot, et le
+tableau du §14.3.1 ne doit pas lui être attribué.
+
+## 14.9 Tests
+
+Suite complète : **664 tests collectés, 663 passés, 1 ignoré**, couverture
+**93,39 %** (seuil 85 %). Le test ignoré (`test_calibration_window.py:227`)
+l'était déjà : il exige un serveur X. Décompte réel
+(`grep -rc "^def test_" tests/`) : **469** fonctions sur **34** fichiers,
+contre 445 sur 31 au lot 0.
+
+### 14.9.1 Tests ajoutés
+
+| Fichier | Ce qu'il protège |
+|---|---|
+| `tests/test_time_base_lot1.py` (10 tests) | `auto` suit la source ; `video`/`wall` restent forçables ; une base inconnue est refusée par la configuration ; le budget de frames suit la cadence de la base (150 frames de grâce à 30 ips contre 19 à 3,8 ips) ; conversion unique secondes → frames ; la copie `tracker_resolved.yaml` ne modifie pas le YAML versionné ; ajustement du tracker vivant, et échec signalé sans interrompre le comptage ; repli si `track_buffer_seconds` vaut `null` ; valeurs publiées dans la configuration résolue |
+| `tests/test_second_trace.py` (5 tests) | la seconde vient de l'index de frame, jamais d'une horloge ; refus sur caméra ; une ligne et une image par seconde ; **le relevé ne modifie ni l'état du pipeline ni la frame** |
+| `tests/test_gt_matching.py` (9 tests) | la proposition est marquée non validée et chaque ligne porte méthode et confiance ; les métriques d'identité sont **refusées** sans validation humaine ; les métriques de comptage le sont toujours ; chaque compteur est comparé à son référentiel ; fragmentation de piste et identifiants techniques partagés |
+
+### 14.9.2 Tests corrigés — aucun
+
+Aucun test existant n'a eu besoin d'être modifié. Cinq ont **échoué en cours de
+route**, et c'est le correctif qui était fautif, pas eux : les avertissements de
+base de temps étaient émis **avant** `SESSION_START` et polluaient le journal
+d'une source illisible. Les événements ont été retirés du journal (le repli
+reste sur stderr, dans les logs, et la base retenue est publiée dans
+`summary.json`), après quoi les cinq tests sont repassés sans être touchés.
+
+## 14.10 Ce qui reste non résolu
+
+1. **Le symptôme visé n'a pas bougé** : `erreur_comptage_max_visible` vaut 9
+   avant comme après, pour une cible de ≤ 1. Le lot est un préalable de
+   mesure, pas un correctif (§14.7.3).
+2. **`occupancy_operational` finit à 12 pour 13 personnes réelles**, à cause de
+   l'instant de fin du warm-up (§14.7.2). À traiter au lot 2.
+3. **L'effet propre de `track_buffer_seconds` n'est pas isolé** (§14.8), et la
+   valeur 15,0 s reste `PROVISOIRE` : la plus longue occlusion du corpus reste
+   à mesurer en base vidéo.
+4. **Une personne au ras de l'objectif est systématiquement écartée** par le
+   filtre de ratio sur `fort_occ` (§14.4.3). Non corrigé, versé au lot 2.
+5. **La conversion de `track_buffer` sur caméra n'a pas été mesurée en vrai** :
+   le corpus ne contient que des fichiers. Le chemin est testé unitairement,
+   pas en conditions réelles.
+6. **Les seuils de signification du §13.5.1 sont périmés** pour les mesures
+   faites en base vidéo : le bruit y est nul (§14.5). Les lots suivants doivent
+   se mesurer dans cette base, sans quoi les tableaux ne sont pas comparables.
+7. **Reporté du lot 0** : la ligne n'est toujours pas publiée dans
+   `config_resolved.yaml` (§13.7.2). Inchangé, toujours ouvert.
+

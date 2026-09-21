@@ -30,7 +30,19 @@ model:
   # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
   # Le garde-fou contre les faux positifs est porté par new_track_thresh.
   confidence: 0.10          # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
-  nms_iou: 0.55             # PROVISOIRE — à calibrer
+  # nms_iou — CONSERVÉ à 0,55 après mesure (lot 1, §1.2). Le lot proposait de
+  # le monter à 0,85 ou 0,90, pour récupérer les détections de personnes
+  # assises côte à côte qu'on supposait supprimées par la NMS. Mesuré sur
+  # fort_occ4, chaque valeur isolément, en base de temps vidéo :
+  #   0,55 -> 21 identifiants techniques, 18 identités, 6 changements d'ID
+  #   0,85 -> 35 identifiants techniques, 22 identités, 14 changements d'ID
+  #   0,90 -> 65 identifiants techniques, 45 identités, 21 changements d'ID,
+  #           et occupancy_operational = 16 pour 13 personnes réelles
+  # erreur_comptage_max_visible vaut 9 dans les TROIS cas : les personnes
+  # manquantes ne manquent pas par suppression NMS. Monter le seuil ne fait
+  # que créer des doublons promus en identités. Voir docs/correctif_occlusion.md
+  # §14.6. Reste PROVISOIRE : non calibré sur un corpus disjoint.
+  nms_iou: 0.55             # PROVISOIRE — 0,85 et 0,90 mesurés et écartés (§14.6)
   image_size: 960           # PROVISOIRE — à calibrer
   classes: [0]              # classe COCO « person »
   device: cpu               # « cpu » (machine de référence) | « auto » | « cuda:0 »
@@ -79,7 +91,27 @@ tracker:
   # relais. Compromis : plus long = moins de changements d'identifiant technique,
   # mais plus de mémoire/calcul et un risque légèrement accru de réassociation
   # erronée en forte densité de personnes d'apparence similaire.
-  track_buffer: 150   # EN FRAMES — voir l'avertissement de base de temps ci-dessous
+  # track_buffer_seconds — NOUVEAU (lot 1, §1.1). Valeur précédente : aucune
+  # (seul `track_buffer`, en FRAMES, existait).
+  #   raison : `track_buffer` en frames ne couvre pas la même durée selon la
+  #     source (150 frames = 5 s sur fichier à 30 ips, ~43 s sur caméra à 3,5 ips
+  #     traités), alors que la galerie ReID raisonne en secondes. L'horizon du
+  #     tracker devenait une propriété de la machine, pas de la scène.
+  #   valeur 15,0 s : le diagnostic mesure des occlusions jusqu'à 13,5 s ; 12,0 s
+  #     ne les couvrirait pas toutes, 15,0 s laisse une marge.
+  #   compromis accepté : un horizon plus long garde des pistes mortes plus
+  #     longtemps — plus de mémoire, et risque accru de réassociation erronée en
+  #     forte densité.
+  #   PROVISOIRE : à figer quand la plus longue occlusion du corpus aura été
+  #     mesurée en base de temps vidéo (lot 1, §1.4).
+  track_buffer_seconds: 15.0
+  # Frames de mesure du FPS avant conversion, quand le FPS n'est pas connu
+  # d'avance (source caméra). Sur fichier, la cadence source est lue
+  # directement et la conversion est faite avant le premier appel au tracker.
+  fps_warm_up_frames: 60
+  # track_buffer : valeur DÉDUITE au démarrage de track_buffer_seconds. Celle
+  # écrite ici ne sert que de repli si track_buffer_seconds vaut null.
+  track_buffer: 150   # EN FRAMES — déduit au démarrage, voir ci-dessus
   # -- Incohérence de base de temps (documentée, PAS corrigée) --------------
   # `track_buffer` ci-dessus est en FRAMES, alors que la galerie ReID de la
   # section `reid` est en SECONDES : les deux mécanismes de mémoire ne couvrent
@@ -282,6 +314,21 @@ timing:
   # Toutes les durées sont en SECONDES ; elles sont converties en frames au
   # runtime avec le FPS réellement mesuré (règle 0.2).
   fps_source: measured          # jamais une valeur supposée
+  # time_base — NOUVEAU (lot 1, §1.0). Valeur précédente : aucune ; le pipeline
+  # horodatait systématiquement sur time.perf_counter (temps MURAL), y compris
+  # sur fichier.
+  #   raison : sur fichier, le temps mural fait dépendre toutes les durées de la
+  #     vitesse de la machine. Mesuré en session 0 sur fort_occ4 : 13 purges en
+  #     base vidéo contre 0 en base murale, et un bruit run-à-run nul d'un côté,
+  #     non nul de l'autre (docs/correctif_occlusion.md §11.7.3). Une mesure
+  #     faite sur fichier décrivait donc un régime qui n'existe pas en
+  #     production.
+  #   compromis accepté : sur fichier, les durées ne reflètent plus le temps
+  #     réellement passé à traiter ; c'est voulu — c'est le temps de la SCÈNE qui
+  #     gouverne une occlusion, pas celui du calcul. Le FPS de traitement reste
+  #     mesuré et publié à part.
+  #   auto = vidéo si la source est un fichier, mural si c'est une caméra.
+  time_base: auto
   # Warm-up : terminé quand warmup_min_frames frames ONT été observées ET que
   # warmup_seconds se sont écoulées. Exiger les deux bornes évite une fin
   # prématurée à faible FPS (temps écoulé mais 3 frames vues) comme à haut FPS

@@ -177,6 +177,11 @@ def collect(session_dir: Path, threshold_s: float) -> dict:
     fps = summary.get("fps", {})
 
     return {
+        # Base de temps et horizon de piste réellement appliqués, tels que le
+        # pipeline les a publiés (lot 1). Avant le lot 1, `summary.json` ne les
+        # portait pas : l'absence vaut donc « base murale ».
+        "time_base": summary.get("time_base", "wall"),
+        "track_buffer_frames": summary.get("track_buffer_frames"),
         "event_counts": dict(sorted(Counter(e["type"] for e in events).items())),
         "frames_processed": summary.get("frames_processed"),
         "processing_fps": fps.get("mean"),
@@ -228,11 +233,6 @@ def measure(args: argparse.Namespace) -> list[dict]:
                     "timestamp": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
                     ),
-                    # `wall` tant que le pipeline horodate sur time.perf_counter
-                    # (src/main.py). Le lot 1 traite cette base de temps ; le
-                    # champ existe pour que les mesures d'avant et d'après
-                    # restent distinguables sans relire le code.
-                    "time_base": "wall",
                     "line": args.line,
                     "exit_code": code,
                 }

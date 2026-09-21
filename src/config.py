@@ -45,6 +45,10 @@ ALLOWED_ON_LINE_POLICIES = ("indeterminate", "inside", "outside")
 ALLOWED_DISAPPEARANCE_POLICIES = ("deferred_confirmation", "ambiguous_immediate")
 ALLOWED_AMBIGUOUS_POLICIES = ("provisional_person", "defer")
 ALLOWED_FPS_SOURCES = ("measured",)
+#: Bases de temps du pipeline (lot 1, §1.0). ``auto`` = horodatage vidéo sur
+#: fichier, temps mural sur caméra : la mesure sur fichier décrit alors le même
+#: régime que la production, ce qui n'était pas le cas avant ce lot.
+ALLOWED_TIME_BASES = ("auto", "video", "wall")
 #: Méthodes de compensation de mouvement caméra (GMC) acceptées par BoT-SORT.
 #: ``none`` est la seule correcte pour une caméra **fixe** : les autres
 #: réintroduiraient une estimation de mouvement sur une image immobile, donc une
@@ -134,8 +138,17 @@ class TrackerConfig:
     track_high_thresh: float = 0.4
     track_low_thresh: float = 0.1
     new_track_thresh: float = 0.7
-    #: Persistance de piste : durée d'occlusion couverte par le tracker.
+    #: Persistance de piste : durée d'occlusion couverte par le tracker,
+    #: **en secondes** (lot 1, §1.1). C'est la valeur de référence : elle est
+    #: convertie une seule fois en frames au démarrage, avec le FPS de la base
+    #: de temps retenue. ``None`` conserve l'ancien comportement (frames).
+    track_buffer_seconds: float | None = 15.0
+    #: Conversion de ``track_buffer_seconds`` : valeur **déduite** au démarrage,
+    #: conservée ici comme repli et pour la compatibilité ascendante.
     track_buffer: int = 150
+    #: Frames de mesure du FPS avant conversion, quand le FPS n'est pas connu
+    #: d'avance (source caméra).
+    fps_warm_up_frames: int = 60
     #: Ré-identification native BoT-SORT (association par apparence).
     with_reid: bool = True
     match_thresh: float = 0.9
@@ -431,6 +444,10 @@ class TimingConfig:
     """
 
     fps_source: str = "measured"
+    #: Base de temps de **toute** l'horloge du pipeline (FSM, galerie,
+    #: snapshots). ``auto`` la déduit de la source ; ``video`` et ``wall``
+    #: forcent, pour comparer les deux régimes lors d'une investigation.
+    time_base: str = "auto"
     warmup_seconds: float = 0.5
     warmup_min_frames: int = 15
     confirmation_seconds: float = 0.5
@@ -810,6 +827,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
 
     timing_raw = _section(raw, "timing")
     fps_source = str(timing_raw.get("fps_source", "measured"))
+    time_base = str(timing_raw.get("time_base", "auto"))
+    if time_base not in ALLOWED_TIME_BASES:
+        problems.append(
+            f"timing.time_base doit être l'un de {ALLOWED_TIME_BASES} "
+            f"(reçu {time_base!r})"
+        )
     if fps_source not in ALLOWED_FPS_SOURCES:
         problems.append(
             f"timing.fps_source doit être 'measured' (reçu {fps_source!r}) : une valeur "
@@ -1034,6 +1057,15 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     track_buffer = _positive_int(
         tracker_raw.get("track_buffer", 150), "tracker.track_buffer", problems
     )
+    raw_track_buffer_seconds = tracker_raw.get("track_buffer_seconds", 15.0)
+    track_buffer_seconds = (
+        None
+        if raw_track_buffer_seconds is None
+        else _positive(raw_track_buffer_seconds, "tracker.track_buffer_seconds", problems)
+    )
+    fps_warm_up_frames = _positive_int(
+        tracker_raw.get("fps_warm_up_frames", 60), "tracker.fps_warm_up_frames", problems
+    )
     match_thresh = _unit_interval_inclusive(
         tracker_raw.get("match_thresh", 0.9), "tracker.match_thresh", problems
     )
@@ -1164,6 +1196,12 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             track_low_thresh=float(track_low_thresh if track_low_thresh is not None else 0.1),
             new_track_thresh=float(new_track_thresh if new_track_thresh is not None else 0.7),
             track_buffer=int(track_buffer if track_buffer is not None else 150),
+            track_buffer_seconds=(
+                None if track_buffer_seconds is None else float(track_buffer_seconds)
+            ),
+            fps_warm_up_frames=int(
+                fps_warm_up_frames if fps_warm_up_frames is not None else 60
+            ),
             with_reid=bool(tracker_raw.get("with_reid", True)),
             match_thresh=float(match_thresh if match_thresh is not None else 0.9),
             proximity_thresh=float(
@@ -1260,6 +1298,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         ),
         timing=TimingConfig(
             fps_source=fps_source,
+            time_base=time_base,
             warmup_seconds=warmup_seconds,
             warmup_min_frames=warmup_min_frames,
             confirmation_seconds=confirmation_seconds,

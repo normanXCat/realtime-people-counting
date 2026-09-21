@@ -308,6 +308,79 @@ def write_resolved_config(
     return resolved_path
 
 
+def resolve_time_base(configured: str, source: int | str) -> str:
+    """Base de temps effective (lot 1, §1.0). ``auto`` suit la **source**.
+
+    Un fichier vidéo porte son propre temps : l'horodater à l'horloge murale
+    fait dépendre toutes les durées (grâce FSM, fenêtre de galerie) de la
+    vitesse de la machine, si bien qu'une mesure sur fichier décrit un régime
+    qui n'existe pas en production (``docs/correctif_occlusion.md`` §11.7.3).
+    Une caméra, elle, n'a pas d'autre temps que le temps réel.
+    """
+    if configured in ("video", "wall"):
+        return configured
+    return "wall" if isinstance(source, int) else "video"
+
+
+def resolved_tracker_config(
+    tracker_path: Path, session_root: Path, track_buffer_frames: int
+) -> Path:
+    """Copie la configuration BoT-SORT avec ``track_buffer`` **déduit** (§1.1).
+
+    Ultralytics lit ce fichier à la création du tracker : la conversion
+    secondes → frames doit donc être faite **avant** le premier appel, pas
+    après. La copie est écrite dans la session, ce qui laisse la configuration
+    versionnée intacte et rend la valeur appliquée lisible après coup.
+    """
+    raw = yaml.safe_load(tracker_path.read_text(encoding="utf-8")) or {}
+    raw["track_buffer"] = int(track_buffer_frames)
+    resolved = session_root / "tracker_resolved.yaml"
+    resolved.write_text(
+        "# Copie de "
+        f"{tracker_path.name} avec track_buffer déduit de "
+        "tracker.track_buffer_seconds (lot 1, §1.1).\n"
+        + yaml.safe_dump(raw, allow_unicode=True, sort_keys=True),
+        encoding="utf-8",
+    )
+    return resolved
+
+
+def track_buffer_frames_from_seconds(seconds: float, fps: float) -> int:
+    """Horizon de survie de piste, converti en frames pour une cadence donnée.
+
+    Une seule implémentation pour les deux chemins (fichier et caméra) : deux
+    arrondis divergents produiraient deux horizons différents pour la même
+    configuration. Le résultat est au moins 1 frame — un horizon nul
+    supprimerait toute piste dès la frame suivante.
+    """
+    return max(1, round(float(seconds) * float(fps)))
+
+
+def apply_track_buffer(model: Any, frames: int) -> bool:
+    """Ajuste l'horizon d'un tracker **déjà construit** (source caméra, §1.1).
+
+    Sur fichier, la conversion passe par :func:`resolved_tracker_config`, lue
+    par Ultralytics au démarrage. Sur caméra, le FPS n'est connu qu'après
+    mesure : il faut donc toucher les trackers vivants. Ultralytics dérive
+    ``max_time_lost`` de ``track_buffer`` à la construction ; c'est cette
+    valeur, et elle seule, qui est corrigée — une fois.
+
+    Retourne ``False`` si la structure interne d'Ultralytics ne s'y prête pas :
+    la valeur du YAML reste alors en vigueur et l'appelant le journalise. Un
+    échec ici dégrade la mesure, il n'interrompt pas le comptage.
+    """
+    predictor = getattr(model, "predictor", None)
+    trackers = getattr(predictor, "trackers", None) if predictor is not None else None
+    if not trackers:
+        return False
+    applied = False
+    for tracker in trackers:
+        if hasattr(tracker, "max_time_lost"):
+            tracker.max_time_lost = int(frames)
+            applied = True
+    return applied
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -608,6 +681,72 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.close()
         return 3
 
+    # -- Base de temps unique (lot 1, §1.0) --------------------------------
+    # Une seule horloge par exécution, consultée partout : FSM, galerie,
+    # snapshots. Le FPS de cette base sert aussi à convertir les durées en
+    # frames — en base vidéo, c'est la cadence de la source, pas celle,
+    # variable, du traitement.
+    time_base = resolve_time_base(config.timing.time_base, source)
+    video_fps: float | None = None
+    if time_base == "video":
+        try:
+            video_fps = source_fps(source)
+        except SecondTraceUnavailable as error:
+            # FPS illisible : on ne devine pas une cadence, on retombe sur
+            # l'horloge murale en le disant. Pas d'événement ici : ce bloc
+            # s'exécute AVANT `SESSION_START`, et une source illisible produira
+            # de toute façon son propre `SOURCE_ERROR`. Le repli reste tracé sur
+            # stderr, dans les logs, et la base retenue est publiée dans
+            # `summary.json`.
+            time_base = "wall"
+            print(f"[TEMPS] Base vidéo impossible ({error}) : repli sur wall", file=sys.stderr)
+            logging.getLogger(__name__).warning(
+                "time_base video indisponible (%s) : repli sur la base murale", error
+            )
+    time_base_fps = video_fps if time_base == "video" else None
+
+    # -- track_buffer exprimé en secondes (lot 1, §1.1) --------------------
+    # Conversion UNIQUE : réévaluer en cours de session changerait l'horizon du
+    # tracker sans prévenir, ce qui est le défaut que ce lot corrige.
+    track_buffer_frames = config.tracker.track_buffer
+    track_buffer_resolved_from: str = "configuration (frames)"
+    if config.tracker.track_buffer_seconds is None:
+        # Même raison que ci-dessus : avant `SESSION_START`, donc journalisé
+        # par le logger Python, pas par le journal d'événements.
+        logging.getLogger(__name__).warning(
+            "tracker.track_buffer_seconds absent : repli sur %d frames, dont la "
+            "durée dépend de la source",
+            track_buffer_frames,
+        )
+    elif time_base_fps is not None:
+        track_buffer_frames = track_buffer_frames_from_seconds(
+            config.tracker.track_buffer_seconds, time_base_fps
+        )
+        track_buffer_resolved_from = f"{config.tracker.track_buffer_seconds} s x {time_base_fps:.3f} ips"
+        tracker_path = resolved_tracker_config(tracker_path, session_root, track_buffer_frames)
+        if not 15 <= track_buffer_frames <= 1200:
+            # Avertir, jamais refuser : une cadence inhabituelle reste une
+            # mesure, pas une erreur de configuration.
+            logging.getLogger(__name__).warning(
+                "track_buffer déduit = %d frames (%s), hors de [15, 1200]",
+                track_buffer_frames, track_buffer_resolved_from,
+            )
+        logging.getLogger(__name__).info(
+            "track_buffer : %s -> %d frames (base de temps %s)",
+            track_buffer_resolved_from, track_buffer_frames, time_base,
+        )
+    else:
+        # Caméra : le FPS n'est connu qu'après mesure. La conversion est
+        # différée d'exactement fps_warm_up_frames frames, puis appliquée une
+        # seule fois au tracker vivant (voir plus bas).
+        track_buffer_resolved_from = "différée (FPS caméra à mesurer)"
+
+    print(
+        f"[TEMPS] base={time_base}"
+        + (f" | fps_source={time_base_fps:.3f}" if time_base_fps else "")
+        + f" | track_buffer={track_buffer_frames} frames ({track_buffer_resolved_from})"
+    )
+
     # Relevé par seconde (outillage de vérité terrain) : lecture seule, jamais
     # consulté par le comptage. Refusé sur caméra plutôt que produit faux.
     second_tracer: SecondTracer | None = None
@@ -762,6 +901,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     #: Avertissement de base de temps (frames vs secondes) émis une seule fois,
     #: dès que le FPS réellement traité est connu.
     live_timebase_warned = False
+    #: Conversion de ``track_buffer_seconds`` restant à faire (source caméra).
+    track_buffer_deferred = (
+        config.tracker.track_buffer_seconds is not None and time_base_fps is None
+    )
     live_timebase_logger = logging.getLogger(__name__)
 
     print(
@@ -806,6 +949,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             duration_s=time.perf_counter() - start_s, budget=None,
             diagnostics=diagnostics,
             identity_totals={"technical_ids": 0, "persons_created": 0},
+            time_base=time_base,
+            track_buffer_frames=track_buffer_frames,
         )
         if second_tracer is not None:
             second_tracer.close()
@@ -930,7 +1075,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 frame_index=frame_index,
             )
 
-            timestamp_s = time.perf_counter() - start_s
+            # Horloge unique (§1.0) : temps vidéo dérivé de l'index de frame sur
+            # fichier, temps mural sur caméra.
+            if time_base == "video" and video_fps:
+                timestamp_s = (frame_index - 1) / video_fps
+            else:
+                timestamp_s = time.perf_counter() - start_s
             # Diagnostic de la frame : distingue « aucune détection » de « boîtes
             # présentes sans identifiant technique ». Le second cas laisse
             # `detections` vide (aucun identifiant n'est inventé) : les pistes
@@ -950,8 +1100,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timestamp_s,
                 frame_index,
             )
-            fps_estimator.tick(timestamp_s)
-            if fps_estimator.is_ready:
+            fps_estimator.tick(time.perf_counter() - start_s)
+            if time_base == "video" and video_fps:
+                # Budget fixé une fois : en base vidéo, une seconde vaut
+                # toujours video_fps frames, quelle que soit la charge machine.
+                if budget is None:
+                    budget = config.timing.frame_budget(video_fps)
+                    occupancy.set_frame_budget(budget)
+            elif fps_estimator.is_ready:
                 budget = config.timing.frame_budget(fps_estimator.require_fps())
                 occupancy.set_frame_budget(budget)
                 if isinstance(source, int) and not live_timebase_warned:
@@ -992,6 +1148,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                     live_timebase_logger.warning(
                         "track_buffer_frame_seconds_divergence : %s", details
                     )
+
+            if (
+                track_buffer_deferred
+                and frame_index >= config.tracker.fps_warm_up_frames
+                and fps_estimator.is_ready
+            ):
+                # Conversion unique sur source caméra (§1.1) : le tracker est
+                # déjà construit, on ajuste son horizon en place, une fois.
+                track_buffer_deferred = False
+                measured = fps_estimator.require_fps()
+                frames = track_buffer_frames_from_seconds(
+                    config.tracker.track_buffer_seconds, measured
+                )
+                applied = apply_track_buffer(model, frames)
+                # CONFIG_WARNING dans les deux cas : aucun type d'événement
+                # n'est ajouté au schéma pour ce lot, seul le code distingue la
+                # conversion réussie de la conversion impossible.
+                logger.emit(
+                    "CONFIG_WARNING", timestamp_s, frame_index,
+                    code=(
+                        "track_buffer_converted" if applied
+                        else "track_buffer_conversion_impossible"
+                    ),
+                    source="tracker",
+                    details=(
+                        f"{config.tracker.track_buffer_seconds} s x {measured:.3f} ips "
+                        f"= {frames} frames"
+                        + ("" if applied else " — tracker inaccessible, valeur YAML conservée")
+                    ),
+                )
+                logging.getLogger(__name__).info(
+                    "track_buffer converti : %d frames (appliqué=%s)", frames, applied
+                )
 
             occupancy.process_frame(detections, frame, timestamp_s, frame_index)
             if second_tracer is not None:
@@ -1103,6 +1292,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "technical_ids": len(seen_technical_ids),
                 "persons_created": len(seen_person_ids),
             },
+            time_base=time_base,
+            track_buffer_frames=track_buffer_frames,
         )
         logger.close()
 
@@ -1150,6 +1341,8 @@ def _finalize(
     budget: FrameBudget | None,
     diagnostics: DetectionDiagnostics | None = None,
     identity_totals: dict[str, int] | None = None,
+    time_base: str = "wall",
+    track_buffer_frames: int | None = None,
 ) -> None:
     """Écrit le bilan de session : événement final, résumé, environnement (spec 6.5)."""
     latency = profiler.summary()
@@ -1189,6 +1382,11 @@ def _finalize(
             "source": config.timing.fps_source,
             "measured_samples": fps_estimator.samples,
         },
+        # Base de temps réellement employée (lot 1, §1.0) : deux mesures faites
+        # dans des bases différentes ne sont pas comparables, la publier évite
+        # de devoir relire le code pour le savoir.
+        "time_base": time_base,
+        "track_buffer_frames": track_buffer_frames,
         "frame_budget": None if budget is None else budget.to_dict(),
         "bootstrap_frames": occupancy.bootstrap_frames,
         "counters": {
