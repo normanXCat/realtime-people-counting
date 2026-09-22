@@ -3204,3 +3204,154 @@ fusion non signalée, et la régression visible de `rare_occ2`. La ligne
 inclinée est une mesure exploratoire : la ligne figée du plan reste
 `0.05,0.6,0.95,0.6`, et le changement de ligne de référence est une décision à
 prendre. Relevés non versionnés : `results/lot4/trace/{incl*,finale*}`.
+
+# 19. Lot 7 minimal — prétraitement CLAHE (2026-09-23)
+
+> Mesuré sur un corpus contenant 12 entrées réelles, 0 `NEW` parasite et
+> 12 inversions (comptage robuste) sans CLAHE. Avancé avant les lots 2, 5 et 6
+> **sur instruction** de la personne responsable : `docs/lot_7_pretraitement.md`
+> demandait le lot 6 accepté d'abord. Seul le CLAHE (§8.2) est traité ; lecture
+> asynchrone (§8.1) et masque ROI (§8.3) ne sont pas faits.
+
+**Ligne de référence de `fort_occ4`** (décision du 2026-09-23, tranche la
+question laissée ouverte au §18.1) : `0.383,1.0,0.56,0.55`, côté `negative`,
+inscrite au §2 de `CLAUDE.md`. `rare_occ2` reste sur `0.05,0.6,0.95,0.6`.
+
+## 19.1 Implémentation
+
+- `src/preprocessing.py` : `ClaheNormalizer`, CLAHE sur le canal **L** de LAB
+  (a et b inchangés), et un rappel Ultralytics `on_predict_batch_start` qui
+  normalise **en place** les frames du lot avant le letterbox. `result.orig_img`
+  est donc la frame normalisée : YOLO, le GMC de BoT-SORT et OSNet voient la
+  même image. Dimensions et coordonnées inchangées (la ligne est calibrée sur
+  la première frame lue à part, sans effet sur les coordonnées).
+- `src/main.py` : rappel enregistré seulement si
+  `preprocessing.clahe.enabled` ; durée publiée par le profileur
+  (`latency_ms.preprocessing`).
+- `config/pipeline.yaml` / `src/config.py` : section `preprocessing.clahe`
+  (`enabled: false` **par défaut**, `clip_limit: 2.0`,
+  `tile_grid_size: [8, 8]`), validée, publiée dans `config_resolved.yaml`.
+- Vérifié sur un relevé de 40 frames : image tracée avec CLAHE contre sans,
+  écart moyen de L = 20, de (a, b) = 0,8. Même nombre de frames traitées avec
+  et sans CLAHE (1055 sur `fort_occ4`, 744 sur `rare_occ2`).
+
+## 19.2 Mesures (version E, `soutenance-finale`, sans puis avec CLAHE)
+
+Relevés : `results/lot4/trace/inclCLAHE{0,1}_fort_occ4` et
+`clahe{0,1}_rare_occ2` (non versionnés) ; analyse par
+`results/lot4/table_incl.py` et `analyse_ligne.py`, mêmes scripts qu'au §18.1.
+Le relevé sans CLAHE reproduit exactement celui de la version E. Les
+compteurs sont identiques sur les trois rejouages FPS de chaque condition.
+
+**`fort_occ4`, ligne de référence (12 attendus)** :
+
+| | Sans CLAHE | Avec CLAHE |
+|---|---|---|
+| IN / OUT / NEW | 12 / 0 / 0 | 12 / **1** / **1** |
+| `operational` en fin contre 12 | **12** (exact dès s21) | 12, **par compensation** (−1 de s14 à s33) |
+| `NEW` parasites (personne déjà comptée) | 0 | **1** (s33, `P6`) |
+| OUT fantôme | 0 | **1** (s14.9, voir ci-dessous) |
+| Écart `operational` hors transition d'entrée | 0 | −1 |
+| `visible_count` erreur max / somme | 8 / 146 | 9 / 150 |
+| Inversions (comptage robuste) | 12 | 13 |
+| Nouvelles identités, personne déjà suivie | 10 | 10 |
+| Rattachements `REID_MATCH` faux | 0 | **2** |
+| `REID_AMBIGUOUS` | 4 | 7 |
+| Doublons (secondes, vérité terrain) | 6 | 3 |
+| Pistes / identités | 19 / 17 | 23 / 18 |
+
+**Mécanisme de l'OUT fantôme** : à s14.9, la piste 15 (`P10`, encore dehors,
+dans l'embrasure) est rattachée par OSNet à l'identité 2 (`P5`, entrée à s4),
+similarité 0,693 ≥ 0,66. L'identité réapparaît du côté extérieur :
+`recovery_outside_coherent` émet un OUT. `P10` entre ensuite sous cette même
+identité (IN à s17). Le second rattachement faux (s10, `P9` → identité de
+`P4`) n'a pas d'effet sur le comptage.
+
+**`rare_occ2`, ligne de convention** :
+
+| | Sans CLAHE | Avec CLAHE |
+|---|---|---|
+| initial / IN / OUT / NEW → `operational` en fin | 0 / 2 / 0 / 2 → 4 | 0 / 2 / 0 / 2 → 4 |
+| `visible_count` max | 4 | **5** |
+| Pistes / identités | 6 / 5 | 6 / 6 |
+| `POSSIBLE_MULTI_PERSON_BOX` | 28 | 20 |
+| `REID_MATCH` | 1 | 0 |
+
+Sans vérité terrain sur `rare_occ2`, le `visible_count` de 5 ne se tranche pas
+entre la 5e personne réelle retrouvée (vue au lot 4) et un doublon ;
+l'identité en plus laisse la même ambiguïté.
+
+**FPS, mesuré seul** (`scripts/measure_corpus.py`, runs séquentiels, sans et
+avec CLAHE alternés, trois rejouages ; `results/lot7/fps_*.jsonl`) :
+
+| | Sans CLAHE | Avec CLAHE |
+|---|---|---|
+| `fort_occ4` | 3,919 / 3,745 / 4,056 → **3,92** | 3,304 / 3,773 / 3,741 → **3,74** (−4,5 %) |
+| `rare_occ2` | 3,826 / 4,053 / 4,204 → **4,05** | 3,559 / 3,729 / 3,632 → **3,63** (−10 %) |
+
+Coût du CLAHE sur 1280×720 : ≈ 38–40 ms par frame (médiane du profileur,
+relevés parallèles). Les valeurs sans CLAHE sont plus basses qu'au §18.1
+(4,21 / 4,27) : état de la machine différent, d'où la comparaison alternée
+dans une même série. Plancher de 3,06 ips tenu dans les deux cas.
+
+## 19.3 Similarités OSNet avec CLAHE (§8.2 du lot)
+
+`results/lot7/calib_similarity_clahe.py` : même protocole qu'au §17.2
+(correspondances validées de `results/gt_matching_fort_occ4_seuils.json`, une
+étiquette, paires de secondes différentes), CLAHE appliqué à la frame entière
+avant la découpe, comme dans le pipeline. 247 découpes, 13 étiquettes (plus
+qu'au §17.2 : la correspondance a été complétée depuis), mêmes découpes dans
+les deux conditions. Une même découpe sans et avec CLAHE : similarité médiane
+0,940 (min 0,834).
+
+| | Intra médiane / p10 / p5 | Inter médiane / p95 / p99 | Intra sous le p95 inter |
+|---|---|---|---|
+| Sans CLAHE | 0,661 / 0,532 / 0,507 | 0,522 / **0,657** / 0,711 | 48,9 % |
+| Avec CLAHE | 0,654 / 0,527 / 0,497 | 0,534 / **0,658** / 0,706 | 51,7 % |
+
+| Seuil | Sans : intra / inter acceptées | Avec : intra / inter acceptées |
+|---|---|---|
+| 0,64 | 57,1 % / 7,7 % | 55,1 % / 8,0 % |
+| **0,66** | 50,3 % / 4,6 % | 47,6 % / 4,7 % |
+| 0,68 | 44,3 % / 2,7 % | 41,2 % / 2,5 % |
+
+**Seuil 0,66 : reste valable** selon la règle du §17.2 (juste au-dessus du
+p95 inter, inchangé à 0,658) ; aucun réajustement ne se justifie. En
+revanche, CLAHE **rapproche** les deux distributions (médiane inter +0,012,
+intra −0,007) : il dégrade légèrement la séparation au lieu de l'améliorer,
+ce qui est cohérent avec les deux rattachements faux mesurés.
+
+## 19.4 Position par rapport au §4 de `CLAUDE.md`
+
+Avec CLAHE, sur `fort_occ4` : `erreur_comptage_max_operational` **non tenu**
+(OUT fantôme, −1 hors entrée pendant 19 s ; exact en fin seulement par
+compensation) alors qu'il l'est sans CLAHE ; `visible_count` 9 (≤ 1 non
+tenu, 8 sans) ; inversions 13 (≤ 1 non tenu, 12 sans) ; FPS tenu (3,74).
+Non-régression `rare_occ2` : `operational` identique, `visible_count`
+max 4 → 5, identités 5 → 6 (ambigu sans vérité terrain).
+
+**Lecture** : sur ce corpus, CLAHE n'améliore aucune métrique de vérité
+terrain de `fort_occ4` et en dégrade trois, par l'intermédiaire du ReID. Il
+reste **désactivé** ; décision à la personne responsable.
+
+## 19.5 Tests
+
+- `tests/test_preprocessing_clahe.py` (nouveau, 13 cas) : désactivé par défaut
+  avec les paramètres standards ; section optionnelle ; valeurs invalides
+  refusées ; publication et rechargement de la config résolue ; seule la
+  luminance change (a, b à ±3 près) ; égalité avec la référence OpenCV ;
+  déterminisme ; rappel en place (mêmes objets, aucune frame ajoutée ni
+  retirée).
+- `tests/test_protocol.py::test_config_resolue_ne_contient_que_des_sections_du_schema` :
+  attente **corrigée**, `preprocessing` ajouté à l'ensemble des sections. La
+  section est toujours publiée, même désactivée, conformément à la règle
+  « tout paramètre publié dans `config_resolved.yaml` ».
+- Suite complète : **698 collectés, 697 passés, 1 ignoré**, couverture
+  **93,79 %**.
+
+## 19.6 Non résolu
+
+- Décision d'activation du CLAHE (mesures ci-dessus).
+- `clip_limit` et `tile_grid_size` non explorés (valeurs standards seules).
+- Lecture asynchrone (§8.1) et masque ROI (§8.3) non faits.
+- Lots 2, 5 et 6 toujours à faire ; ce lot a été mesuré avant eux.

@@ -87,6 +87,7 @@ from geometry import (
 )
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
+from preprocessing import ClaheNormalizer, make_predict_callback
 from second_trace import SecondTraceUnavailable, SecondTracer, source_fps
 from track_diagnostics import (
     BOXES_EMPTY,
@@ -917,6 +918,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         from ultralytics import YOLO  # import tardif : évite de charger torch pour --help
 
         model = YOLO(str(model_path))
+        if config.preprocessing.clahe.enabled:
+            # Lot 7 : CLAHE en place avant le letterbox d'Ultralytics, donc vu
+            # à l'identique par YOLO, le tracker (GMC) et l'extracteur ReID.
+            model.add_callback(
+                "on_predict_batch_start",
+                make_predict_callback(
+                    ClaheNormalizer(config.preprocessing.clahe),
+                    lambda ms: profiler.record("preprocessing", ms),
+                ),
+            )
         generator = model.track(
             source=source,
             tracker=str(tracker_path),

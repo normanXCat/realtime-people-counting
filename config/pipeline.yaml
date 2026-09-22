@@ -571,3 +571,15 @@ presence:
     # extraits de la même détection que la boîte : pas de boîte, pas de point) et
     # pouvait maintenir jusqu'à 10 s une personne réellement sortie du champ.
     max_head_staleness_frames: 1
+
+# -- Prétraitement (lot 7, docs/lot_7_pretraitement.md §8.2) ---------------
+# CLAHE sur le canal L de l'espace LAB (jamais sur les trois canaux BGR : la
+# teinte, exploitée par le descripteur d'apparence, doit rester intacte).
+# Appliqué en place sur la frame avant YOLO : le tracker et OSNet découpent la
+# même image normalisée. Toujours actif ou toujours inactif, jamais conditionné
+# au contraste de la frame.
+preprocessing:
+  clahe:
+    enabled: false        # PROVISOIRE — désactivé par défaut, décision en attente (§19 du journal)
+    clip_limit: 2.0       # valeur standard OpenCV, non calibrée
+    tile_grid_size: [8, 8]

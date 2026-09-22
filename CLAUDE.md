@@ -35,7 +35,7 @@ au moment de traiter le lot concerné.
 | Lot 3 — ReID OSNet + galerie | `docs/lot_3_reid_osnet.md` | **3.a appliqué** le 2026-09-21, avancé avant le lot 2 sur instruction (`docs/correctif_occlusion.md` §16-§17) : OSNet-x0.25 ONNX FP32, calcul à la demande + déclencheur de proximité, `similarity_threshold` 0,66 `PROVISOIRE` ; marges mesurées et **inchangées** (0,10 / 0,12) ; déclencheur de proximité **désactivé** (0 inversion corrigée). Correspondance complète **validée** : inversions réelles 14 → 13, toutes au niveau de la piste technique (§17.8) ; `id_switches_reels` loin de la cible ≤ 1. **3.b reportée en perspective** (gel du code) | `107643d`, puis §17.8 | 2026-09-21 |
 | Lot 5 — retouches locales | `docs/lot_5_retouches.md` | à faire | — | — |
 | Lot 6 — head_assist | `docs/lot_6_head_assist.md` | à faire | — | — |
-| Lot 7 — prétraitement | `docs/lot_7_pretraitement.md` | à faire | — | — |
+| Lot 7 — prétraitement (**minimal, avancé sur instruction**) | `docs/lot_7_pretraitement.md` | **mesuré, en attente de décision** (`docs/correctif_occlusion.md` §19) : CLAHE canal L de LAB (2,0 ; 8 × 8), `preprocessing.clahe.enabled: false` par défaut. Avec CLAHE sur `fort_occ4` (ligne de référence) : 1 OUT fantôme + 1 `NEW` parasite (fin 12 par compensation), `visible_count` 8 → 9, inversions 12 → 13, 2 `REID_MATCH` faux ; FPS 3,92 → 3,74. `similarity_threshold` 0,66 reste valable (p95 inter 0,657 → 0,658). ROI et lecture asynchrone non faits | voir `git log` (étiquette `soutenance-pretraitement`) | 2026-09-23 |
 | Clôture — mise à jour de `docs/rapport_final.md` (§7.1) | — | à faire | — | — |
 
 **Ordre imposé : 1 → 4 → 2 → 3 → 5 → 6 → 7.** Les numéros de lot sont
@@ -154,6 +154,20 @@ zone ou un franchissement.
   **Ne jamais changer cette ligne en cours de plan** : elle détermine zones,
   côtés et franchissements, donc tous les compteurs IN/OUT et de rétention. Une
   autre ligne rend les tableaux avant/après entre lots incomparables.
+- **Ligne de référence de `fort_occ4` — décision du 2026-09-23** (personne
+  responsable) : la ligne inclinée de la porte, déjà utilisée pour la version E
+  (`docs/correctif_occlusion.md` §18.1), remplace la ligne de convention **pour
+  `fort_occ4` uniquement** :
+
+  ```bash
+  --line 0.383,1.0,0.56,0.55    # inside_side: negative (côté intérieur = la salle)
+  ```
+
+  Sur 1280×720 : segment (490, 720) – (717, 396). 12 pistes la franchissent une
+  fois chacune (12 entrées réelles). Les autres vidéos du corpus, dont
+  `rare_occ2`, restent mesurées sur `0.05,0.6,0.95,0.6`. Les relevés de
+  `fort_occ4` antérieurs au §18.1 (ligne de convention) ne sont pas
+  comparables aux relevés sur cette ligne.
 - **Prérequis d'installation** : `models/yolo11n.pt` n'est pas versionné et doit
   être téléchargé avant tout lancement, sinon `verify_weights` échoue (code 3).
   Source et SHA-256 : `docs/correctif_occlusion.md` §11.3.

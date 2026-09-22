@@ -618,6 +618,27 @@ class PresenceConfig:
 
 
 @dataclass(frozen=True)
+class ClaheConfig:
+    """Normalisation lumineuse CLAHE sur le canal L de l'espace LAB (lot 7, §8.2).
+
+    Toujours active ou toujours inactive : jamais conditionnée au contraste de
+    la frame, sinon le descripteur d'apparence varierait sans changement
+    d'identité.
+    """
+
+    enabled: bool = False  # PROVISOIRE — désactivée tant que non décidée
+    clip_limit: float = 2.0
+    tile_grid_size: tuple[int, int] = (8, 8)
+
+
+@dataclass(frozen=True)
+class PreprocessingConfig:
+    """Prétraitement appliqué à la frame avant YOLO **et** avant le ReID."""
+
+    clahe: ClaheConfig = field(default_factory=ClaheConfig)
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """Configuration résolue et validée du pipeline."""
 
@@ -637,6 +658,7 @@ class PipelineConfig:
     diagnostics: DiagnosticsConfig
     anchor: AnchorConfig = field(default_factory=AnchorConfig)
     presence: PresenceConfig = field(default_factory=PresenceConfig)
+    preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     config_path: Path = DEFAULT_CONFIG_PATH
 
     # -- Accès pratiques ---------------------------------------------------
@@ -728,7 +750,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     known = {
         "schema_version", "source", "model", "tracker", "reid", "line", "geometry",
         "timing", "occupancy", "output", "stabilization", "display", "logging",
-        "diagnostics", "anchor", "presence",
+        "diagnostics", "anchor", "presence", "preprocessing",
     }
     for key in raw:
         if key not in known:
@@ -1170,6 +1192,21 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         problems.append("display.window_name est vide : un nom de fenêtre est requis")
 
     # -- Assistance tête (additif, désactivé par défaut) -------------------
+    clahe_raw = _section(_section(raw, "preprocessing"), "clahe")
+    clahe_clip = _positive(clahe_raw.get("clip_limit", 2.0), "preprocessing.clahe.clip_limit", problems)
+    clahe_grid_raw = clahe_raw.get("tile_grid_size", (8, 8))
+    clahe_grid: tuple[int, int] = (8, 8)
+    if not isinstance(clahe_grid_raw, (list, tuple)) or len(clahe_grid_raw) != 2:
+        problems.append(
+            "preprocessing.clahe.tile_grid_size doit être une liste de deux entiers "
+            f"(reçu {clahe_grid_raw!r})"
+        )
+    else:
+        cols = _positive_int(clahe_grid_raw[0], "preprocessing.clahe.tile_grid_size[0]", problems)
+        rows = _positive_int(clahe_grid_raw[1], "preprocessing.clahe.tile_grid_size[1]", problems)
+        if cols is not None and rows is not None:
+            clahe_grid = (cols, rows)
+
     presence_raw = _section(raw, "presence")
     head_assist_raw = _section(presence_raw, "head_assist")
     head_assist_enabled = bool(head_assist_raw.get("enabled", False))
@@ -1436,6 +1473,13 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                     if ha_max_head_staleness is not None
                     else 1
                 ),
+            ),
+        ),
+        preprocessing=PreprocessingConfig(
+            clahe=ClaheConfig(
+                enabled=bool(clahe_raw.get("enabled", False)),
+                clip_limit=float(clahe_clip or 2.0),
+                tile_grid_size=clahe_grid,
             ),
         ),
         config_path=config_path or DEFAULT_CONFIG_PATH,
