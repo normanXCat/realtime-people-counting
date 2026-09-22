@@ -956,7 +956,8 @@ Il lève l'étape bloquante du §3, demandée au §11.10.1.
 **Effectif réel, seconde par seconde** : 4, 5, 5, 5, 6, 6, 7, 7, 8, 8, 8, 8, 9,
 9, 10, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13,
 13, 13. La salle se remplit de 4 à 13 personnes, sans jamais se vider : aucune
-sortie réelle sur la séquence.
+sortie réelle sur la séquence. **Corrigé le 2026-09-22 (§18)** : `P13` n'entre
+jamais ; les six dernières valeurs passent de 13 à 12.
 
 **Segments d'occlusion annotés :**
 
@@ -1051,7 +1052,8 @@ reprise de l'annotation** : l'information est déjà là.
 
 Quatre enseignements, tous soutenus par la mesure :
 
-1. **`occupancy_operational` est exact** : 13 contre 13. Le bilan officiel ne se
+1. **`occupancy_operational` est exact** : 13 contre 13 (**corrigé au §18 : 13
+   contre 12, un `NEW` en trop**). Le bilan officiel ne se
    trompe pas — cohérent avec le fait que la vérité terrain ne comporte aucune
    sortie réelle et que le pipeline n'a produit aucun `OUT` fantôme (les 13
    purges sont toutes `is_exit=false`, §11.5).
@@ -1788,7 +1790,8 @@ derrières une porte* » — les quatre sont en train d'entrer, pas installées.
 seconde 8, et ainsi de suite jusqu'à `P13` à la seconde 29 : la salle se
 remplit de 0 à 13 par la porte, sans jamais se vider (§12.1).
 
-Le comptage attendu est donc **0 initial et 13 franchissements**. Le pipeline
+Le comptage attendu est donc **0 initial et 13 franchissements** (**12 depuis la
+correction du §18**). Le pipeline
 en produit 3, 2 et 7 : il place trois personnes au warm-up alors qu'elles sont
 encore dans l'embrasure, et il rattrape ensuite la majorité des autres par
 `NEW`, c'est-à-dire comme des apparitions intérieures — des personnes
@@ -1872,7 +1875,8 @@ reste sur stderr, dans les logs, et la base retenue est publiée dans
 1. **Le symptôme visé n'a pas bougé** : `erreur_comptage_max_visible` vaut 9
    avant comme après, pour une cible de ≤ 1. Le lot est un préalable de
    mesure, pas un correctif (§14.7.3).
-2. **`occupancy_operational` finit à 12 pour 13 personnes réelles**, à cause de
+2. **`occupancy_operational` finit à 12 pour 13 personnes réelles** (**12 pour
+   12 depuis la correction du §18**, juste par compensation), à cause de
    l'instant de fin du warm-up (§14.7.2). À traiter au lot 2.
 3. **L'effet propre de `track_buffer_seconds` n'est pas isolé** (§14.8), et la
    valeur 15,0 s reste `PROVISOIRE` : la plus longue occlusion du corpus reste
@@ -3081,3 +3085,42 @@ supprime les erreurs propres à la couche d'identité ; celles du tracker
 demanderaient d'agir sur l'association de BoT-SORT (seuils ou ReID natif), sur
 la galerie multi-échantillons (3.b, reportée) ou sur la détection elle-même
 (§8, détection têtes / haut du corps, en réserve).
+
+# 18. Correction de la vérité terrain : `P13` n'entre jamais (2026-09-22)
+
+**Constat de la personne responsable** : `P13` n'est visible qu'à l'extérieur
+(par la porte à s29 et s31, puis par la fenêtre) ; il n'entre jamais dans la
+salle. Commit `d150530` :
+
+- `tests/fixtures/ground_truth_fort_occ4.json` : `P13` retiré de `present` sur
+  s29–s34, `count` 13 → **12** ; nouveau champ `visibles_hors_salle: ["P13"]`
+  à s29 et s31 ;
+- `scripts/gt_matching.py` (`visible_labels`) : ces étiquettes comptent parmi
+  les visibles, jamais parmi les présentes. Test ajouté.
+
+**Total attendu : 12 présents en fin de séquence, 0 initial et 12
+franchissements.** `erreur_comptage_max_visible` est inchangée (`P13` restait
+visible aux mêmes secondes) ; les métriques d'identité aussi (`P13` garde son
+étiquette).
+
+**Chiffres déjà publiés, recalculés** (`occupancy_operational` en fin, ligne de
+convention) :
+
+| Relevé | Publié | Corrigé |
+|---|---|---|
+| Baseline lot 1 (§12.2, §14) | 13 contre 13, « exact » | **13 contre 12 (+1)** |
+| lot 1 après (§14.7.2) | 12 contre 13 | 12 contre 12 (juste par compensation) |
+| lot 4, `new_track_thresh` 0,60 | 14 | 14 contre 12 (+2) |
+| `soutenance-seuils` | 18 | 18 contre 12 (+6) |
+| `soutenance-osnet2` | 19 | **19 contre 12 (+7)** |
+
+`erreur_comptage_max_operational` sur `soutenance-osnet2` : 6 → 7.
+
+**Conséquence** : l'affirmation « `occupancy_operational` déjà exact, 13 contre
+13 » (`CLAUDE.md` §4 et §8, §12.2 et §14 de ce journal) était fausse ; corrigée
+dans le même commit. Le surcomptage apparaît avec les seuils du lot 4 : `NEW`
+par apparition intérieure créés sur des fragments de personnes déjà comptées.
+Mesuré aussi sur une ligne de porte (`0.383,1.0,0.383,0.62`) : IN = 12 exact
+dans toutes les versions, `soutenance-osnet2` finit à 18 contre 12 par 5 `NEW`
+de fragments et 1 `NEW` de `P13` vu par la fenêtre (mesure exploratoire, hors
+ligne figée ; relevés dans `results/lot4/trace_porte/`, non versionnés).

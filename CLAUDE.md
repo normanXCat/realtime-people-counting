@@ -84,9 +84,10 @@ est `accepté`.
 
 **Dette de comptage relevée au lot 1, à traiter au lot 2** : sur `fort_occ4`,
 le pipeline compte 3 `initial` + 2 `IN` + 7 `NEW` là où la vérité terrain
-donne **0 initial et 13 franchissements** — la salle est vide à la seconde 0 et
-se remplit entièrement par la porte. Le total (12 contre 13) est presque juste
-par compensation ; la structure du comptage, elle, ne l'est pas (§14.7.2.1).
+donne **0 initial et 12 franchissements** — la salle est vide à la seconde 0 et
+se remplit entièrement par la porte (`P13`, vu seulement à l'extérieur, n'entre
+jamais : vérité terrain corrigée le 2026-09-22, `docs/correctif_occlusion.md`
+§18). Le total (12 contre 12) n'est juste que par compensation ; la structure du comptage, elle, ne l'est pas (§14.7.2.1).
 
 ---
 
@@ -289,7 +290,8 @@ ligne**. Entre les deux, la personne est dans l'image sans être encore entrée 
 le retard d'une à deux secondes est le comportement **correct**, pas une
 erreur. Mesuré sur la baseline de `fort_occ4` : l'écart vaut −1 pendant chaque
 entrée, −2 à deux instants où deux personnes entrent coup sur coup (s15 à s18),
-et **0 à la dernière seconde** (13 contre 13). Un correctif qui ferait
+et **+1 à la dernière seconde** (13 contre 12 depuis la correction de `P13`,
+`docs/correctif_occlusion.md` §18 : un `NEW` en trop). Un correctif qui ferait
 disparaître ce retard ferait compter des personnes non entrées.
 
 **Baseline FPS — FIGÉE (lot 0).** `3,825 ips`, médiane de **trois rejouages
@@ -471,7 +473,7 @@ Décisions prises hors du code, à ne pas rouvrir sans instruction humaine.
 | **Warm-up initial** | **conservé** | Identifie les personnes déjà présentes au lancement. Ces identités sont hors zone de franchissement, donc couvertes par la rétention illimitée du lot 2. |
 | **FAISS pour l'indexation ReID** | **écarté à ce stade** | Similarité cosinus NumPy suffit à 10–50 identités (< 0,1 ms). À rouvrir au-delà de plusieurs milliers d'empreintes. |
 | **Tête comme ancre géométrique** | **interdit** | Voir §1. |
-| **Logique IN / OUT / NEW et `occupancy_operational`** | **interdit de modifier** | Ce compteur est **déjà exact** : 13 contre 13 en fin de `fort_occ4`, sans aucun IN/OUT fantôme (baseline lot 1). Il compte les personnes **dans la salle, visibles ou non** — ce n'est donc pas lui que l'occlusion dégrade. Aucun lot de 1 à 7 ne touche à cette logique ; ce qui doit progresser est `visible_count` (et `occupancy_observed`). Toute modification de la FSM de franchissement, des règles NEW, ou du calcul de `occupancy_operational` est hors périmètre, au même titre que l'ancre géométrique tête. À rouvrir uniquement sur instruction humaine explicite. |
+| **Logique IN / OUT / NEW et `occupancy_operational`** | **interdit de modifier** | Ce compteur était **presque exact** à la baseline du lot 1 : 13 contre 12 en fin de `fort_occ4` (vérité terrain corrigée le 2026-09-22, §18 du journal), sans IN/OUT fantôme sur la ligne de convention. **Il surcompte depuis le lot 4** (19 contre 12 avec `soutenance-osnet2`, 18 contre 12 sur une ligne de porte), par des `NEW` créés sur des fragments de personnes déjà comptées — cause en amont (tracker), pas dans cette logique. Il compte les personnes **dans la salle, visibles ou non** — ce n'est donc pas lui que l'occlusion dégrade. Aucun lot de 1 à 7 ne touche à cette logique ; ce qui doit progresser est `visible_count` (et `occupancy_observed`). Toute modification de la FSM de franchissement, des règles NEW, ou du calcul de `occupancy_operational` est hors périmètre, au même titre que l'ancre géométrique tête. À rouvrir uniquement sur instruction humaine explicite. |
 
 ---
 
