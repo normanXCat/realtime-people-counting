@@ -9,9 +9,9 @@
 # détections faibles (personne floue) pour le second étage d'association. Le
 # garde-fou contre les faux positifs n'est pas le seuil d'inférence YOLO
 # (model.confidence = 0.10 dans pipeline.yaml). new_track_thresh le portait à
-# 0.7 ; abaissé à 0.60 au lot 4 (PROVISOIRE), le garde-fou est reporté sur le
-# filtre géométrique et timing.confirmation_seconds de pipeline.yaml, où figurent
-# la valeur précédente, la mesure et le compromis.
+# 0.7 ; abaissé à 0.60 au lot 4, il est rétabli à 0.70 le 2026-09-22 (version E,
+# docs/correctif_occlusion.md §18) : à 0.60, des fragments créaient des NEW en
+# trop. Valeur précédente, mesure et compromis : pipeline.yaml.
 #
 # track_buffer (150 frames ≈ 5 s à 30 ips) couvre le p90 des occlusions mesurées
 # sur les vidéos de test (médiane 2,5 s, p90 5,1 s) ; au-delà, la galerie ReID
@@ -20,9 +20,9 @@
 tracker_type: botsort
 
 # Association et conservation des pistes pendant les occlusions.
-track_high_thresh: 0.30  # lot 4, PROVISOIRE — valeur précédente 0.4 (voir pipeline.yaml)
+track_high_thresh: 0.40  # version E (§18), PROVISOIRE — valeur précédente 0.30 (voir pipeline.yaml)
 track_low_thresh: 0.1
-new_track_thresh: 0.60   # lot 4, PROVISOIRE — valeur précédente 0.7
+new_track_thresh: 0.70   # version E (§18), PROVISOIRE — valeur précédente 0.60
 track_buffer: 150
 match_thresh: 0.9
 fuse_score: True

@@ -28,9 +28,9 @@ model:
   # produit des scores faibles mais des boîtes encore exploitables par
   # l'association BoT-SORT. Filtrer ces détections ici les supprime avant même
   # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
-  # Le garde-fou contre les faux positifs était porté par new_track_thresh (0,7) ;
-  # depuis le lot 4 (0,60), il l'est par le filtre géométrique et
-  # timing.confirmation_seconds — voir la section tracker.
+  # Le garde-fou contre les faux positifs est porté par new_track_thresh (0,7),
+  # abaissé à 0,60 au lot 4 puis RÉTABLI à 0,70 le 2026-09-22 (version E,
+  # docs/correctif_occlusion.md §18) — voir la section tracker.
   confidence: 0.10          # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
   # nms_iou — CONSERVÉ à 0,55 après mesure (lot 1, §1.2). Le lot proposait de
   # le monter à 0,85 ou 0,90, pour récupérer les détections de personnes
@@ -43,8 +43,19 @@ model:
   # erreur_comptage_max_visible vaut 9 dans les TROIS cas : les personnes
   # manquantes ne manquent pas par suppression NMS. Monter le seuil ne fait
   # que créer des doublons promus en identités. Voir docs/correctif_occlusion.md
-  # §14.6. Reste PROVISOIRE : non calibré sur un corpus disjoint.
-  nms_iou: 0.55             # PROVISOIRE — 0,85 et 0,90 mesurés et écartés (§14.6)
+  # §14.6.
+  # nms_iou — MODIFIÉ le 2026-09-22 : 0,55 -> 0,45 (version E,
+  # docs/correctif_occlusion.md §18). Valeurs mesurées : 0,45 / 0,40.
+  #   raison : des boîtes tête-épaules recouvrant la boîte entière à IoU
+  #     0,31-0,50 survivaient à 0,55 et devenaient des doublons (pistes et
+  #     identités en trop). À 0,45 (ligne de porte, fort_occ4) : doublons
+  #     23 -> 11, inversions 13 -> 10, visible_count inchangé (somme 95 -> 97).
+  #   0,40 ÉCARTÉ : doublons 7 mais visible_count dégradé (somme 95 -> 108),
+  #     des voisins réels sont supprimés.
+  #   compromis accepté : seul, 0,45 ne réduit pas le surcomptage (NEW 6 -> 8) ;
+  #     il est appliqué avec new_track_thresh 0,70 et track_high_thresh 0,40.
+  #   PROVISOIRE : calibré sur l'ensemble de test lui-même.
+  nms_iou: 0.45             # PROVISOIRE — valeur précédente 0,55 (§18)
   image_size: 960           # PROVISOIRE — à calibrer
   classes: [0]              # classe COCO « person »
   device: cpu               # « cpu » (machine de référence) | « auto » | « cuda:0 »
@@ -55,7 +66,19 @@ tracker:
   # Seuils BoT-SORT, DISTINCTS du seuil YOLO et synchronisés avec le YAML lu par
   # Ultralytics (un test vérifie la synchronisation, sinon la divergence serait
   # silencieuse).
-  # track_high_thresh — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15.15).
+  # track_high_thresh — RÉTABLI À 0,40 le 2026-09-22 (version E,
+  #   docs/correctif_occlusion.md §18), valeur précédente 0,30. Mesuré sur
+  #   fort_occ4, ligne inclinée 0.383,1.0,0.56,0.55, avec new_track_thresh 0,70
+  #   et nms_iou 0,45 : occupancy_operational 17 -> 12 contre 12 (exact dès
+  #   s21), NEW sur des fragments de personnes déjà comptées 5 -> 0,
+  #   REID_AMBIGUOUS 13 -> 4, nouvelles identités pour une personne déjà
+  #   suivie 18 -> 10, doublons 23 -> 6, inversions 13 -> 12, aucun
+  #   rattachement faux.
+  #   compromis accepté (décision de la personne responsable) : visible_count
+  #   revient au niveau du lot 1 — erreur max 7 -> 8, somme des écarts visibles
+  #   95 -> 146 : le gain visible du lot 4 est abandonné au profit d'un bilan
+  #   officiel exact. PROVISOIRE.
+  # Historique — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15.15), 0,4 -> 0,30 :
   #   valeur précédente : 0.4. Valeurs mesurées : 0,30 / 0,25.
   #   raison : dans BoT-SORT (Ultralytics 8.4.126, byte_tracker.py), les pistes
   #     PERDUES ne participent qu'à la première association, qui ne reçoit que
@@ -76,13 +99,19 @@ tracker:
   #   0,25 ÉCARTÉ : erreur visible 8 (pas de gain), doublons 12, et les
   #     détections faibles de l'enfant volent la piste de la personne assise dès
   #     s27.
-  #   invariant : new_track_thresh (0,60) >= track_high_thresh (0,30) >
+  #   invariant : new_track_thresh (0,70) >= track_high_thresh (0,40) >
   #     track_low_thresh (0,1) >= model.confidence (0,10) — vérifié par
   #     src/config.py et par les tests.
   #   PROVISOIRE : calibré sur l'ensemble de test lui-même.
-  track_high_thresh: 0.30   # plancher de l'association principale
+  track_high_thresh: 0.40   # plancher de l'association principale — PROVISOIRE, précédente 0,30 (§18)
   track_low_thresh: 0.1     # plancher du second étage (détections faibles)
-  # new_track_thresh — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15).
+  # new_track_thresh — RÉTABLI À 0,70 le 2026-09-22 (version E,
+  #   docs/correctif_occlusion.md §18), valeur précédente 0,60. Raison : à
+  #   0,60, des fragments de personnes déjà comptées créaient des pistes
+  #   neuves à l'intérieur, promues en NEW par apparition intérieure :
+  #   surcomptage 17-19 contre 12 selon la ligne. Effet et compromis : voir
+  #   track_high_thresh ci-dessus (mesure conjointe). PROVISOIRE.
+  # Historique — MODIFIÉ au lot 4 (docs/correctif_occlusion.md §15), 0,7 -> 0,60 :
   #   valeur précédente : 0.7. Valeurs mesurées : 0,60 / 0,55 / 0,45.
   #   raison : seul des trois seuils de la fiche à déplacer visible_count sur
   #     fort_occ4 (base vidéo, bruit nul). À 0,60 : erreur_comptage_max_visible
@@ -113,7 +142,7 @@ tracker:
   #     NMS relevé avec lequel combiner.
   #   PROVISOIRE : calibré sur l'ensemble de test lui-même, pas sur un corpus
   #     disjoint.
-  new_track_thresh: 0.60    # plancher exigé pour créer une NOUVELLE piste
+  new_track_thresh: 0.70    # plancher exigé pour créer une NOUVELLE piste — PROVISOIRE, précédente 0,60 (§18)
   # -- Lot 4 : mesure isolée des trois seuils (docs/correctif_occlusion.md §15)
   # Base vidéo, fort_occ4 + rare_occ2, ligne de convention figée. Résultat :
   #   match_thresh 0,9 -> 0,75 : ÉCARTÉ. Aucun gain visible (erreur visible 9),

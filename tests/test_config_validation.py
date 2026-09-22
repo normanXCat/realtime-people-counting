@@ -83,14 +83,16 @@ def test_yolo_threshold_is_low_enough_for_the_tracker_low_stage():
     config = load_config()
     assert config.model.confidence == pytest.approx(0.10)
     assert config.tracker.track_low_thresh == pytest.approx(0.1)
-    # 0,4 -> 0,30 au lot 4 (docs/correctif_occlusion.md §15.15) : l'ordre des
+    # 0,4 -> 0,30 au lot 4 (docs/correctif_occlusion.md §15.15), puis rétabli à
+    # 0,40 (version E, §18 : surcomptage par NEW sur fragments). L'ordre des
     # seuils vérifié ci-dessous est inchangé.
-    assert config.tracker.track_high_thresh == pytest.approx(0.30)
+    assert config.tracker.track_high_thresh == pytest.approx(0.40)
     assert config.tracker.track_low_thresh < config.tracker.track_high_thresh
-    # 0,7 -> 0,60 au lot 4 (docs/correctif_occlusion.md §15). L'invariant
-    # vérifié ici est inchangé : le seuil de création reste au-dessus du
-    # plancher d'association principal et du seuil YOLO.
-    assert config.tracker.new_track_thresh == pytest.approx(0.60)
+    # 0,7 -> 0,60 au lot 4 (docs/correctif_occlusion.md §15), puis rétabli à
+    # 0,70 (version E, §18). L'invariant vérifié ici est inchangé : le seuil de
+    # création reste au-dessus du plancher d'association principal et du seuil
+    # YOLO.
+    assert config.tracker.new_track_thresh == pytest.approx(0.70)
     assert config.tracker.new_track_thresh >= config.tracker.track_high_thresh
     assert config.model.confidence <= config.tracker.track_low_thresh
     assert coherence_warnings(config) == []

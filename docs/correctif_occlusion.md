@@ -3124,3 +3124,83 @@ Mesuré aussi sur une ligne de porte (`0.383,1.0,0.383,0.62`) : IN = 12 exact
 dans toutes les versions, `soutenance-osnet2` finit à 18 contre 12 par 5 `NEW`
 de fragments et 1 `NEW` de `P13` vu par la fenêtre (mesure exploratoire, hors
 ligne figée ; relevés dans `results/lot4/trace_porte/`, non versionnés).
+
+## 18.1 Version E appliquée : `new_track_thresh` 0,70, `track_high_thresh` 0,40, `nms_iou` 0,45 (2026-09-22)
+
+> Mesuré sur un corpus contenant 12 entrées réelles et 5 à 7 `NEW` parasites
+> (fragments de personnes déjà comptées) selon la version.
+
+**Décision de la personne responsable** après comparaison de sept versions sur
+la ligne inclinée `0.383,1.0,0.56,0.55` (côté intérieur = la salle ; fenêtre
+dehors, tables dedans, 12 pistes franchissant une fois chacune). OSNet-x0.25,
+`similarity_threshold` 0,66 et `describe_on_proximity: false` inchangés.
+
+| Seuil | Avant | Après | Statut |
+|---|---|---|---|
+| `tracker.new_track_thresh` (+ `custom_botsort.yaml`) | 0,60 | **0,70** | `PROVISOIRE` |
+| `tracker.track_high_thresh` (+ `custom_botsort.yaml`) | 0,30 | **0,40** | `PROVISOIRE` |
+| `model.nms_iou` | 0,55 | **0,45** | `PROVISOIRE` |
+
+**Comparaison des versions (`fort_occ4`, ligne inclinée, 12 attendus)** :
+
+| | A `soutenance-osnet2` | B high 0,40 | C high 0,40 + NMS 0,45 | D NMS 0,45 | **E (appliquée)** | F `v_max_ratio` 0,5 | G `v_max_ratio` 0,3 |
+|---|---|---|---|---|---|---|---|
+| IN / OUT / NEW | 12/0/5 | 12/0/5 | 12/0/4 | 12/0/7 | **12/0/0** | 12/0/5 | 12/0/5 |
+| `operational` en fin | 17 | 17 | 16 | 19 | **12** | 17 | 17 |
+| NEW d'une personne déjà comptée | 5 | 4 | 3 | 6 | **0** | 5 | 5 |
+| Nouvelles identités, personne déjà suivie | 18 | 18 | 17 | 17 | **10** | 18 | 18 |
+| `REID_AMBIGUOUS` | 13 | 15 | 12 | 12 | **4** | 13 | 10 |
+| Rattachements faux | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| Inversions (comptage robuste) | 13 | 13 | 9 | 10 | 12 | 14 | 14 |
+| Doublons (secondes, vérité terrain) | 23 | 9 | 7 | 11 | **6** | 23 | 23 |
+| `visible_count` erreur max / somme | 7 / 95 | 8 / 99 | 7 / 106 | 7 / 97 | **8 / 146** | 7 / 95 | 7 / 95 |
+
+B et C : 24 et 21 boîtes sans étiquette par transfert (métriques d'identité
+moins sûres). F et G : l'hypothèse « rayon de ré-identification trop large »
+n'est pas vérifiée (NEW et fragments inchangés).
+
+**Confirmation sur la configuration versionnée** (relevés parallèles, FPS
+mesuré seul, trois rejouages) :
+
+| | `soutenance-osnet2` | **E versionnée** |
+|---|---|---|
+| `fort_occ4`, ligne inclinée : `operational` en fin contre 12 | 17 | **12** (exact dès s21) — identique à la mesure de E |
+| `fort_occ4`, ligne de convention : initial / IN / NEW, `operational` en fin | 3 / 7 / 9 → 19 | 3 / 2 / 6 → **11** (−1) |
+| `fort_occ4`, ligne de convention : pistes / identités / `REID_AMBIGUOUS` | 31 / 31 / 13 | 19 / 17 / 4 |
+| `fort_occ4` : `visible_count` erreur max / somme | 7 / 95 | 8 / 146 |
+| `rare_occ2` : `operational` en fin (IN / NEW) | 5 (3 / 2) | **4 (2 / 2)** |
+| `rare_occ2` : pistes / identités / boîtes incluses | 11 / 10 / 24 | 6 / 5 / 14 |
+| `rare_occ2` : `visible_count` max | **5** | **4** |
+| FPS `fort_occ4` (3 rejouages) | 3,474 (un seul run) | 4,225 / 4,198 / 4,213 → **4,21** |
+| FPS `rare_occ2` (3 rejouages) | 4,13 / 4,05 | 4,271 / 4,258 / 4,323 → **4,27** |
+
+**Critères du §4 (`fort_occ4`, ligne inclinée)** :
+
+- `erreur_comptage_max_operational` : **tenu** (exact en fin de séquence et
+  dès s21, aucun IN/OUT fantôme, aucun `NEW` parasite). Le retard pendant
+  l'entrée (−4 à −6) vient de l'annotation, qui compte une personne dès
+  qu'elle apparaît dans l'embrasure ; il est identique dans toutes les
+  versions.
+- `erreur_comptage_max_visible` ≤ 1 : **non tenu**, 8 (7 avant).
+- `id_switches_reels` ≤ 1 : **non tenu** (12 inversions).
+- `fusions_reelles` non signalées : 1 fusion (s12), non signalée.
+- FPS ≥ 3,06 : **tenu** (4,21).
+- Non-régression `rare_occ2` : **non tenue**. `visible_count` retombe à 4
+  personnes vues au plus, contre 5 depuis le lot 4, et `operational` passe
+  de 5 à 4 : c'est le niveau d'avant le lot 4 (§15). En contrepartie, les
+  doublons et les identités en trop diminuent (identités 10 → 5, boîtes
+  incluses 24 → 14). Sans vérité terrain sur `rare_occ2`, on ne peut pas
+  trancher entre une entrée manquée et un doublon retiré.
+
+**Compromis accepté** : le gain visible du lot 4 est abandonné au profit d'un
+bilan officiel exact.
+
+**Tests** : `tests/test_config_validation.py`, valeurs attendues 0,30 → 0,40
+et 0,60 → 0,70 (l'invariant d'ordre des seuils est inchangé). Suite complète
+: **685 collectés, 684 passés, 1 ignoré**, couverture **93,70 %**.
+
+**Non résolu** : `visible_count` (8 contre ≤ 1), inversions (12 contre ≤ 1),
+fusion non signalée, et la régression visible de `rare_occ2`. La ligne
+inclinée est une mesure exploratoire : la ligne figée du plan reste
+`0.05,0.6,0.95,0.6`, et le changement de ligne de référence est une décision à
+prendre. Relevés non versionnés : `results/lot4/trace/{incl*,finale*}`.
