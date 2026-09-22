@@ -12,7 +12,8 @@
     "3. Pour chaque seconde : mettre dans 'present' les etiquettes visibles, et leur nombre dans 'count'.",
     "4. Une personne masquee puis revenue GARDE son etiquette. Une nouvelle personne recoit une etiquette neuve.",
     "5. 'notes' : ecrire le doute plutot que de trancher arbitrairement.",
-    "6. Remplir 'occlusions' pour tout masquage de plus de 3 secondes."
+    "6. Remplir 'occlusions' pour tout masquage de plus de 3 secondes.",
+    "7. 'visibles_hors_salle' : etiquettes visibles a l'image mais jamais entrees dans la salle (hors 'present' et 'count', comptees parmi les visibles)."
   ],
   "etiquettes": {
     "P1": "chemise rouge_jaune, 1e rang gauche",
@@ -27,7 +28,7 @@
     "P10": "chemise noir, 2e rang droite",
     "P11": "chemise blanc, 1e rang droite",
     "P12": "chemise noir, 2e rang droite",
-    "P13": "chemise bleu_noir, 1e rang droite"
+    "P13": "chemise bleu_noir, visible seulement a l'exterieur (par la porte) : n'entre jamais dans la salle, jamais present (correction du 2026-09-22)"
   },
   "secondes": [
     {
@@ -236,43 +237,45 @@
     {
       "seconde": 29,
       "image": "t30.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "visibles_hors_salle": ["P13"],
       "notes": "P13 apparait, P12 occulte P3. P9 n'est pas encore visible"
     },
     {
       "seconde": 30,
       "image": "t31.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
       "notes": "P13 n'est plus visible, P3 n'est plus occulté, P12 disparait"
     },
     {
       "seconde": 31,
       "image": "t32.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
+      "visibles_hors_salle": ["P13"],
       "notes": "P12 et P9 ne sont pas visibles . P13 apparait"
     },
     {
       "seconde": 32,
       "image": "t33.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
       "notes": "P13 et P9 ne sont pas visibles . P12 est occulté par P4"
     },
     {
       "seconde": 33,
       "image": "t34.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
       "notes": "P4 occulte P12, P12 occulte P3, P9 n'est pas visible puisqu'il est sorti de la zone de camera mais reste dans la salle "
     },
     {
       "seconde": 34,
       "image": "t35.jpg",
-      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12", "P13"],
-      "count": 13,
+      "present": ["P1", "P2", "P3", "P4", "P5","P6","P7", "P8", "P9", "P10", "P11", "P12"],
+      "count": 12,
       "notes": "P4 occulte P12, P12 occulte P3 . P9 n'est pas encore visible . P2 occulte P10 ."
     }
   ],

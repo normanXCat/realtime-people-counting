@@ -202,7 +202,9 @@ def propose(trace: list[dict], truth: dict) -> dict:
 
 
 def visible_labels(truth: dict, matching: dict) -> dict[int, set[str]]:
-    """Étiquettes **visibles** par seconde = présentes moins les non visibles."""
+    """Étiquettes **visibles** par seconde = présentes moins les non visibles,
+    plus les ``visibles_hors_salle`` (à l'image, jamais entrées : P13 de
+    ``fort_occ4``)."""
     intervals = matching.get("non_visibles", {}).get("intervalles", {})
     hidden: dict[int, set[str]] = defaultdict(set)
     for label, ranges in intervals.items():
@@ -210,7 +212,8 @@ def visible_labels(truth: dict, matching: dict) -> dict[int, set[str]]:
             for second in range(int(start), int(end) + 1):
                 hidden[second].add(label)
     return {
-        int(entry["seconde"]): set(entry["present"]) - hidden[int(entry["seconde"])]
+        int(entry["seconde"]): (set(entry["present"]) - hidden[int(entry["seconde"])])
+        | set(entry.get("visibles_hors_salle", []))
         for entry in truth["secondes"]
     }
 

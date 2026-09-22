@@ -162,6 +162,16 @@ def test_visibilite_derivee_des_intervalles_relus(truth):
     assert visibles[2] == {"P1"}
 
 
+def test_visible_hors_salle_compte_parmi_les_visibles_pas_les_presentes(truth):
+    """Une personne vue à l'extérieur (P13 de fort_occ4) est visible, jamais présente."""
+    truth = json.loads(json.dumps(truth))
+    truth["secondes"][1]["visibles_hors_salle"] = ["P9"]
+    visibles = gt_matching.visible_labels(truth, {})
+
+    assert visibles[1] == {"P1", "P2", "P9"}
+    assert "P9" not in truth["secondes"][1]["present"]
+
+
 def test_comptage_compare_chaque_compteur_a_son_referentiel(truth):
     """operational ↔ présentes, visible_count ↔ visibles annotées (CLAUDE.md §6)."""
     trace = [
