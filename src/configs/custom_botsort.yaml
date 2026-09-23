@@ -30,7 +30,7 @@ fuse_score: True
 # Re-identification native BoT-SORT.
 with_reid: True
 model: auto
-proximity_thresh: 0.5
+proximity_thresh: 0.80  # variante E2 (§20), PROVISOIRE — valeur précédente 0.5 (voir pipeline.yaml)
 appearance_thresh: 0.25
 
 # Caméra fixe.

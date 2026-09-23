@@ -95,6 +95,8 @@ def test_yolo_threshold_is_low_enough_for_the_tracker_low_stage():
     assert config.tracker.new_track_thresh == pytest.approx(0.70)
     assert config.tracker.new_track_thresh >= config.tracker.track_high_thresh
     assert config.model.confidence <= config.tracker.track_low_thresh
+    # 0,5 -> 0,80 (variante E2, docs/correctif_occlusion.md §20).
+    assert config.tracker.proximity_thresh == pytest.approx(0.80)
     assert coherence_warnings(config) == []
 
 

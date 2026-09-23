@@ -228,7 +228,17 @@ tracker:
   # de IdentityManager (qui, lui, opère après expiration de la piste technique).
   with_reid: true
   match_thresh: 0.9         # seuil d'association IoU principal
-  proximity_thresh: 0.5     # seuil de proximité du ReID natif
+  # proximity_thresh — 0,5 -> 0,80 le 2026-09-23 (variante E2, décision de la
+  #   personne responsable ; docs/correctif_occlusion.md §20). Précédente : 0,5.
+  #   Raison : repris après le lot 3 comme prévu au lot 4 ; avec OSNet, fort_occ4
+  #   ligne de référence : inversions 12 -> 10 (échanges entre pistes proches ;
+  #   reprises d'une piste perdue inchangées, 4), operational 12 contre 12 exact,
+  #   aucun NEW ni OUT parasite, aucun rattachement faux.
+  #   Compromis accepté : visible_count erreur max 8 -> 9.
+  #   Écartés : track_high_thresh 0,30 (+ rayon de report 1,0) — OUT fantôme à
+  #   s14 par rattachement faux ; les deux ensemble — gain d'inversions annulé.
+  #   PROVISOIRE : calibré sur l'ensemble de test lui-même.
+  proximity_thresh: 0.80    # seuil de proximité du ReID natif — PROVISOIRE, précédente 0,5 (§20)
   appearance_thresh: 0.25   # seuil d'apparence du ReID natif
   # Caméra FIXE : aucune compensation de mouvement ne doit être estimée (une GMC
   # active introduirait une instabilité de boîte et d'identifiant sans cause).

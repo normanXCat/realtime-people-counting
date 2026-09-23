@@ -3355,3 +3355,100 @@ reste **désactivé** ; décision à la personne responsable.
 - `clip_limit` et `tile_grid_size` non explorés (valeurs standards seules).
 - Lecture asynchrone (§8.1) et masque ROI (§8.3) non faits.
 - Lots 2, 5 et 6 toujours à faire ; ce lot a été mesuré avant eux.
+
+# 20. Variante E2 appliquée : `proximity_thresh` 0,5 → 0,80 (2026-09-23)
+
+> Mesuré sur un corpus contenant 12 inversions réelles (comptage robuste),
+> dont 4 reprises d'une piste perdue sur une autre personne, à la version E.
+
+**Objectif** : qu'une personne longtemps occultée rejoigne sa propre piste
+au lieu de celle d'une voisine. CLAHE reste désactivé (décision du
+2026-09-23, §19).
+
+## 20.1 Règle de report du `NEW` — réglages existants
+
+La règle qui diffère un `NEW` quand une personne déjà comptée est occultée à
+proximité (`occupancy_manager.occluded_counted_neighbours`, contrôlée dans
+`_count_new` et dans la FSM) a :
+
+- un **rayon** réglable : `geometry.occlusion_ambiguity_ratio` (0,5, en
+  fraction de la hauteur médiane des boîtes) ;
+- **aucune durée propre** : elle joue tant que la personne comptée reste en
+  mémoire, occultée ou absente, soit `timing.grace_period_seconds` (5 s) plus
+  `reid.long_term.gallery_retention_seconds` (12 s). Ces deux paramètres
+  servent aussi ailleurs, ils n'ont pas été touchés.
+
+## 20.2 Mesure (à partir de `soutenance-finale`, relevés parallèles)
+
+`fort_occ4`, ligne de référence, 12 attendus. Rayon de report élargi à 1,0
+dans E1 et E3 ; E1h ajouté pour isoler l'effet du rayon. Relevés
+`results/lot4/trace/incl{E1,E1h,E2,E3}_fort_occ4`, configurations dans
+`results/lot7/` (non versionnés).
+
+| | E (base) | E1 : haut 0,30 + rayon 1,0 | E1h : haut 0,30 seul | **E2 : proximité 0,8** | E3 : E1 + E2 |
+|---|---|---|---|---|---|
+| Inversions (comptage robuste) | 12 | 8 | 8 | **10** | 12 |
+| … dont reprises d'une piste perdue sur une autre personne | 4 | 1 | 1 | 4 | 5 |
+| Nouvelles identités, personne déjà suivie | 10 | 13 | 13 | 10 | 11 |
+| `operational` en fin contre 12 | 12 | 11 | 12 par compensation | **12** | 12 |
+| `NEW` parasites | 0 | 0 | 1 (`P5`, s12) | 0 | 0 |
+| OUT parasites | 0 | 1 (s14) | 1 (s14) | 0 | 0 |
+| `visible_count` erreur max / somme | 8 / 146 | 9 / 143 | 9 / 143 | 9 / 148 | 9 / 137 |
+| Rattachements `REID_MATCH` faux | 0 | 1 | 1 | 0 | 1 |
+
+- `track_high_thresh` 0,30 réduit bien les reprises (4 → 1), mais crée un
+  rattachement faux à s14.2 (`P4`, encore dehors, prend l'identité de `P7`),
+  d'où un OUT fantôme (`recovery_outside_coherent`) : même mécanisme qu'avec
+  CLAHE (§19.2).
+- Le rayon 1,0 supprime le `NEW` parasite de `P5` (E1h → E1), sans effet sur
+  l'OUT fantôme.
+- E2 : les 2 inversions en moins sont des échanges entre pistes proches ; les
+  reprises ne bougent pas (4). Doublons 6 → 3.
+- E3 : le gain d'inversions disparaît.
+
+## 20.3 Décision et seuil
+
+**Décision de la personne responsable** : E2 appliquée seule. E1 écartée (OUT
+fantôme à s14), E3 écartée (gain annulé).
+
+| Seuil | Avant | Après | Effet mesuré | Compromis | Statut |
+|---|---|---|---|---|---|
+| `tracker.proximity_thresh` (+ `custom_botsort.yaml`) | 0,5 | **0,80** | inversions 12 → 10, sans double comptage, OUT parasite ni rattachement faux | `visible_count` erreur max 8 → 9 | `PROVISOIRE` |
+
+L'objectif visé (reprises d'une piste perdue) **n'est pas atteint** : 4 avant
+comme après.
+
+## 20.4 Confirmation sur la configuration versionnée
+
+| | Version E (§18.1, §19.2) | **`soutenance-finale2`** |
+|---|---|---|
+| `fort_occ4`, ligne de référence : IN / OUT / NEW → `operational` en fin | 12 / 0 / 0 → 12 | 12 / 0 / 0 → **12** (exact dès s21) |
+| `fort_occ4` : inversions (dont reprises) / nouvelles identités | 12 (4) / 10 | **10 (4)** / 10 |
+| `fort_occ4` : `visible_count` erreur max / somme | 8 / 146 | 9 / 148 |
+| `fort_occ4` : pistes / identités / `POSSIBLE_MULTI_PERSON_BOX` | 19 / 17 / — | 19 / 17 / 56 |
+| `rare_occ2` : initial / IN / OUT / NEW → `operational` | 0 / 2 / 0 / 2 → 4 | 0 / 2 / 0 / 2 → 4 |
+| `rare_occ2` : `visible_count` max, pistes / identités | 4, 6 / 5 | 4, 6 / 5 |
+| `rare_occ2` : `POSSIBLE_MULTI_PERSON_BOX` | 28 | 26 |
+| FPS `fort_occ4` (3 rejouages, seul) | 3,92 (§19.2) | 3,901 / 4,048 / 3,973 → **3,97** |
+| FPS `rare_occ2` (3 rejouages, seul) | 4,05 (§19.2) | 4,132 / 4,082 / 3,729 → **4,08** |
+
+Le relevé versionné reproduit exactement la mesure E2 ; compteurs identiques
+sur les trois rejouages FPS. `rare_occ2` : aucune dégradation.
+
+**Critères du §4 (`fort_occ4`, ligne de référence)** :
+`erreur_comptage_max_operational` tenu ; `visible_count` ≤ 1 non tenu (9) ;
+`id_switches_reels` ≤ 1 non tenu (10) ; FPS ≥ 3,06 tenu ; non-régression
+`rare_occ2` tenue.
+
+## 20.5 Tests
+
+`tests/test_config_validation.py` : assertion ajoutée,
+`proximity_thresh == 0,80` (la cohérence avec `custom_botsort.yaml` était déjà
+vérifiée). Suite complète : **698 collectés, 697 passés, 1 ignoré**,
+couverture **93,79 %**.
+
+## 20.6 Non résolu
+
+Reprises d'une piste perdue sur une autre personne (4) : le seul réglage qui
+les réduit (`track_high_thresh` 0,30) crée un OUT fantôme par rattachement
+faux. `visible_count` (9), inversions (10), fusion non signalée (s12).
