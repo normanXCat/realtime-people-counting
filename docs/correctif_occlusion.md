@@ -3896,4 +3896,4 @@ calibration navigateur (ligne et sans ligne) et court-circuit par `--line` /
   déclenchant l'action de sa touche, branchement de `app.js`. Vérifié aussi
   dans Chrome par de vraies frappes (Échap → question, G → ligne effacée,
   C → démonstration ; mode sans ligne → « Non assigné »). Aucun changement
-  côté serveur ni comptage. Suite : 781 collectés, 1 ignoré.
+  côté serveur ni comptage. Suite : 779 collectés, 1 ignoré.
