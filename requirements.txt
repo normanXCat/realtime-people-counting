@@ -19,11 +19,18 @@ lap==0.5.13
 opencv-python==5.0.0.93
 numpy==2.5.2
 pillow==12.3.0
+# Affectation optimale (matrice N×N) pour la résolution globale des groupes de
+# pistes lors d'une correction de swap à 3+ personnes. Importé de façon gardée
+# dans identity_manager : sans scipy, le pipeline retombe sur la comparaison par
+# paires (jamais d'arrêt au démarrage).
+scipy==1.18.1
 
 # --- Configuration et métriques ------------------------------------------
 PyYAML==6.0.3
 
-# --- ReID externe (variante 5, désactivé par défaut) ----------------------
-# L'extracteur profond utilise MobileNetV3 (torchvision) ; torchreid n'est
-# requis que si `reid.external_reid.weights: osnet_*` est explicitement choisi.
-# torchreid==0.2.5
+# --- ReID externe (ReID profond, activé par défaut) -----------------------
+# L'extracteur profond (`reid.external_reid.enabled: true`) charge OSNet via
+# torchreid si le paquet est installé, sinon il retombe proprement sur
+# MobileNetV3 Small (torchvision), puis sur le descripteur HSV : aucune de ces
+# dégradations n'interrompt le pipeline.
+torchreid==0.2.5

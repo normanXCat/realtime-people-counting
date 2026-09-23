@@ -44,12 +44,22 @@ ALLOWED_INSIDE_SIDES = ("positive", "negative")
 ALLOWED_ON_LINE_POLICIES = ("indeterminate", "inside", "outside")
 ALLOWED_DISAPPEARANCE_POLICIES = ("deferred_confirmation", "ambiguous_immediate")
 ALLOWED_AMBIGUOUS_POLICIES = ("provisional_person", "defer")
-ALLOWED_FPS_SOURCES = ("measured",)
+#: Source de l'horloge de session. ``measured`` : FPS mesuré sur l'horloge murale
+#: (source caméra live, débit réellement traité). ``video_native`` : FPS natif du
+#: fichier vidéo (CAP_PROP_FPS) — sur un fichier traité hors temps réel, c'est le
+#: seul référentiel qui garde ``grace_period_frames`` (FSM) cohérent avec le
+#: ``track_buffer`` de BoT-SORT (exprimé en frames vidéo natives).
+ALLOWED_FPS_SOURCES = ("measured", "video_native")
 #: Méthodes de compensation de mouvement caméra (GMC) acceptées par BoT-SORT.
 #: ``none`` est la seule correcte pour une caméra **fixe** : les autres
 #: réintroduiraient une estimation de mouvement sur une image immobile, donc une
 #: source d'instabilité gratuite des boîtes et des identifiants techniques.
 ALLOWED_GMC_METHODS = ("none", "sparseOptFlow", "orb", "ecc", "sof")
+#: Implémentations de tracker acceptées. Le projet n'en supporte qu'une :
+#: BoT-SORT. Accepter une autre valeur laisserait croire qu'un second tracker
+#: est évalué, alors que la persistance de piste et le ReID natif sont réglés
+#: pour BoT-SORT uniquement.
+ALLOWED_TRACKER_TYPES = ("botsort",)
 
 
 class ConfigError(ValueError):
@@ -115,10 +125,12 @@ class TrackerConfig:
     - ``track_buffer`` : nombre de frames qu'une piste perdue reste vivante
       avant suppression définitive côté tracker. Il doit couvrir la durée
       typique des occlusions mesurée sur les vidéos de test (médiane ≈ 2,5 s,
-      p90 ≈ 5 s) : ``150`` frames valent ≈ 5 s à la cadence source de 30 ips,
-      soit le p90 observé. Compromis documenté : un buffer plus long réduit les
-      changements d'identifiant technique mais augmente la mémoire/le calcul et
-      le risque de réassociation erronée en forte densité ;
+      p90 ≈ 5 s) : ``240`` frames valent ≈ 8 s à la cadence source de 30 ips,
+      soit le p90 observé plus une marge, ce qui réduit les handoffs vers le
+      ReID long terme sans dépasser le p90 + marge. Compromis documenté : un
+      buffer plus long réduit les changements d'identifiant technique mais
+      augmente la mémoire/le calcul et le risque de réassociation erronée en
+      forte densité ;
     - ``with_reid`` : active le module d'apparence **de BoT-SORT**, qui tente une
       réassociation avant de créer un nouvel identifiant technique. Il complète
       (sans le remplacer) le ReID long terme de :mod:`identity_manager`, qui
@@ -131,13 +143,19 @@ class TrackerConfig:
 
     config_path: str = "src/configs/custom_botsort.yaml"
     persist: bool = True
+    #: Implémentation de tracker (``botsort`` : seule supportée).
+    tracker_type: str = "botsort"
     track_high_thresh: float = 0.4
     track_low_thresh: float = 0.1
     new_track_thresh: float = 0.7
     #: Persistance de piste : durée d'occlusion couverte par le tracker.
-    track_buffer: int = 150
+    track_buffer: int = 240
     #: Ré-identification native BoT-SORT (association par apparence).
     with_reid: bool = True
+    #: Fusion du score de détection dans la matrice de coût IoU (BoT-SORT).
+    fuse_score: bool = True
+    #: Modèle de descripteur d'apparence du ReID natif (``auto`` = choix du tracker).
+    model: str = "auto"
     match_thresh: float = 0.9
     proximity_thresh: float = 0.5
     appearance_thresh: float = 0.25
@@ -182,8 +200,25 @@ class LongTermReidConfig:
     #: ``long_absence_seconds`` d'absence. ``None`` (défaut) = pas d'assouplissement
     #: (le seuil reste ``similarity_threshold``) : le compromis est choisi
     #: explicitement, jamais subi, pour éviter les fausses réassociations.
-    long_absence_seconds: float = 2.0
+    long_absence_seconds: float = 6.0
     long_absence_similarity_floor: float | None = None
+    #: Chemin de secours « galerie » pour les observations **non trackées**.
+    #: Une personne assise et immobile dont la réapparition retombe entre
+    #: ``tracker.track_low_thresh`` et ``tracker.new_track_thresh`` ne reçoit
+    #: aucun identifiant technique : BoT-SORT l'écarte avant qu'``IdentityManager``
+    #: ne la voie. Quand ce flag est actif, ces observations sont présentées à
+    #: :meth:`IdentityManager.try_gallery_rescue`, qui n'utilise que le filtre
+    #: spatio-temporel et le seuil d'apparence **normaux** (aucun seuil dédié) et
+    #: ne réattribue une identité que si un candidat **unique** les dépasse. Une
+    #: observation qui ne réunit pas ces conditions est ignorée : ce chemin ne
+    #: crée jamais d'identité. Désactivé par défaut : l'activation est une
+    #: décision mesurée (voir le tableau avant/après des vidéos de test).
+    gallery_rescue_enabled: bool = False
+    #: Confiance minimale exigée pour accepter une observation non trackée dans ce
+    #: chemin de secours. ``None`` = repli sur ``tracker.track_low_thresh`` : en
+    #: dessous, l'observation n'a même pas nourri le second étage de BoT-SORT et
+    #: n'est donc pas exploitable non plus au niveau de la galerie.
+    gallery_rescue_min_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -222,7 +257,7 @@ class AppearanceContinuityConfig:
     """
 
     enabled: bool = True
-    similarity_threshold: float = 0.50
+    similarity_threshold: float = 0.55
     max_gap_frames: int = 2
     min_interval_seconds: float = 1.0
 
@@ -247,11 +282,23 @@ class SwapCorrectionConfig:
     - ``margin`` : écart minimal ``crossed - direct`` pour déclencher la
       correction. Valeur initiale identique à l'ancien ``[RE-ID-LOCK]``, à
       recalibrer sur l'ensemble de calibration.
+    - ``group_proximity_ratio`` : distance (fraction de la hauteur de bbox) sous
+      laquelle deux pistes présentes sur la même frame appartiennent au **même
+      groupe** à résoudre globalement. Le chevauchement de boîtes suffit à lui
+      seul à réunir deux pistes dans un groupe ; ce seuil ajoute le cas de deux
+      boîtes très proches mais disjointes (embrasure de porte).
+
+    Une permutation circulaire à trois pistes (``A→B``, ``B→C``, ``C→A``) n'est
+    pas décomposable en décisions par paires indépendantes : au-delà de deux
+    pistes, la résolution devient **globale** (matrice de similarité N×N et
+    affectation optimale) sur tout le groupe proche, en une seule correction.
     """
 
     enabled: bool = True
-    #: PROVISOIRE — même valeur que l'ancien [RE-ID-LOCK], à recalibrer.
-    margin: float = 0.12
+    #: Marge calibrée sur le p1 des similarités mesurées (voir pipeline.yaml).
+    margin: float = 0.08
+    #: Distance relative (fraction de la hauteur de bbox) d'appartenance au groupe.
+    group_proximity_ratio: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -732,8 +779,8 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     fps_source = str(timing_raw.get("fps_source", "measured"))
     if fps_source not in ALLOWED_FPS_SOURCES:
         problems.append(
-            f"timing.fps_source doit être 'measured' (reçu {fps_source!r}) : une valeur "
-            "supposée est interdite par la règle 0.2"
+            f"timing.fps_source doit être l'un de {ALLOWED_FPS_SOURCES} "
+            f"(reçu {fps_source!r}) : une valeur supposée est interdite par la règle 0.2"
         )
     warmup_seconds = _non_negative(
         timing_raw.get("warmup_seconds", 0.5), "timing.warmup_seconds", problems
@@ -814,6 +861,19 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "reid.long_term.long_absence_similarity_floor",
         problems,
     )
+    gallery_rescue_enabled = bool(long_term_raw.get("gallery_rescue_enabled", False))
+    gallery_rescue_min_raw = long_term_raw.get("gallery_rescue_min_confidence", None)
+    gallery_rescue_min_confidence = (
+        None
+        if gallery_rescue_min_raw is None
+        else _bounded(
+            gallery_rescue_min_raw,
+            "reid.long_term.gallery_rescue_min_confidence",
+            problems,
+            low=0.0,
+            high=1.0,
+        )
+    )
     if (
         long_absence_floor is not None
         and similarity_threshold is not None
@@ -848,6 +908,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     swap_margin = _positive(
         swap_correction_raw.get("margin", 0.12),
         "reid.swap_correction.margin",
+        problems,
+    )
+    swap_group_proximity = _non_negative(
+        swap_correction_raw.get("group_proximity_ratio", 0.5),
+        "reid.swap_correction.group_proximity_ratio",
         problems,
     )
 
@@ -904,6 +969,19 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
 
     # -- BoT-SORT : seuils distincts du seuil YOLO (spec 2 du prompt) -------
     tracker_raw = _section(raw, "tracker")
+    tracker_type = str(tracker_raw.get("tracker_type", "botsort"))
+    if tracker_type not in ALLOWED_TRACKER_TYPES:
+        problems.append(
+            f"tracker.tracker_type doit être l'un de {ALLOWED_TRACKER_TYPES} "
+            f"(reçu {tracker_type!r}) : le pipeline ne supporte que BoT-SORT."
+        )
+    fuse_score = bool(tracker_raw.get("fuse_score", True))
+    reid_model = str(tracker_raw.get("model", "auto"))
+    if not reid_model.strip():
+        problems.append(
+            "tracker.model ne peut pas être vide : « auto » laisse le tracker "
+            "choisir un backbone, une chaîne vide le ferait échouer au chargement."
+        )
     track_high_thresh = _unit_interval(
         tracker_raw.get("track_high_thresh", 0.4), "tracker.track_high_thresh", problems
     )
@@ -1032,6 +1110,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
     assert min_box_height_px is not None and min_box_width_px is not None
     assert long_absence_seconds is not None
     assert swap_margin is not None and max_growth_ratio is not None
+    assert swap_group_proximity is not None
 
     return PipelineConfig(
         schema_version=1,
@@ -1052,6 +1131,9 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         tracker=TrackerConfig(
             config_path=str(tracker_raw.get("config_path", "src/configs/custom_botsort.yaml")),
             persist=bool(tracker_raw.get("persist", True)),
+            tracker_type=tracker_type,
+            fuse_score=fuse_score,
+            model=reid_model,
             track_high_thresh=float(track_high_thresh if track_high_thresh is not None else 0.4),
             track_low_thresh=float(track_low_thresh if track_low_thresh is not None else 0.1),
             new_track_thresh=float(new_track_thresh if new_track_thresh is not None else 0.7),
@@ -1091,6 +1173,17 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 long_absence_similarity_floor=(
                     None if long_absence_floor is None else float(long_absence_floor)
                 ),
+                gallery_rescue_enabled=gallery_rescue_enabled,
+                # ``null`` = repli explicite sur ``tracker.track_low_thresh`` : le
+                # plancher du chemin de secours ne peut pas être fixé au-dessus du
+                # seuil qui décide si une détection a nourri le second étage de
+                # BoT-SORT, sinon le secours deviendrait plus strict que le
+                # tracker lui-même.
+                gallery_rescue_min_confidence=float(
+                    gallery_rescue_min_confidence
+                    if gallery_rescue_min_confidence is not None
+                    else (track_low_thresh if track_low_thresh is not None else 0.1)
+                ),
             ),
             external_reid=ExternalReidConfig(
                 enabled=bool(external_raw.get("enabled", False)),
@@ -1113,6 +1206,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             swap_correction=SwapCorrectionConfig(
                 enabled=bool(swap_correction_raw.get("enabled", True)),
                 margin=float(swap_margin if swap_margin is not None else 0.12),
+                group_proximity_ratio=float(swap_group_proximity),
             ),
         ),
         line=LineConfig(
@@ -1228,6 +1322,40 @@ def coherence_warnings(config: PipelineConfig) -> list[tuple[str, str]]:
                 "BoT-SORT. Les personnes floues restent donc plus souvent "
                 "perdues (nouvelle piste technique ou absence), et le risque "
                 "de faux NEW augmente."
+            ),
+        ))
+    # Assistance tête : le fichier de poids est-il réellement présent ? Un flag
+    # `enabled: true` sans poids ferait échouer l'initialisation si rien n'était
+    # prévu ; on le signale donc explicitement et main.py se rabat proprement sur
+    # le modèle de détection standard (assistance désactivée pour la session).
+    head_assist = config.presence.head_assist
+    if head_assist.enabled:
+        pose_path = config.resolve_path(head_assist.pose_model_path)
+        if not pose_path.exists():
+            warnings.append((
+                "head_assist_model_missing",
+                (
+                    "presence.head_assist.enabled=true mais les poids de pose "
+                    f"{pose_path} sont absents : l'assistance tête sera "
+                    "désactivée pour la session et le pipeline se rabattra sur "
+                    f"model.path ({config.model.path}). Télécharger les poids "
+                    "(ou corriger presence.head_assist.pose_model_path) pour "
+                    "activer l'assistance."
+                ),
+            ))
+    # Chemin de secours « galerie » : il n'a de sens que si la galerie long terme
+    # est active. Un flag activé sans galerie ferait croire à un filet de sécurité
+    # inexistant : l'observation serait alors simplement ignorée.
+    long_term = config.reid.long_term
+    if long_term.gallery_rescue_enabled and not long_term.enabled:
+        warnings.append((
+            "gallery_rescue_without_long_term_reid",
+            (
+                "reid.long_term.gallery_rescue_enabled=true mais "
+                "reid.long_term.enabled=false : le chemin de secours n'a aucune "
+                "galerie à interroger, les observations non trackées seront "
+                "ignorées. Activer reid.long_term.enabled (et le mesurer) ou "
+                "désactiver gallery_rescue_enabled."
             ),
         ))
     return warnings

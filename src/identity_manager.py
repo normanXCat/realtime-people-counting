@@ -30,11 +30,20 @@ déclenchement « à l'occlusion imminente », l'assignation hongroise, l'état
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Sequence
 
 import cv2
 import numpy as np
+
+#: Affectation optimale (coût = 1 - similarité) pour la résolution globale d'un
+#: groupe de pistes mutuellement proches. Import gardé : un environnement sans
+#: ``scipy`` (dépendance déclarée dans ``requirements.txt``) ne doit pas empêcher
+#: le pipeline de démarrer — il retombe alors sur la comparaison par paires.
+try:  # pragma: no cover - dépend de l'environnement d'exécution
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment
+except Exception:  # pragma: no cover - repli explicite, jamais silencieux
+    _linear_sum_assignment = None  # type: ignore[assignment]
 
 from config import (
     AppearanceContinuityConfig,
@@ -96,12 +105,37 @@ class HistogramAppearanceExtractor:
         return None if norm < 1e-8 else flat / norm
 
 
+def _mobilenet_weights_cached(weights: Any) -> bool:
+    """Les poids MobileNetV3 demandés sont-ils **déjà** présents sur le disque ?
+
+    Le pipeline ne doit jamais déclencher de téléchargement réseau implicite au
+    milieu d'une frame : si les poids ne sont pas en cache, l'extracteur profond
+    se rabat proprement sur le descripteur HSV (dégradation explicite, jamais une
+    frame bloquée derrière une requête réseau).
+    """
+    try:
+        import os
+        from pathlib import Path
+
+        import torch.hub
+
+        filename = os.path.basename(str(weights.url))
+        return (Path(torch.hub.get_dir()) / "checkpoints" / filename).exists()
+    except Exception:
+        return False
+
+
 class DeepAppearanceExtractor:
     """Descripteur d'apparence profond (ex-``reid.py``), ablation de la section 9.
 
     Chargement paresseux : aucun poids n'est téléchargé à l'import. OSNet
     (``torchreid``) est utilisé si disponible, sinon le repli MobileNetV3 Small
     tronqué — exactement le comportement consolidé des deux modules supprimés.
+
+    Dégradation propre : si ``torch``/``torchvision`` sont absents, si les poids
+    doivent être téléchargés (aucun réseau implicite) ou si le modèle échoue à se
+    construire, l'extracteur bascule sur :class:`HistogramAppearanceExtractor` et
+    publie ``unavailable_reason`` au lieu de lever une exception.
     """
 
     name = "deep_mobilenetv3"
@@ -116,13 +150,35 @@ class DeepAppearanceExtractor:
         self._model: Any = None
         self._transform: Any = None
         self._device: Any = None
+        #: Repli dégradé (HSV) utilisé dès que le modèle profond est indisponible.
+        self._fallback: HistogramAppearanceExtractor | None = None
+        #: Motif de la dégradation (``None`` si le modèle profond est utilisable).
+        self.unavailable_reason: str | None = None
 
-    def _ensure_model(self) -> None:
+    def _degrade(self, reason: str) -> None:
+        """Bascule sur le descripteur HSV et mémorise la raison de la dégradation."""
+        self._fallback = HistogramAppearanceExtractor()
+        self.unavailable_reason = reason
+        self.name = "histogram_hsv_fallback"
+
+    def _ensure_model(self) -> bool:
+        """Construit le modèle profond si possible ; ne lève jamais.
+
+        Returns:
+            ``True`` si le modèle profond est prêt, ``False`` si l'extracteur est
+            dégradé vers HSV (``self._fallback`` non ``None``).
+        """
+        if self._fallback is not None:
+            return False
         if self._model is not None:
-            return
-        import torch  # import local : le chemin par défaut n'a pas besoin de torch
-        import torch.nn as nn
-        from torchvision import models, transforms
+            return True
+        try:
+            import torch  # import local : le chemin par défaut n'a pas besoin de torch
+            import torch.nn as nn
+            from torchvision import models, transforms
+        except Exception as exc:  # dépendance absente ou cassée
+            self._degrade(f"torch_unavailable:{type(exc).__name__}")
+            return False
 
         device = self._device_override or ("cuda" if torch.cuda.is_available() else "cpu")
         self._device = torch.device(device)
@@ -138,19 +194,30 @@ class DeepAppearanceExtractor:
                 .to(self._device)
             )
             self.name = f"deep_{self.config.weights}"
-        except Exception:
-            backbone = models.mobilenet_v3_small(
-                weights=models.MobileNet_V3_Small_Weights.DEFAULT
-            )
-            backbone.classifier = nn.Identity()
-            self._model = backbone.eval().to(self._device)
-            self.name = "deep_mobilenetv3"
+        except ImportError:
+            if not _mobilenet_weights_cached(models.MobileNet_V3_Small_Weights.DEFAULT):
+                self._degrade("mobilenetv3_weights_not_cached")
+                return False
+            try:
+                backbone = models.mobilenet_v3_small(
+                    weights=models.MobileNet_V3_Small_Weights.DEFAULT
+                )
+                backbone.classifier = nn.Identity()
+                self._model = backbone.eval().to(self._device)
+                self.name = "deep_mobilenetv3"
+            except Exception as exc:
+                self._degrade(f"mobilenetv3_load_failed:{type(exc).__name__}")
+                return False
+        except Exception as exc:
+            self._degrade(f"torchreid_load_failed:{type(exc).__name__}")
+            return False
         self._transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((height, width)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
+        return True
 
     def describe(self, frame: np.ndarray, bbox: Sequence[float]) -> np.ndarray | None:
         height, width = frame.shape[:2]
@@ -161,9 +228,13 @@ class DeepAppearanceExtractor:
             # Crop inexploitable : on refuse **avant** de charger un modèle, ce
             # qui évite tout téléchargement de poids pour rien.
             return None
+        if not self._ensure_model():
+            # Repli dégradé explicite : le descripteur HSV reste utilisable et
+            # aucune frame n'est bloquée par un téléchargement réseau.
+            assert self._fallback is not None
+            return self._fallback.describe(frame, bbox)
         import torch
 
-        self._ensure_model()
         crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
         with torch.no_grad():
             vector = (
@@ -220,6 +291,24 @@ class Assignment:
 
 
 @dataclass
+class _SwapCandidate:
+    """Piste éligible à une correction de swap sur la frame courante.
+
+    Regroupe tout ce qui est nécessaire à la décision — apparence courante et
+    apparence de référence — **extrait une seule fois par piste** : une piste
+    qui participe à plusieurs comparaisons (résolution de groupe) ne doit pas
+    recalculer son descripteur.
+    """
+
+    observation: Observation
+    technical_track_id: int
+    person_id: int
+    record: IdentityRecord
+    feature: np.ndarray
+    reference: np.ndarray
+
+
+@dataclass
 class IdentityRecord:
     """État d'identité détenu par le gestionnaire (niveau long terme)."""
 
@@ -240,6 +329,17 @@ class IdentityRecord:
     #: Dernière raison de rejet d'apparence (`REID_DESCRIPTOR_REJECTED`). Sert à
     #: ne journaliser qu'un changement de situation, jamais une ligne par frame.
     last_rejection: str | None = None
+    #: Empreinte d'apparence **figée avant/pendant une fusion** de boîtes : elle
+    #: n'est jamais polluée par le crop multi-personnes (les mises à jour de
+    #: galerie sont rejetées) et sert de référence stricte pour ré-apparier
+    #: l'identité après une séparation de boîtes.
+    merge_fingerprint: np.ndarray | None = None
+    #: Instant de la dernière observation où la boîte a été suspectée de
+    #: contenir plusieurs personnes. ``None`` = situation normale : le
+    #: ré-appariement peut de nouveau profiter de l'assouplissement progressif.
+    merge_flagged_at_s: float | None = None
+    #: Nombre de ré-appariements effectués en mode strict après fusion.
+    strict_rematches: int = 0
 
     @property
     def age_s(self) -> float:
@@ -317,6 +417,11 @@ class IdentityManager:
         self.technical_id_changes = 0
         self.appearance_discontinuities = 0
         self.swap_corrections_applied = 0
+        #: Observations non trackées rattachées à une identité de galerie par le
+        #: chemin de secours (``REID_GALLERY_RESCUE``). Compteur séparé des
+        #: ``REID_MATCH`` : c'est la mesure d'impact du mécanisme, et le critère
+        #: qui décide de l'activer ou non dans la configuration livrée.
+        self.gallery_rescues = 0
         #: Dernier descripteur observé **par identifiant technique** — et non par
         #: ``person_id`` : c'est la seule vue qui permette de détecter un swap
         #: interne au tracker, où la personne suit un identifiant technique qui
@@ -327,6 +432,12 @@ class IdentityManager:
         #: discontinuité n'est pas refermée par un retour à la continuité.
         self._discontinuity_active: set[int] = set()
         self._last_continuity_emit_s: dict[int, float] = {}
+        #: Identités issues d'une fusion de boîtes (boîte multi-personnes) pour
+        #: lesquelles le ré-appariement doit exiger une similarité **stricte**
+        #: vis-à-vis de l'empreinte figée avant la fusion. Recalculé au début de
+        #: chaque ``assign`` : le critère est donc stable sur toute la frame,
+        #: indépendamment de l'ordre de traitement des observations.
+        self._merge_strict_ids: set[int] = set()
         #: Échantillon borné des similarités d'apparence **mesurées entre deux
         #: frames consécutives d'une même piste continue**. C'est ce qui permet de
         #: régler ``similarity_threshold`` sur des valeurs observées plutôt que
@@ -359,6 +470,42 @@ class IdentityManager:
         if frame is None:
             return None
         return self.appearance.describe(frame, bbox)
+
+    # -- Empreinte de fusion (anti-swap sur séparation de boîtes) -----------
+    def _flag_merge_record(self, record: IdentityRecord, timestamp_s: float) -> None:
+        """Fige l'apparence connue d'une identité dont la boîte fusionne.
+
+        L'empreinte est copiée **une seule fois** (la première frame où la fusion
+        est suspectée) : les observations suivantes de la boîte fusionnée sont
+        refusées par le contrôle de galerie (``possible_multi_person_crop``), donc
+        l'empreinte reste propre et ne mélange jamais deux personnes.
+        """
+        if record.merge_fingerprint is None and record.feature is not None:
+            record.merge_fingerprint = np.array(record.feature, dtype=np.float32, copy=True)
+        record.merge_flagged_at_s = float(timestamp_s)
+
+    def note_multi_person_box(self, person_id: int, timestamp_s: float) -> None:
+        """Signale qu'une identité est vue dans une boîte multi-personnes.
+
+        Appelé par :mod:`occupancy_manager` lorsque ``POSSIBLE_MULTI_PERSON_BOX``
+        est émis. L'empreinte figée sert ensuite de référence **stricte** lors du
+        ré-appariement après séparation des boîtes.
+        """
+        record = self.records.get(int(person_id))
+        if record is None:
+            return
+        self._flag_merge_record(record, timestamp_s)
+
+    def _reference_feature(self, record: IdentityRecord) -> np.ndarray | None:
+        """Référence d'apparence à utiliser pour apparier une identité.
+
+        Hors fusion, c'est l'apparence courante (moyenne glissante) ; si
+        l'identité sort d'une fusion, c'est l'empreinte figée avant la fusion —
+        jamais un descripteur ayant absorbé deux personnes.
+        """
+        if record.person_id in self._merge_strict_ids and record.merge_fingerprint is not None:
+            return record.merge_fingerprint
+        return record.feature
 
     # -- Qualité du descripteur avant écriture en galerie -------------------
     @staticmethod
@@ -438,6 +585,103 @@ class IdentityManager:
             return None
         return feature
 
+    def _swap_candidate_entries(
+        self, observations: Sequence[Observation], frame: np.ndarray | None
+    ) -> list[_SwapCandidate]:
+        """Pistes éligibles à une correction de swap sur la frame courante.
+
+        Une piste est éligible si elle est mappée à une identité connue non
+        purgée, que son apparence courante est exploitable et que l'apparence de
+        **référence** de cette identité est disponible (apparence courante, ou
+        empreinte figée si l'identité sort d'une fusion de boîtes — jamais un
+        descripteur pollué). Tout ce qui manque est écarté sans bruit : une
+        correction de swap ne se décide que sur des apparences comparables.
+        """
+        entries: list[_SwapCandidate] = []
+        for observation in observations:
+            technical_id = int(observation.technical_track_id)
+            person_id = self.technical_to_person.get(technical_id)
+            if person_id is None or person_id not in self.records:
+                continue
+            record = self.records[person_id]
+            if record.purged_at_s is not None:
+                continue
+            feature = self._extract_valid_feature(observation, frame)
+            if feature is None:
+                continue
+            reference = self._reference_feature(record)
+            if reference is None:
+                continue
+            entries.append(
+                _SwapCandidate(
+                    observation=observation,
+                    technical_track_id=technical_id,
+                    person_id=person_id,
+                    record=record,
+                    feature=feature,
+                    reference=reference,
+                )
+            )
+        return entries
+
+    def _pistes_sont_proches(
+        self, left: _SwapCandidate, right: _SwapCandidate, ratio: float
+    ) -> bool:
+        """Deux pistes de la frame courante appartiennent-elles au même groupe ?
+
+        Deux critères, suffisants chacun : les boîtes se **chevauchent** (cas de
+        l'occlusion, où une boîte commune couvre plusieurs personnes), ou bien
+        les ancres sont à une distance inférieure à
+        ``group_proximity_ratio × hauteur de bbox`` (cas de boîtes disjointes mais
+        contiguës, typiquement une embrasure de porte).
+        """
+        box_left = np.asarray(left.observation.bbox, dtype=float)
+        box_right = np.asarray(right.observation.bbox, dtype=float)
+        x1 = max(float(box_left[0]), float(box_right[0]))
+        y1 = max(float(box_left[1]), float(box_right[1]))
+        x2 = min(float(box_left[2]), float(box_right[2]))
+        y2 = min(float(box_left[3]), float(box_right[3]))
+        if x2 > x1 and y2 > y1:
+            return True
+        height = max(
+            float(left.observation.bbox_height),
+            float(right.observation.bbox_height),
+        )
+        return _distance(left.observation.anchor, right.observation.anchor) <= ratio * height
+
+    def _swap_groups(
+        self, entries: Sequence[_SwapCandidate]
+    ) -> list[list[_SwapCandidate]]:
+        """Composantes connexes de pistes mutuellement proches (union-find).
+
+        Seuls les groupes d'au moins **deux** pistes sont retournés : une piste
+        isolée n'a personne avec qui échanger son identité.
+        """
+        count = len(entries)
+        parent = list(range(count))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            root_left, root_right = find(left), find(right)
+            if root_left != root_right:
+                parent[root_right] = root_left
+
+        ratio = float(self.swap_correction.group_proximity_ratio)
+        for i in range(count):
+            for j in range(i + 1, count):
+                if self._pistes_sont_proches(entries[i], entries[j], ratio):
+                    union(i, j)
+
+        grouped: dict[int, list[_SwapCandidate]] = {}
+        for index, entry in enumerate(entries):
+            grouped.setdefault(find(index), []).append(entry)
+        return [group for group in grouped.values() if len(group) >= 2]
+
     def _correct_cross_swaps(
         self,
         observations: Sequence[Observation],
@@ -445,80 +689,178 @@ class IdentityManager:
         timestamp_s: float,
         frame: np.ndarray | None = None,
     ) -> None:
-        """Corrige activement les inversions d'identité (swap) entre paires de pistes connues.
+        """Corrige activement les inversions d'identité (swap) des pistes proches.
 
-        Pour chaque paire de pistes techniques présentes sur la frame courante et déjà
-        mappées à deux identités distinctes et vivantes/non purgées, compare la similarité
-        directe (A↔A, B↔B) contre la similarité croisée (A↔B, B↔A). Si le croisement
-        l'emporte d'au moins la marge configurée, le mapping technical_to_person est échangé
-        et un événement IDENTITY_SWAP_CORRECTED est émis.
+        Les pistes présentes sur la frame courante sont d'abord regroupées par
+        proximité spatiale (chevauchement de boîtes, ou ancres à portée relative).
+        Chaque groupe est ensuite résolu **globalement** :
+
+        - groupe de deux : comparaison directe / croisée historique (``A↔A, B↔B``
+          contre ``A↔B, B↔A``) — le comportement déjà validé est conservé tel quel ;
+        - groupe de trois ou plus : matrice de similarité N×N (apparence courante ×
+          apparence de référence) et affectation optimale
+          (:func:`scipy.optimize.linear_sum_assignment`, coût ``1 - similarité``).
+          Une permutation circulaire ``A→B``, ``B→C``, ``C→A`` n'est pas
+          décomposable en décisions par paires indépendantes : elle n'est correcte
+          que résolue en une seule fois sur tout le groupe.
+
+        Dans les deux cas, la correction n'est appliquée que si elle change au
+        moins deux pistes **et** si le gain de similarité dépasse ``margin`` ;
+        chaque piste corrigée produit un ``IDENTITY_SWAP_CORRECTED`` (avec
+        ``group_size``), jamais une correction silencieuse.
         """
         if not self.swap_correction.enabled or len(observations) < 2:
             return
+        entries = self._swap_candidate_entries(observations, frame)
+        if len(entries) < 2:
+            return
 
         corrected_tracks: set[int] = set()
+        for group in self._swap_groups(entries):
+            if len(group) == 2:
+                self._correct_pair_swap(
+                    group, frame_index, timestamp_s, corrected_tracks
+                )
+            elif _linear_sum_assignment is not None:
+                self._correct_group_swap(
+                    group, frame_index, timestamp_s, corrected_tracks
+                )
+            else:  # pragma: no cover - environnement sans scipy
+                # Repli explicite : sans affectation optimale, on retombe sur la
+                # comparaison par paires (comportement historique) plutôt que
+                # d'appliquer une correction partielle non optimale.
+                for i in range(len(group)):
+                    for j in range(i + 1, len(group)):
+                        self._correct_pair_swap(
+                            [group[i], group[j]],
+                            frame_index,
+                            timestamp_s,
+                            corrected_tracks,
+                        )
 
-        for i in range(len(observations)):
-            obs_a = observations[i]
-            tech_a = int(obs_a.technical_track_id)
-            if tech_a in corrected_tracks:
+    def _correct_pair_swap(
+        self,
+        pair: Sequence[_SwapCandidate],
+        frame_index: int,
+        timestamp_s: float,
+        corrected_tracks: set[int],
+    ) -> None:
+        """Comparaison directe / croisée de deux pistes (comportement historique)."""
+        left, right = pair
+        if left.technical_track_id in corrected_tracks:
+            return
+        if right.technical_track_id in corrected_tracks:
+            return
+        person_left, person_right = left.person_id, right.person_id
+        if person_left == person_right:
+            return
+        # Une paire issue d'une fusion exige un écart PLUS LARGE : on ne corrige
+        # pas un mapping sur un indice faible.
+        strict_pair = (
+            person_left in self._merge_strict_ids
+            or person_right in self._merge_strict_ids
+        )
+        margin = float(self.swap_correction.margin) * (1.5 if strict_pair else 1.0)
+        direct = self.cosine_similarity(left.feature, left.reference) + self.cosine_similarity(
+            right.feature, right.reference
+        )
+        crossed = self.cosine_similarity(left.feature, right.reference) + self.cosine_similarity(
+            right.feature, left.reference
+        )
+        if crossed <= (direct + margin):
+            return
+        self.technical_to_person[left.technical_track_id] = person_right
+        self.technical_to_person[right.technical_track_id] = person_left
+        corrected_tracks.add(left.technical_track_id)
+        corrected_tracks.add(right.technical_track_id)
+        self.swap_corrections_applied += 1
+        self._emit(
+            "IDENTITY_SWAP_CORRECTED",
+            timestamp_s,
+            frame_index,
+            frame=int(frame_index),
+            technical_track_id_a=left.technical_track_id,
+            technical_track_id_b=right.technical_track_id,
+            person_id_a_before=person_left,
+            person_id_a_after=person_right,
+            person_id_b_before=person_right,
+            person_id_b_after=person_left,
+            similarity_direct=round(float(direct), 4),
+            similarity_crossed=round(float(crossed), 4),
+            margin_applied=round(float(margin), 4),
+            group_size=2,
+            reason=(
+                "cross_appearance_correction_after_merge"
+                if strict_pair
+                else "cross_appearance_correction"
+            ),
+        )
+
+    def _correct_group_swap(
+        self,
+        group: Sequence[_SwapCandidate],
+        frame_index: int,
+        timestamp_s: float,
+        corrected_tracks: set[int],
+    ) -> None:
+        """Résolution globale d'un groupe de trois pistes ou plus (matrice N×N).
+
+        La matrice de similarité est carrée et d'ordre ``N`` : ligne = apparence
+        **courante** de la piste du groupe, colonne = apparence de **référence**
+        de l'identité du groupe. L'affectation optimale minimise le coût
+        ``1 - similarité``. Elle n'est appliquée que si elle change au moins deux
+        pistes et si le gain total dépasse ``margin`` — un bruit d'apparence ne
+        réécrit pas le mapping.
+        """
+        assert _linear_sum_assignment is not None  # garanti par l'appelant
+        count = len(group)
+        similarity = np.empty((count, count), dtype=float)
+        for row, entry in enumerate(group):
+            for column, candidate in enumerate(group):
+                similarity[row, column] = self.cosine_similarity(
+                    entry.feature, candidate.reference
+                )
+        rows, columns = _linear_sum_assignment(1.0 - similarity)
+        assignment = {int(row): int(column) for row, column in zip(rows, columns)}
+        changed = [row for row in range(count) if assignment.get(row, row) != row]
+        if len(changed) < 2:
+            return
+        # Affectation courante : la piste ``row`` est actuellement mappée à
+        # l'identité d'indice ``row`` (même ordre que la construction du groupe),
+        # donc la somme des similaires « directes » est la trace de la matrice.
+        current_total = float(np.trace(similarity))
+        optimal_total = float(sum(similarity[row, assignment[row]] for row in range(count)))
+        strict_group = any(entry.person_id in self._merge_strict_ids for entry in group)
+        margin = float(self.swap_correction.margin) * (1.5 if strict_group else 1.0)
+        if (optimal_total - current_total) <= margin:
+            return
+        # Identités du groupe **après** correction : publiées pour que le journal
+        # permette de reconstituer la permutation complète et pas seulement les
+        # paires une à une.
+        group_person_ids = [group[assignment[row]].person_id for row in range(count)]
+        for row in changed:
+            entry = group[row]
+            if entry.technical_track_id in corrected_tracks:
                 continue
-
-            person_a = self.technical_to_person.get(tech_a)
-            if person_a is None or person_a not in self.records:
-                continue
-            rec_a = self.records[person_a]
-            if rec_a.purged_at_s is not None or rec_a.feature is None:
-                continue
-
-            for j in range(i + 1, len(observations)):
-                obs_b = observations[j]
-                tech_b = int(obs_b.technical_track_id)
-                if tech_b in corrected_tracks:
-                    continue
-
-                person_b = self.technical_to_person.get(tech_b)
-                if person_b is None or person_b not in self.records or person_b == person_a:
-                    continue
-                rec_b = self.records[person_b]
-                if rec_b.purged_at_s is not None or rec_b.feature is None:
-                    continue
-
-                feat_a = self._extract_valid_feature(obs_a, frame)
-                feat_b = self._extract_valid_feature(obs_b, frame)
-                if feat_a is None or feat_b is None:
-                    continue
-
-                ref_a = rec_a.feature
-                ref_b = rec_b.feature
-                direct = self.cosine_similarity(feat_a, ref_a) + self.cosine_similarity(feat_b, ref_b)
-                crossed = self.cosine_similarity(feat_a, ref_b) + self.cosine_similarity(feat_b, ref_a)
-
-                if crossed > (direct + self.swap_correction.margin):
-                    # Inversion confirmée avec marge nette
-                    self.technical_to_person[tech_a] = person_b
-                    self.technical_to_person[tech_b] = person_a
-                    corrected_tracks.add(tech_a)
-                    corrected_tracks.add(tech_b)
-                    self.swap_corrections_applied += 1
-
-                    self._emit(
-                        "IDENTITY_SWAP_CORRECTED",
-                        timestamp_s,
-                        frame_index,
-                        frame=int(frame_index),
-                        technical_track_id_a=tech_a,
-                        technical_track_id_b=tech_b,
-                        person_id_a_before=person_a,
-                        person_id_a_after=person_b,
-                        person_id_b_before=person_b,
-                        person_id_b_after=person_a,
-                        similarity_direct=round(float(direct), 4),
-                        similarity_crossed=round(float(crossed), 4),
-                        margin_applied=round(float(self.swap_correction.margin), 4),
-                        reason="cross_appearance_correction",
-                    )
-                    break
+            person_after = group[assignment[row]].person_id
+            self.technical_to_person[entry.technical_track_id] = person_after
+            corrected_tracks.add(entry.technical_track_id)
+            self.swap_corrections_applied += 1
+            self._emit(
+                "IDENTITY_SWAP_CORRECTED",
+                timestamp_s,
+                frame_index,
+                frame=int(frame_index),
+                technical_track_id=entry.technical_track_id,
+                person_id_before=entry.person_id,
+                person_id_after=person_after,
+                group_size=count,
+                group_person_ids=group_person_ids,
+                similarity_direct=round(current_total, 4),
+                similarity_crossed=round(optimal_total, 4),
+                margin_applied=round(margin, 4),
+                reason="group_appearance_correction",
+            )
 
     # -- Affectation -------------------------------------------------------
     def assign(
@@ -537,6 +879,15 @@ class IdentityManager:
         """
         self._claimed = set()
         self._prune_track_appearance(frame_index)
+
+        # Snapshot des identités « en sortie de fusion » : arrêté AVANT toute
+        # mise à jour, pour que le ré-appariement d'une frame donnée exige une
+        # similarité stricte quel que soit l'ordre des observations.
+        self._merge_strict_ids = {
+            person_id
+            for person_id, record in self.records.items()
+            if record.merge_flagged_at_s is not None and record.merge_fingerprint is not None
+        }
 
         # Correction active des inversions d'identité (swap)
         if self.swap_correction.enabled:
@@ -627,14 +978,17 @@ class IdentityManager:
                 frame=frame,
             )
 
-        scored = sorted(
-            (
-                (self.cosine_similarity(feature, record.feature), person_id, allowed, distance)
-                for person_id, record, allowed, distance in candidates
-                if record.feature is not None
-            ),
-            key=lambda item: (-item[0], item[1]),
-        )
+        scored: list[tuple[float, int, float | None, float | None]] = []
+        for person_id, record, allowed, distance in candidates:
+            # Référence stricte (empreinte de fusion) dès que l'identité sort
+            # d'une boîte multi-personnes, apparence courante sinon.
+            reference = self._reference_feature(record)
+            if reference is None:
+                continue
+            scored.append(
+                (self.cosine_similarity(feature, reference), person_id, allowed, distance)
+            )
+        scored.sort(key=lambda item: (-item[0], item[1]))
         if not scored:
             return self._create_new(
                 observation, feature, timestamp_s, frame_index,
@@ -650,13 +1004,31 @@ class IdentityManager:
         # constant rejetterait alors une réapparition légitime. Il n'est jamais
         # assoupli sans plancher explicite (voir ``effective_similarity_threshold``).
         absence_s = float(timestamp_s - self.records[best_person].last_seen_s)
-        threshold = self.effective_similarity_threshold(absence_s)
+        best_record = self.records[best_person]
+        strict_reappearance = (
+            best_person in self._merge_strict_ids
+            and best_record.merge_fingerprint is not None
+        )
+        if strict_reappearance:
+            # Séparation de boîtes après fusion : AUCUN assouplissement n'est
+            # autorisé avant de réattribuer un ID connu, sinon les deux personnes
+            # fusionnées pourraient se voir échanger leur identité.
+            threshold = max(
+                self.effective_similarity_threshold(absence_s),
+                float(self.long_term.similarity_threshold),
+            )
+        else:
+            threshold = self.effective_similarity_threshold(absence_s)
         margin = self.long_term.safety_margin
 
         if best_similarity < threshold:
             return self._create_new(
                 observation, feature, timestamp_s, frame_index,
-                reason="below_similarity_threshold",
+                reason=(
+                    "below_strict_similarity_threshold"
+                    if strict_reappearance
+                    else "below_similarity_threshold"
+                ),
                 candidates_evaluated=len(scored),
                 best_similarity=best_similarity,
                 frame=frame,
@@ -682,6 +1054,7 @@ class IdentityManager:
             frame=frame,
             threshold_applied=threshold,
             absence_s=absence_s,
+            strict_reappearance=strict_reappearance,
         )
 
     # -- Garde-fou de swap (continuité d'apparence par piste technique) ----
@@ -814,9 +1187,16 @@ class IdentityManager:
         frame: np.ndarray | None = None,
         threshold_applied: float | None = None,
         absence_s: float | None = None,
+        strict_reappearance: bool = False,
     ) -> Assignment:
         record = self.records[person_id]
         new_technical_id = int(observation.technical_track_id)
+        if strict_reappearance:
+            # Ré-appariement post-fusion confirmé : l'épisode de fusion est clos,
+            # l'empreinte figée n'a plus à contraindre les appariements futurs.
+            record.strict_rematches += 1
+            record.merge_fingerprint = None
+            record.merge_flagged_at_s = None
         previous_technical_id = record.technical_track_id
         self.technical_to_person[new_technical_id] = person_id
         record.aliases.add(new_technical_id)
@@ -857,6 +1237,10 @@ class IdentityManager:
                     None if threshold_applied is None else round(threshold_applied, 4)
                 ),
                 absence_s=None if absence_s is None else round(absence_s, 3),
+                strict_reappearance=strict_reappearance,
+                reference=(
+                    "merge_fingerprint" if strict_reappearance else "appearance_history"
+                ),
             )
         return Assignment(
             technical_track_id=int(observation.technical_track_id),
@@ -1038,13 +1422,20 @@ class IdentityManager:
 
         Un candidat est retenu si
 
-            distance <= v_max_ratio × hauteur_bbox × min(Δt, grâce)
+            distance <= v_max_ratio × hauteur_bbox × min(Δt, fenêtre galerie)
                         + spatial_margin_ratio × hauteur_bbox
 
         où ``Δt`` est le temps écoulé **depuis la dernière observation** de
-        l'identité. Les identités purgées restent interrogeables pendant une
-        fenêtre de rétention supplémentaire (spec 3.3, « récemment purgés »),
-        mesurée depuis l'instant de purge et non depuis la dernière observation.
+        l'identité et la fenêtre galerie vaut
+        ``grace_period_seconds + purge_retention_seconds``. Le plafond doit
+        couvrir **toute** la durée pendant laquelle l'identité reste
+        interrogeable (cf. :meth:`within_gallery_window`) : le plafonner à la
+        seule grâce rejetait sur le critère spatial, sans même comparer
+        l'apparence, une réapparition légitime survenue entre la grâce et la fin
+        de la rétention. Les identités purgées restent interrogeables pendant
+        une fenêtre de rétention supplémentaire (spec 3.3, « récemment
+        purgés »), mesurée depuis l'instant de purge et non depuis la dernière
+        observation.
         """
         candidates: list[tuple[int, IdentityRecord, float, float]] = []
         for person_id, record in self.records.items():
@@ -1056,8 +1447,11 @@ class IdentityManager:
             if reference_height <= 0:
                 continue
             elapsed = timestamp_s - record.last_seen_s
+            allowance_window = (
+                self.grace_period_seconds + self.purge_retention_seconds
+            )
             allowed = self.long_term.v_max_ratio * reference_height * min(
-                elapsed, self.grace_period_seconds
+                elapsed, allowance_window
             ) + self.long_term.spatial_margin_ratio * reference_height
             distance = _distance(observation.anchor, record.anchor)
             if distance <= allowed:
@@ -1083,6 +1477,163 @@ class IdentityManager:
             self.grace_period_seconds + self.purge_retention_seconds
         )
 
+    # -- Chemin de secours « galerie » (observations non trackées) ----------
+    @staticmethod
+    def _synthetic_track_id(person_id: int) -> int:
+        """Identifiant technique synthétique d'un rattachement par secours.
+
+        Négatif, donc impossible à confondre avec un identifiant BoT-SORT (qui
+        commence à 1) : le journal, la stabilisation d'ancre et les compteurs
+        distinguent immédiatement une piste réelle d'un rattachement assisté par
+        galerie. Il est déterministe (``-person_id``) : deux secours successifs de
+        la même personne ne créent pas d'identifiants synthétiques à l'infini.
+        """
+        return -int(person_id)
+
+    def try_gallery_rescue(
+        self,
+        observation: Observation,
+        frame: np.ndarray | None,
+        timestamp_s: float,
+        frame_index: int = 0,
+    ) -> Assignment | None:
+        """Rattache une observation **non trackée** à une identité de galerie.
+
+        Une personne assise et immobile dont la réapparition n'atteint pas
+        ``tracker.new_track_thresh`` ne reçoit aucun identifiant technique :
+        BoT-SORT l'écarte avant qu'elle n'atteigne ce module. Ce chemin de secours
+        présente l'observation à la galerie — mais il n'ouvre **aucune tolérance
+        supplémentaire** :
+
+        - le filtre spatio-temporel est celui du chemin nominal
+          (:meth:`_plausible_candidates`) ;
+        - le seuil d'apparence et la marge de sécurité sont ceux du chemin nominal
+          (:attr:`LongTermReidConfig.similarity_threshold` +
+          ``safety_margin``), sans assouplissement dédié ;
+        - l'identité n'est réattribuée que si un candidat est **unique** à
+          dépasser le seuil (écart au second >= ``safety_margin``) ;
+        - une observation qui ne réunit pas ces conditions est **ignorée** :
+          aucun ``person_id`` n'est créé, aucune apparition intérieure n'est
+          inventée. C'est la seule garantie qui rende ce chemin activable.
+
+        Le rattachement produit un ``REID_GALLERY_RESCUE`` **distinct** de
+        ``REID_MATCH`` : l'impact du mécanisme reste mesurable séparément, et le
+        flag ``gallery_rescue_enabled`` permet de le désactiver sans toucher au
+        reste du ReID.
+
+        Returns:
+            L'``Assignment`` du rattachement (identifiant technique synthétique),
+            ou ``None`` si l'observation n'a pas été rattachée.
+        """
+        long_term = self.long_term
+        if not long_term.gallery_rescue_enabled or not long_term.enabled:
+            return None
+        floor = long_term.gallery_rescue_min_confidence
+        if floor is not None and float(observation.confidence) < float(floor):
+            return None
+        # Le descripteur est extrait sans le contrôle de **qualité de galerie** :
+        # ce chemin ne fait que LIRE la galerie, le contrôle d'écriture reste
+        # appliqué par ``_touch`` (une apparence faible n'écrase jamais une
+        # apparence connue). Restreindre l'extraction ici rendrait le secours
+        # inopérant sur les images de moindre qualité qu'il est justement censé
+        # rattraper.
+        feature = observation.feature
+        if feature is None:
+            feature = self.describe(frame, observation.bbox)
+            if feature is not None:
+                observation.feature = feature
+        if feature is None:
+            return None
+        candidates = self._plausible_candidates(observation, timestamp_s)
+        if not candidates:
+            return None
+        scored: list[tuple[float, int, float | None, float | None]] = []
+        for person_id, record, allowed, distance in candidates:
+            reference = self._reference_feature(record)
+            if reference is None:
+                continue
+            scored.append(
+                (self.cosine_similarity(feature, reference), person_id, allowed, distance)
+            )
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_similarity, best_person, allowed, distance = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else None
+        record = self.records[best_person]
+        absence_s = float(timestamp_s - record.last_seen_s)
+        strict_reappearance = (
+            best_person in self._merge_strict_ids
+            and record.merge_fingerprint is not None
+        )
+        if strict_reappearance:
+            threshold = max(
+                self.effective_similarity_threshold(absence_s),
+                float(long_term.similarity_threshold),
+            )
+        else:
+            threshold = self.effective_similarity_threshold(absence_s)
+        if best_similarity < threshold:
+            return None
+        if (
+            runner_up is not None
+            and (best_similarity - runner_up) < float(long_term.safety_margin)
+        ):
+            # Ambiguïté : deux identités plausibles. Le chemin nominal appliquerait
+            # sa politique (provisoire / report) ; le secours, lui, ne crée rien et
+            # s'abstient — c'est le seul comportement qui ne peut pas produire de
+            # fausse réassociation silencieuse.
+            return None
+        synthetic_id = self._synthetic_track_id(best_person)
+        previous_technical_id = record.technical_track_id
+        self.technical_to_person[synthetic_id] = best_person
+        record.aliases.add(synthetic_id)
+        # ``gallery_rescues`` est incrémenté, pas ``technical_id_changes`` : un
+        # rattachement par secours n'est pas un changement d'identifiant BoT-SORT,
+        # et le compteur ``technical_id_changes`` reste ainsi réconciliable, à
+        # l'événement près, avec le nombre de ``TECHNICAL_ID_CHANGED`` journalisés.
+        self.gallery_rescues += 1
+        rescued = replace(observation, technical_track_id=synthetic_id)
+        self._touch(record, rescued, feature, timestamp_s, frame_index, frame)
+        self._emit(
+            "REID_GALLERY_RESCUE",
+            timestamp_s,
+            frame_index,
+            person_id=best_person,
+            technical_track_id=synthetic_id,
+            previous_technical_track_id=previous_technical_id,
+            confidence=round(float(observation.confidence), 4),
+            similarity=round(float(best_similarity), 4),
+            runner_up_similarity=None if runner_up is None else round(float(runner_up), 4),
+            winner_margin=None if runner_up is None else round(float(best_similarity - runner_up), 4),
+            candidates_evaluated=len(scored),
+            distance=None if distance is None else round(float(distance), 2),
+            allowed_distance=None if allowed is None else round(float(allowed), 2),
+            threshold_applied=round(float(threshold), 4),
+            absence_s=round(float(absence_s), 3),
+            strict_reappearance=strict_reappearance,
+            reason="gallery_rescue_untracked_observation",
+        )
+        return Assignment(
+            technical_track_id=synthetic_id,
+            person_id=best_person,
+            bbox=observation.bbox,
+            confidence=float(observation.confidence),
+            anchor=observation.anchor,
+            bbox_height=observation.bbox_height,
+            provisional=record.provisional,
+            matched=True,
+            similarity=float(best_similarity),
+            runner_up_similarity=runner_up,
+            candidates_evaluated=len(scored),
+            allowed_distance=allowed,
+            distance=distance,
+            reason="gallery_rescue",
+            anchor_reliable=observation.anchor_reliable,
+            head_point=observation.head_point,
+            head_confidence=observation.head_confidence,
+        )
+
     # -- Cycle de vie ------------------------------------------------------
     def _touch(
         self,
@@ -1100,6 +1651,14 @@ class IdentityManager:
         record.bbox = np.asarray(observation.bbox, dtype=float)
         record.last_seen_s = timestamp_s
         record.observations += 1
+        # Boîte multi-personnes : on fige l'apparence comme empreinte et on
+        # marque l'identité « en fusion ». Une observation propre lève le
+        # marquage (l'empreinte est conservée pour référence jusqu'à la fin de
+        # la fenêtre de galerie).
+        if getattr(observation, "possible_multi_person", False):
+            self._flag_merge_record(record, timestamp_s)
+        else:
+            record.merge_flagged_at_s = None
         # Une identité observée redevient vivante : elle cesse d'être « purgée »
         # et retrouve la fenêtre de grâce normale. L'événement PURGE déjà
         # journalisé n'est pas effacé : la réassociation est tracée par

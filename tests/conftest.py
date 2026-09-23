@@ -75,6 +75,16 @@ def test_config(make_config):
             "grace_period_seconds": 1.0,  # 10 frames
             "fps_estimate_window": 4,
         },
+        # Durées de test à l'échelle du scénario : la rétention de galerie est
+        # alignée sur la grâce (1 s), sinon la fenêtre totale de 16 s de la
+        # configuration livrée rendrait les scénarios de perte de piste
+        # intestables (et ne permettrait pas de vérifier la libération).
+        "reid": {"long_term": {"gallery_retention_seconds": 1.0}},
+        # L'assistance tête est active dans la configuration livrée ; les tests
+        # de comportement central (chute de hauteur, stabilité d'ancre, sortie)
+        # la désactivent pour rester déterministes. Les tests dédiés
+        # (test_head_assist_presence.py) l'activent explicitement.
+        "presence": {"head_assist": {"enabled": False}},
         "occupancy": {"snapshot_interval_seconds": 0.1},
         "display": {"enabled": False},
     })

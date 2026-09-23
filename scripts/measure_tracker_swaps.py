@@ -52,6 +52,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from config import load_config, override_config  # noqa: E402
+from events import ListSink  # noqa: E402
 from geometry import compute_anchor  # noqa: E402
 from identity_manager import IdentityManager, Observation  # noqa: E402
 
@@ -131,6 +132,17 @@ def measure(args: argparse.Namespace) -> dict:
                 }
             },
         )
+    if args.gallery_rescue is not None:
+        config = override_config(
+            config,
+            {
+                "reid": {
+                    "long_term": {
+                        "gallery_rescue_enabled": bool(args.gallery_rescue)
+                    }
+                }
+            },
+        )
     tracker_path = build_tracker_variant(
         config,
         track_buffer=config.tracker.track_buffer,
@@ -138,12 +150,17 @@ def measure(args: argparse.Namespace) -> dict:
         proximity_thresh=config.tracker.proximity_thresh,
     )
 
+    # Collecteur d'événements en mémoire : permet de compter séparément les
+    # rattachements par secours galerie et les nouvelles identités créées alors
+    # qu'un candidat de galerie existait déjà (proxy de « perte » de piste).
+    sink = ListSink("measure_swaps")
     identities = IdentityManager(
         long_term=config.reid.long_term,
         external_reid=config.reid.external_reid,
         appearance_continuity=config.reid.appearance_continuity,
         swap_correction=config.reid.swap_correction,
         grace_period_seconds=config.timing.grace_period_seconds,
+        event_sink=sink,
     )
     model = YOLO(str(config.resolve_path(config.model.path)))
     generator = model.track(
@@ -187,6 +204,38 @@ def measure(args: argparse.Namespace) -> dict:
                 detections_observed += 1
         identities.assign(observations, frame, timestamp_s, frames_processed)
 
+        # Observations non trackées : mêmes règles que ``main``. Quand BoT-SORT
+        # n'a confirmé aucune piste, ``result.boxes`` conserve les détections
+        # brutes (sans identifiant) ; la gamme
+        # ``[track_low_thresh, new_track_thresh[`` est présentée au chemin de
+        # secours galerie, qui ne peut que rattacher une identité existante.
+        if (
+            config.reid.long_term.gallery_rescue_enabled
+            and boxes is not None
+            and getattr(boxes, "id", None) is None
+            and len(boxes)
+        ):
+            confs = boxes.conf.cpu().numpy() if boxes.conf is not None else [1.0] * len(boxes)
+            low = float(config.tracker.track_low_thresh)
+            high = float(config.tracker.new_track_thresh)
+            for box, confidence in zip(boxes.xyxy.cpu().numpy(), confs):
+                confidence = float(confidence)
+                if not (low <= confidence < high):
+                    continue
+                bbox = np.asarray(box, dtype=float)
+                identities.try_gallery_rescue(
+                    Observation(
+                        technical_track_id=0,
+                        bbox=bbox,
+                        confidence=confidence,
+                        anchor=compute_anchor(bbox),
+                        bbox_height=float(bbox[3] - bbox[1]),
+                    ),
+                    frame,
+                    timestamp_s,
+                    frames_processed,
+                )
+
         if args.max_frames is not None and frames_processed >= args.max_frames:
             break
 
@@ -215,6 +264,9 @@ def measure(args: argparse.Namespace) -> dict:
         "swap_correction": {
             "enabled": bool(config.reid.swap_correction.enabled),
             "margin": float(config.reid.swap_correction.margin),
+            "group_proximity_ratio": float(
+                config.reid.swap_correction.group_proximity_ratio
+            ),
             "swap_corrections_applied": int(identities.swap_corrections_applied),
         },
         "identity": {
@@ -223,6 +275,25 @@ def measure(args: argparse.Namespace) -> dict:
             "technical_id_changes": int(identities.technical_id_changes),
             "descriptor_rejections": int(identities.descriptor_rejections),
             "swap_corrections_applied": int(identities.swap_corrections_applied),
+        },
+        # Chemin de secours galerie : mesure d'impact séparée (avec / sans).
+        "gallery_rescue": {
+            "enabled": bool(config.reid.long_term.gallery_rescue_enabled),
+            "min_confidence": float(
+                config.reid.long_term.gallery_rescue_min_confidence or 0.0
+            ),
+            "rescues": int(identities.gallery_rescues),
+        },
+        # « Perte » de piste : une nouvelle identité est créée alors qu'un
+        # candidat de galerie existait déjà (filtre spatio-temporel franchi) mais
+        # que son apparence était sous le seuil. C'est le proxy avant/après du
+        # bénéfice de ``gallery_rescue``.
+        "losses": {
+            "new_identities_with_gallery_candidate": sum(
+                1
+                for event in sink.of_type("REID_NEW")
+                if int(event.get("candidates_evaluated") or 0) > 0
+            ),
         },
     }
 
@@ -246,6 +317,16 @@ def main(argv: list[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Active ou désactive la correction active de swap (défaut : valeur de configuration)",
+    )
+    parser.add_argument(
+        "--gallery-rescue",
+        dest="gallery_rescue",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Active ou désactive le chemin de secours galerie pour les "
+            "observations non trackées (défaut : valeur de configuration)"
+        ),
     )
     parser.add_argument("--out", default=None, help="JSON Lines de sortie (défaut : results/swap_measurements.jsonl)")
     args = parser.parse_args(argv)

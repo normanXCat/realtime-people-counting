@@ -150,7 +150,8 @@ def test_confidence_defaults_stay_coherent(sim):
     assert config.tracker.track_low_thresh <= config.model.confidence
     assert config.tracker.track_low_thresh < config.tracker.track_high_thresh
     assert config.tracker.new_track_thresh >= config.tracker.track_high_thresh
-    assert coherence_warnings(config) == []
+    codes = [code for code, _message in coherence_warnings(config)]
+    assert "yolo_confidence_above_tracker_low_thresh" not in codes
 
 
 # ---------------------------------------------------------------------------

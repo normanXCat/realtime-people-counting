@@ -13,7 +13,35 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any, Iterator
+
+#: Écart relatif au-delà duquel le débit de traitement mesuré est considéré
+#: comme divergent du FPS natif déclaré (signal d'un run hors temps réel).
+NATIVE_FPS_DIVERGENCE_THRESHOLD = 0.20
+
+
+def native_video_fps(source: Any) -> float | None:
+    """FPS natif déclaré par une source vidéo (``CAP_PROP_FPS``), ou ``None``.
+
+    Sur un fichier traité hors temps réel, c'est le seul référentiel qui garde
+    les durées de la configuration alignées sur le **contenu vidéo** plutôt que
+    sur le débit CPU. Ne lève jamais : une source caméra (FPS non déclaré) ou
+    une erreur d'ouverture renvoie ``None``, et l'appelant se rabat sur
+    l'horloge murale.
+    """
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(source)
+    except Exception:
+        return None
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+    except Exception:  # pragma: no cover - backend vidéo en échec
+        return None
+    finally:
+        capture.release()
+    return fps if fps > 0 else None
 
 #: Étapes instrumentées séparément (spec 6.5).
 LATENCY_STAGES: tuple[str, ...] = (
@@ -36,10 +64,13 @@ class FpsEstimator:
     n'ouvre l'écriture vidéo qu'une fois cette mesure disponible.
     """
 
-    def __init__(self, window: int = 30) -> None:
+    def __init__(self, window: int = 30, native_fps: float | None = None) -> None:
         if window < 2:
             raise ValueError("La fenêtre d'estimation du FPS doit être >= 2")
         self.window = int(window)
+        #: FPS natif de la source (``None`` pour une caméra live) : sert de
+        #: référence pour détecter un traitement hors temps réel.
+        self.native_fps = None if native_fps is None else float(native_fps)
         self._intervals: deque[float] = deque(maxlen=window)
         self._last_timestamp: float | None = None
         self._first_timestamp: float | None = None
@@ -87,6 +118,31 @@ class FpsEstimator:
         ordered = sorted(self._intervals)
         middle = ordered[len(ordered) // 2]
         return 1.0 / middle if middle > 0 else None
+
+    @property
+    def divergence_ratio(self) -> float | None:
+        """Écart relatif entre le FPS mesuré et le FPS natif de référence."""
+        measured = self.fps
+        if self.native_fps is None or measured is None or self.native_fps <= 0:
+            return None
+        return abs(measured - self.native_fps) / self.native_fps
+
+    @property
+    def diverges_from_native(self) -> bool:
+        """Le débit de traitement s'écarte-t-il de plus de 20 % du FPS natif ?"""
+        ratio = self.divergence_ratio
+        return ratio is not None and ratio > NATIVE_FPS_DIVERGENCE_THRESHOLD
+
+    def divergence_message(self) -> str | None:
+        """Message de ``CONFIG_WARNING`` si le run diverge du FPS natif, sinon ``None``."""
+        if not self.diverges_from_native or self.native_fps is None:
+            return None
+        return (
+            f"Le débit de traitement mesuré ({(self.fps or 0.0):.2f} ips) diverge "
+            f"de plus de {NATIVE_FPS_DIVERGENCE_THRESHOLD * 100:.0f} % du FPS "
+            f"natif déclaré ({self.native_fps:.2f} ips) : run hors temps réel non "
+            "couvert par les seuils calibrés (track_buffer, grace_period_frames)."
+        )
 
     def require_fps(self) -> float:
         """Retourne le FPS mesuré, ou échoue explicitement s'il n'existe pas."""

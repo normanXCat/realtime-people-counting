@@ -77,7 +77,7 @@ from config import (
 )
 from events import EventLogger
 from geometry import LineError, VirtualLine, extract_head_point
-from metrics import FpsEstimator, LatencyProfiler, Timer
+from metrics import FpsEstimator, LatencyProfiler, Timer, native_video_fps
 from occupancy_manager import Detection, OccupancyManager
 from track_diagnostics import (
     BOXES_EMPTY,
@@ -211,6 +211,54 @@ def resolve_source(raw: str) -> int | str:
     if candidate.isdigit():
         return int(candidate)
     return candidate
+
+
+def is_video_file_source(source: int | str) -> bool:
+    """Une source est-elle un **fichier vidéo** (par opposition à une caméra) ?
+
+    ``resolve_source`` convertit les index numériques en ``int`` : tout ``str``
+    restant est un chemin de fichier, seul cas où un FPS natif est interrogeable
+    et où l'horloge doit suivre le **contenu** et non le débit CPU.
+    """
+    return isinstance(source, str)
+
+
+def collect_untracked_detections(
+    boxes: Any, config: PipelineConfig, *, ids_present: bool
+) -> list[Detection]:
+    """Détections **sans identifiant technique**, à présenter au secours galerie.
+
+    BoT-SORT écarte les détections qu'il n'associe pas (score sous
+    ``new_track_thresh``) : quand aucune piste n'est confirmée, elles restent
+    visibles dans ``result.boxes``, sans identifiant. Les ignorer revient à ne
+    jamais laisser la galerie les examiner — c'est le cas d'une personne assise et
+    immobile dont la réapparition est de moindre qualité. Elles sont restreintes à
+    la gamme ``[track_low_thresh, new_track_thresh[`` : au-dessus, une piste
+    aurait été créée ; en dessous, le second étage de BoT-SORT lui-même les refuse.
+
+    Aucun identifiant n'est inventé ici : ``technical_track_id`` vaut ``0``
+    (placeholder non tracké), le rattachement éventuel à une identité de galerie
+    est décidé par :meth:`IdentityManager.try_gallery_rescue`.
+    """
+    if not config.reid.long_term.gallery_rescue_enabled or ids_present or boxes is None:
+        return []
+    count = box_count(boxes)
+    if not count:
+        return []
+    confidences = (
+        boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None
+        else [1.0] * count
+    )
+    low = float(config.tracker.track_low_thresh)
+    high = float(config.tracker.new_track_thresh)
+    detections: list[Detection] = []
+    for box, confidence in zip(boxes.xyxy.cpu().numpy(), confidences):
+        confidence = float(confidence)
+        if low <= confidence < high:
+            detections.append(
+                Detection(technical_track_id=0, bbox=box, confidence=confidence)
+            )
+    return detections
 
 
 def new_session_id() -> str:
@@ -456,7 +504,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     video_path = session_root / config.output.video_filename
     buffered_rendered: list[Any] = []
     profiler = LatencyProfiler()
-    fps_estimator = FpsEstimator(window=config.timing.fps_estimate_window)
+    # -- Horloge : FPS natif du fichier vidéo vs horloge murale ------------
+    # Sur un fichier traité hors temps réel, l'horloge murale mesure le débit
+    # CPU, pas le FPS du contenu : grace_period_frames (FSM) se désynchronise
+    # alors du track_buffer de BoT-SORT (exprimé en frames vidéo natives). Toute
+    # source fichier est donc horodatée en frames natives
+    # (timestamp = frame_index / native_fps) ; la caméra live garde
+    # time.perf_counter().
+    native_fps: float | None = None
+    use_native_clock = is_video_file_source(source)
+    if use_native_clock:
+        native_fps = native_video_fps(source)
+        if native_fps is None:
+            use_native_clock = False
+            print(
+                f"[TIMING] FPS natif illisible pour {source} : repli sur l'horloge "
+                "murale (débit de traitement).",
+                file=sys.stderr,
+            )
+    session_fps_source = "video_native" if use_native_clock else "measured"
+    fps_estimator = FpsEstimator(
+        window=config.timing.fps_estimate_window,
+        native_fps=native_fps,
+    )
+    #: Horloge murale **séparée** : mesure le débit réel de traitement pour
+    #: signaler un run hors temps réel, sans contaminer l'horloge de contenu.
+    processing_estimator = FpsEstimator(
+        window=config.timing.fps_estimate_window,
+        native_fps=native_fps,
+    )
+    fps_native_warning_emitted = False
     logger = EventLogger(
         session_root / config.output.events_filename,
         session_id=session_id,
@@ -470,12 +547,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     start_s = time.perf_counter()
 
+    # -- Modèle : assistance tête avec repli propre ------------------------
+    # L'assistance tête exige le modèle de pose. S'il est absent, on ne fait PAS
+    # échouer l'initialisation : on la désactive pour la session et on retombe sur
+    # le modèle de détection standard (repli journalisé, jamais silencieux).
+    head_assist_active = config.presence.head_assist.enabled
     try:
-        if config.presence.head_assist.enabled:
-            model_path = config.resolve_path(config.presence.head_assist.pose_model_path)
-            model_sha256 = verify_weights(
-                model_path, config.presence.head_assist.pose_model_expected_sha256
-            )
+        if head_assist_active:
+            pose_path = config.resolve_path(config.presence.head_assist.pose_model_path)
+            if pose_path.exists():
+                model_path = pose_path
+                model_sha256 = verify_weights(
+                    pose_path, config.presence.head_assist.pose_model_expected_sha256
+                )
+            else:
+                head_assist_active = False
+                model_path = config.resolve_path(config.model.path)
+                model_sha256 = verify_weights(model_path, config.model.expected_sha256)
+                print(
+                    f"[MODEL] Poids de pose absents ({pose_path}) : assistance tête "
+                    f"désactivée pour cette session, repli sur {config.model.path}.",
+                    file=sys.stderr,
+                )
         else:
             model_path = config.resolve_path(config.model.path)
             model_sha256 = verify_weights(model_path, config.model.expected_sha256)
@@ -496,7 +589,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         source=str(source),
         model_path=str(model_path),
         model_sha256=model_sha256,
-        fps_source=config.timing.fps_source,
+        fps_source=session_fps_source,
+        fps_native=native_fps,
         line_policy="manual_required",
         mode=args.mode,
         tracker_high_thresh=config.tracker.track_high_thresh,
@@ -512,6 +606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tracker_gmc_method=config.tracker.gmc_method,
         warmup_min_frames=config.timing.warmup_min_frames,
         warmup_seconds=config.timing.warmup_seconds,
+        head_assist_enabled=head_assist_active,
     )
     # Incohérences de configuration : journalisées explicitement (un seuil YOLO
     # plus haut que le seuil bas du tracker rend la récupération des personnes
@@ -521,6 +616,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "CONFIG_WARNING", 0.0, 0, code=code, details=message, source="config"
         )
         print(f"[CONFIG] {code} : {message}", file=sys.stderr)
+    if config.presence.head_assist.enabled and not head_assist_active:
+        # Repli effectif : la configuration résolue de session reflète
+        # l'assistance réellement active (le YAML archivé ne prétend pas
+        # l'inverse de l'exécution). Fait APRÈS l'émission des CONFIG_WARNING
+        # pour que l'absence des poids reste tracée dans le journal.
+        config = override_config(
+            config, {"presence": {"head_assist": {"enabled": False}}}
+        )
     print(
         f"[MODE] {args.mode} | source={source} | étape 1/2 : définition manuelle "
         "de la ligne virtuelle (la première image va s'afficher)"
@@ -644,9 +747,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             fps_estimator=fps_estimator, session_root=session_root,
             session_id=session_id, config=config,
             resolved_config_path=resolved_config_path, model_path=model_path,
-            model_sha256=model_sha256, frames_processed=0,
+            model_sha256=model_sha256,            frames_processed=0,
             duration_s=time.perf_counter() - start_s, budget=None,
-            diagnostics=diagnostics,
+            diagnostics=diagnostics, native_fps=native_fps,
+            fps_source=session_fps_source,
         )
         logger.close()
         return 5
@@ -741,6 +845,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     observed_confidences.append(float(confidence))
 
+            # -- Observations non trackées : chemin de secours galerie ----------
+            # BoT-SORT écarte les détections non associées (score sous
+            # ``new_track_thresh``) : quand AUCUNE piste n'est confirmée, elles
+            # restent visibles dans ``result.boxes``, sans identifiant technique.
+            # Les ignorer revient à ne jamais laisser la galerie les examiner —
+            # c'est exactement le cas d'une personne assise/immobile dont la
+            # réapparition est de moindre qualité. Elles sont donc transmises
+            # comme « observations non trackées », restreintes à la gamme
+            # ``[track_low_thresh, new_track_thresh[`` : au-dessus, une piste
+            # aurait été créée ; en dessous, le second étage de BoT-SORT lui-même
+            # les refuse. Aucun identifiant n'est inventé ici.
+            untracked_detections = collect_untracked_detections(
+                boxes, config, ids_present=tracker_ids_present
+            )
+
             # Diagnostic systématique des détections brutes YOLO avant filtrage (spec correction 1)
             raw_boxes_array = None
             raw_conf_array = None
@@ -756,7 +875,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 frame_index=frame_index,
             )
 
-            timestamp_s = time.perf_counter() - start_s
+            if use_native_clock and native_fps:
+                # Horloge de contenu : indépendante du débit CPU (voir plus haut).
+                timestamp_s = (frame_index - 1) / native_fps
+            else:
+                timestamp_s = time.perf_counter() - start_s
             # Diagnostic de la frame : distingue « aucune détection » de « boîtes
             # présentes sans identifiant technique ». Le second cas laisse
             # `detections` vide (aucun identifiant n'est inventé) : les pistes
@@ -777,11 +900,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 frame_index,
             )
             fps_estimator.tick(timestamp_s)
+            # Débit réel de traitement (horloge murale) : sert uniquement à
+            # signaler un run hors temps réel par rapport au FPS natif déclaré.
+            processing_estimator.tick(time.perf_counter() - start_s)
+            if (
+                not fps_native_warning_emitted
+                and processing_estimator.is_ready
+                and processing_estimator.diverges_from_native
+            ):
+                message = processing_estimator.divergence_message()
+                logger.emit(
+                    "CONFIG_WARNING",
+                    timestamp_s,
+                    frame_index,
+                    code="fps_native_divergence",
+                    details=message,
+                    source="runtime",
+                )
+                print(f"[CONFIG] fps_native_divergence : {message}", file=sys.stderr)
+                fps_native_warning_emitted = True
             if fps_estimator.is_ready:
                 budget = config.timing.frame_budget(fps_estimator.require_fps())
                 occupancy.set_frame_budget(budget)
 
-            occupancy.process_frame(detections, frame, timestamp_s, frame_index)
+            occupancy.process_frame(
+                detections,
+                frame,
+                timestamp_s,
+                frame_index,
+                untracked=untracked_detections,
+            )
 
             with Timer() as render_timer:
                 rendered = frame.copy()
@@ -872,6 +1020,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             duration_s=time.perf_counter() - start_s,
             budget=budget,
             diagnostics=diagnostics,
+            native_fps=native_fps,
+            fps_source=session_fps_source,
         )
         logger.close()
 
@@ -918,6 +1068,8 @@ def _finalize(
     duration_s: float,
     budget: FrameBudget | None,
     diagnostics: DetectionDiagnostics | None = None,
+    native_fps: float | None = None,
+    fps_source: str | None = None,
 ) -> None:
     """Écrit le bilan de session : événement final, résumé, environnement (spec 6.5)."""
     latency = profiler.summary()
@@ -954,7 +1106,10 @@ def _finalize(
             "mean": round(fps_mean, 3) if fps_mean else None,
             "median": round(fps_estimator.fps_median, 3) if fps_estimator.fps_median else None,
             "min": round(fps_estimator.fps_min, 3) if fps_estimator.fps_min else None,
-            "source": config.timing.fps_source,
+            # FPS natif déclaré par la source vidéo : à côté des mesures pour
+            # repérer immédiatement un run hors temps réel.
+            "native": None if native_fps is None else round(float(native_fps), 3),
+            "source": fps_source or config.timing.fps_source,
             "measured_samples": fps_estimator.samples,
         },
         "frame_budget": None if budget is None else budget.to_dict(),
@@ -994,6 +1149,26 @@ def _finalize(
             ),
             "descriptor_rejections": int(
                 occupancy.identities.descriptor_rejections
+            ),
+        },
+        # Chemin de secours « galerie » : publié avec son flag et son plancher de
+        # confiance, pour que l'impact d'une activation soit mesurable dans
+        # ``summary.json`` sans dépendre du détail des événements.
+        "gallery_rescue": {
+            "enabled": bool(config.reid.long_term.gallery_rescue_enabled),
+            "min_confidence": float(
+                config.reid.long_term.gallery_rescue_min_confidence or 0.0
+            ),
+            "rescues": int(occupancy.identities.gallery_rescues),
+        },
+        # Extracteur d'apparence réellement actif : le nom distingue le modèle
+        # profond (OSNet/MobileNetV3) du repli HSV, et ``unavailable_reason``
+        # documente une dégradation propre sans jamais l'être silencieusement.
+        "appearance_extractor": {
+            "enabled": bool(config.reid.external_reid.enabled),
+            "name": str(getattr(occupancy.identities.appearance, "name", "unknown")),
+            "unavailable_reason": getattr(
+                occupancy.identities.appearance, "unavailable_reason", None
             ),
         },
         "tracker": {

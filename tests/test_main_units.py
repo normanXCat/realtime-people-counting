@@ -281,9 +281,12 @@ def test_source_inouvrable_produit_une_erreur_explicite(tmp_path: Path):
     assert events_path.exists()
 
     events = read_events(events_path)
-    types = [event["type"] for event in events]
+    # Les CONFIG_WARNING de démarrage (par ex. poids de pose absents) ne font pas
+    # partie du parcours d'erreur testé.
+    types = [event["type"] for event in events if event["type"] != "CONFIG_WARNING"]
     assert types == ["SESSION_START", "SOURCE_ERROR", "SESSION_END"]
     # La sélection de ligne échoue d'abord sur la lecture de la première image.
-    assert "jamais.mp4" in events[1]["error"]
+    source_error = next(event for event in events if event["type"] == "SOURCE_ERROR")
+    assert "jamais.mp4" in source_error["error"]
     # Une source défaillante ne doit produire aucun franchissement.
     assert not [event for event in events if event["type"] in ("IN", "OUT", "NEW")]

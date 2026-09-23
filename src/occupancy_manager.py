@@ -343,20 +343,21 @@ class OccupancyManager:
     # ------------------------------------------------------------------
     # Traitement d'une frame
     # ------------------------------------------------------------------
-    def process_frame(
+    def _filter_detections_geometry(
         self,
         detections: Sequence[Detection],
-        frame: np.ndarray,
         timestamp_s: float,
         frame_index: int,
-    ) -> None:
-        """Traite une frame complète : identités, FSM, comptage, occupation."""
-        self._frames += 1
-        height, width = frame.shape[:2]
-        self._frame_size = (width, height)
+    ) -> list[Detection]:
+        """Filtre géométrique (spec correction 1) : écarte les artefacts extrêmes.
 
-        # Filtrage géométrique (spec correction 1) : écarter les artefacts extrêmes
-        # tout en acceptant les postures assises (ratio W/H jusqu'à max_aspect_ratio_wh).
+        Appliqué de façon identique aux pistes **trackées** et aux observations
+        **non trackées** du chemin de secours galerie : une réapparition assise
+        passe dès qu'elle est géométriquement plausible (ratio W/H jusqu'à
+        ``max_aspect_ratio_wh``). Chaque rejet est journalisé, jamais silencieux.
+        Un identifiant technique ``<= 0`` désigne une observation non trackée : il
+        n'est pas publié comme s'il s'agissait d'une piste BoT-SORT.
+        """
         valid_detections: list[Detection] = []
         for det in detections:
             valid, reason, ratio = check_detection_geometry(
@@ -368,10 +369,11 @@ class OccupancyManager:
                 min_width_px=self.config.geometry.min_box_width_px,
             )
             if not valid:
+                technical_id = int(det.technical_track_id)
                 _log.debug(
                     "Frame %d: detection %d rejected by geometric filter: reason=%s, w/h=%.2f, conf=%.3f",
                     frame_index,
-                    det.technical_track_id,
+                    technical_id,
                     reason,
                     ratio,
                     det.confidence,
@@ -387,11 +389,42 @@ class OccupancyManager:
                     bbox=[round(float(v), 2) for v in det.bbox],
                     min_ratio=self.config.geometry.min_aspect_ratio_wh,
                     max_ratio=self.config.geometry.max_aspect_ratio_wh,
-                    technical_track_id=int(det.technical_track_id),
+                    **(
+                        {}
+                        if technical_id <= 0
+                        else {"technical_track_id": technical_id}
+                    ),
                 )
                 continue
             valid_detections.append(det)
-        detections = valid_detections
+        return valid_detections
+
+    def process_frame(
+        self,
+        detections: Sequence[Detection],
+        frame: np.ndarray,
+        timestamp_s: float,
+        frame_index: int,
+        untracked: Sequence[Detection] = (),
+    ) -> None:
+        """Traite une frame complète : identités, FSM, comptage, occupation.
+
+        ``untracked`` porte les détections **sans identifiant technique** que
+        BoT-SORT a écartées (score sous ``new_track_thresh``), transmises par
+        ``main`` au lieu d'être silencieusement ignorées. Elles ne traversent que
+        le chemin de secours galerie (:meth:`IdentityManager.try_gallery_rescue`)
+        et ne peuvent jamais créer d'identité.
+        """
+        self._frames += 1
+        height, width = frame.shape[:2]
+        self._frame_size = (width, height)
+
+        detections = self._filter_detections_geometry(
+            detections, timestamp_s, frame_index
+        )
+        untracked = self._filter_detections_geometry(
+            list(untracked), timestamp_s, frame_index
+        )
 
         if self.budget is None:
             # Aucun FPS mesuré : les durées ne peuvent pas être converties en
@@ -504,6 +537,36 @@ class OccupancyManager:
             assignments = self.identities.assign(
                 observations, frame, timestamp_s, frame_index
             )
+            # Chemin de secours « galerie » : les détections écartées par BoT-SORT
+            # n'ont jamais atteint ``assign``. Elles lui sont présentées **après**
+            # l'affectation nominale, pour qu'une identité encore active ne puisse
+            # pas être capturée par une observation non trackée. Une observation
+            # non rattachée est ignorée : ce chemin ne crée jamais d'identité.
+            if untracked and self.config.reid.long_term.gallery_rescue_enabled:
+                for detection in untracked:
+                    raw = np.asarray(detection.bbox, dtype=float)
+                    rescued = self.identities.try_gallery_rescue(
+                        Observation(
+                            technical_track_id=int(detection.technical_track_id),
+                            bbox=raw,
+                            confidence=float(detection.confidence),
+                            anchor=compute_anchor(raw),
+                            bbox_height=float(raw[3] - raw[1]),
+                            anchor_reliable=(
+                                anchor_reliability(
+                                    detection.bbox, width, height, margin_ratio
+                                )
+                                is AnchorReliability.FIABLE
+                            ),
+                            head_point=detection.head_point,
+                            head_confidence=detection.head_confidence,
+                        ),
+                        frame,
+                        timestamp_s,
+                        frame_index,
+                    )
+                    if rescued is not None:
+                        assignments.append(rescued)
         if self.profiler is not None:
             self.profiler.record("reid", reid_timer.ms)
 
@@ -524,6 +587,12 @@ class OccupancyManager:
                     threshold=round(float(th), 4),
                     technical_track_id=tech_id,
                     bbox=[round(float(v), 2) for v in assignment.bbox],
+                )
+                # L'identité fige son empreinte d'apparence : après séparation,
+                # le ré-appariement exigera une similarité stricte vis-à-vis de
+                # cette empreinte (aucun assouplissement post-fusion).
+                self.identities.note_multi_person_box(
+                    int(assignment.person_id), timestamp_s
                 )
 
         ambiguity_radius_px = self.scale.ratio_to_px(

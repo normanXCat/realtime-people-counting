@@ -3,10 +3,11 @@
 Symptôme corrigé : une personne cachée longtemps, dont la piste technique a
 expiré, n'était plus jamais réassociée. Trois exigences sont vérifiées ici :
 
-1. la durée de rétention de la galerie d'apparence est **alignée** sur la période
-   de grâce d'occupation (``reid.long_term.gallery_retention_seconds: null``) :
-   la mémoire n'est jamais libérée avant que la personne n'ait eu une chance
-   réaliste de réapparaître ; un découplage explicite reste possible ;
+1. la mémoire d'apparence couvre **toute** la fenêtre d'occlusion : rétention
+   explicite de 10 s (``reid.long_term.gallery_retention_seconds``) + grâce de
+   6 s = 16 s, au-delà de l'occlusion max mesurée (13,5 s). Le plafond de
+   déplacement du filtre spatio-temporel doit couvrir cette même fenêtre, sinon
+   un candidat légitime est rejeté spatialement avant toute comparaison ;
 2. le seuil d'apparence peut être assoupli de façon **progressive** selon la
    durée d'absence — mais uniquement si un plancher est déclaré, et jamais en
    dessous de ce plancher (aucun assouplissement subi par défaut) ;
@@ -71,6 +72,9 @@ def long_config(make_config):
             "grace_period_seconds": 3.0,
             "fps_estimate_window": 4,
         },
+        # Rétention explicitement alignée sur la grâce (3 s) : le scénario
+        # « au-delà de la rétention » reste mesurable en 70 frames à 10 fps.
+        "reid": {"long_term": {"gallery_retention_seconds": 3.0}},
         "occupancy": {"snapshot_interval_seconds": 0.1},
         "display": {"enabled": False},
     })
@@ -127,15 +131,57 @@ def enter(sim, track_id=1, x=150.0):
 # ---------------------------------------------------------------------------
 # 1. Durée de rétention : alignée sur la grâce, découplable explicitement
 # ---------------------------------------------------------------------------
-def test_retention_is_aligned_on_the_occupancy_grace_by_default(config):
+def test_default_retention_covers_the_longest_measured_occlusion(config):
+    """Grâce (6 s) + rétention (10 s) = 16 s > occlusion max mesurée (13,5 s)."""
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert config.reid.long_term.gallery_retention_seconds is None
-    assert manager.purge_retention_seconds == pytest.approx(
-        config.timing.grace_period_seconds
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(10.0)
+    assert manager.purge_retention_seconds == pytest.approx(10.0)
+    assert (
+        config.timing.grace_period_seconds + manager.purge_retention_seconds
+        >= 13.5
     )
+
+
+def test_spatial_cap_covers_the_whole_gallery_window():
+    """Un candidat réapparu après la grâce (mais dans la rétention) reste plausible.
+
+    Régression : le plafond de déplacement était borné à la seule grâce, ce qui
+    rejetait sur le critère spatial, **avant** toute comparaison d'apparence, une
+    réapparition légitime survenue entre ``grace_period_seconds`` et
+    ``grace_period_seconds + purge_retention_seconds``.
+    """
+    manager = IdentityManager(
+        long_term=LongTermReidConfig(
+            enabled=True,
+            similarity_threshold=0.4,
+            safety_margin=0.0,
+            v_max_ratio=1.5,
+            spatial_margin_ratio=0.3,
+            gallery_retention_seconds=10.0,
+        ),
+        grace_period_seconds=1.0,
+        appearance=StubAppearance(default=None),
+    )
+    # Identité établie à t = 0 (ancre (100, 300), hauteur 100).
+    manager.assign(
+        [observation(7, anchor=(100.0, 300.0), feature=unit(1, 0, 0))], FRAME, 0.0, 1
+    )
+    manager.assign([], FRAME, 0.1, 2)  # la piste cesse d'être « live »
+
+    # À t = 4 s (grâce = 1 s, fenêtre galerie = 11 s), une réapparition à
+    # 1000 px est cohérente sur toute la fenêtre, mais dépasse le plafond d'une
+    # seule grâce (1.5×200×1 + 0.3×200 = 360 px).
+    reappearance = observation(9, anchor=(1100.0, 300.0), feature=unit(1, 0, 0))
+    candidates = manager._plausible_candidates(reappearance, 4.0)
+    assert [person_id for person_id, *_rest in candidates] == [1]
+    assert candidates[0][2] >= 1000.0
+    # L'ancien plafond (grâce seule) l'aurait refusé : c'est le bug corrigé.
+    height = manager.records[1].bbox_height
+    grace_only = 1.5 * height * 1.0 + 0.3 * height
+    assert 1100.0 - 100.0 > grace_only
 
 
 def test_explicit_retention_decouples_the_memory_from_the_occupancy_grace():

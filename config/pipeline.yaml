@@ -11,136 +11,206 @@
 schema_version: 1
 
 source:
-  # Source par défaut : "0" (index caméra) ou un chemin de fichier vidéo.
-  # Peut être surchargée par --source. --config peut pointer vers un autre YAML.
-  default: "0"
-  # Nombre de tentatives de reconnexion quand le flux s'ouvre mais ne produit
-  # plus d'images (spec 5.5). 0 = fin de flux considérée comme une erreur.
-  reconnect_attempts: 0
-  # Durée sans aucune détection au-delà de laquelle l'absence est signalée
-  # (SOURCE_NO_DETECTION), distincte d'une fin de flux et d'une erreur.
-  no_detection_seconds: 2.0
+    # Source par défaut : "0" (index caméra) ou un chemin de fichier vidéo.
+    # Peut être surchargée par --source. --config peut pointer vers un autre YAML.
+    default: "0"
+    # Nombre de tentatives de reconnexion quand le flux s'ouvre mais ne produit
+    # plus d'images (spec 5.5). 0 = fin de flux considérée comme une erreur.
+    reconnect_attempts: 0
+    # Durée sans aucune détection au-delà de laquelle l'absence est signalée
+    # (SOURCE_NO_DETECTION), distincte d'une fin de flux et d'une erreur.
+    no_detection_seconds: 2.0
 
 model:
-  path: models/yolo11n.pt
-  expected_sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
-  # Seuil d'inférence YOLO. Volontairement BAS : une personne légèrement floue
-  # produit des scores faibles mais des boîtes encore exploitables par
-  # l'association BoT-SORT. Filtrer ces détections ici les supprime avant même
-  # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
-  # Le garde-fou contre les faux positifs est porté par new_track_thresh.
-  confidence: 0.10          # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
-  nms_iou: 0.55             # PROVISOIRE — à calibrer
-  image_size: 960           # PROVISOIRE — à calibrer
-  classes: [0]              # classe COCO « person »
-  device: cpu               # « cpu » (machine de référence) | « auto » | « cuda:0 »
+    path: models/yolo11n.pt
+    expected_sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+    # Seuil d'inférence YOLO. Volontairement BAS : une personne légèrement floue
+    # produit des scores faibles mais des boîtes encore exploitables par
+    # l'association BoT-SORT. Filtrer ces détections ici les supprime avant même
+    # que le tracker puisse s'en servir, ce qui casse la persistance de piste.
+    # Le garde-fou contre les faux positifs est porté par new_track_thresh.
+    confidence: 0.10 # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4)
+    # NMS : un seuil BAS fusionne agressivement les boîtes voisines ; à 0.40, deux
+    # personnes proches sont séparées plus tôt par le NMS et n'arrivent plus comme
+    # une seule boîte fusionnée en entrée de BoT-SORT (symptôme 4).
+    nms_iou: 0.40 # PROVISOIRE — à calibrer
+    image_size: 960 # PROVISOIRE — à calibrer
+    classes: [0] # classe COCO « person »
+    device: cpu # « cpu » (machine de référence) | « auto » | « cuda:0 »
 
 tracker:
-  config_path: src/configs/custom_botsort.yaml
-  persist: true
-  # Seuils BoT-SORT, DISTINCTS du seuil YOLO et synchronisés avec le YAML lu par
-  # Ultralytics (un test vérifie la synchronisation, sinon la divergence serait
-  # silencieuse).
-  track_high_thresh: 0.4    # plancher de l'association principale
-  track_low_thresh: 0.1     # plancher du second étage (détections faibles)
-  new_track_thresh: 0.7     # plancher exigé pour créer une NOUVELLE piste
+    config_path: src/configs/custom_botsort.yaml
+    persist: true
+    # -- Synchronisation intégrale avec le YAML lu par Ultralytics ---------
+    # TOUTES les clés écrites dans src/configs/custom_botsort.yaml sont doublées
+    # ici (tracker_type, fuse_score, model compris) : un test vérifie que les deux
+    # sources sont identiques clé par clé, sinon la divergence serait silencieuse.
+    tracker_type: botsort
+    # Seuils BoT-SORT, DISTINCTS du seuil YOLO et synchronisés avec le YAML lu par
+    # Ultralytics (un test vérifie la synchronisation, sinon la divergence serait
+    # silencieuse).
+    track_high_thresh: 0.4 # plancher de l'association principale
+    track_low_thresh: 0.1 # plancher du second étage (détections faibles)
+    new_track_thresh: 0.7 # plancher exigé pour créer une NOUVELLE piste
 
-  # -- Persistance de piste et ré-identification native -------------------
-  # track_buffer : nombre de frames pendant lesquelles une piste perdue reste
-  # vivante côté tracker. Valeur réglée sur les occlusions RÉELLEMENT mesurées
-  # dans results/*/events.jsonl (OCCLUDED -> réapparition) : médiane 2,5 s,
-  # p90 5,1 s, maximum 13,5 s à la cadence source (~30 ips). 150 frames couvrent
-  # le p90 (~5 s) ; au-delà, la galerie ReID long terme (section reid) prend le
-  # relais. Compromis : plus long = moins de changements d'identifiant technique,
-  # mais plus de mémoire/calcul et un risque légèrement accru de réassociation
-  # erronée en forte densité de personnes d'apparence similaire.
-  track_buffer: 150
-  # with_reid : module d'apparence de BoT-SORT. Il tente une réassociation AVANT
-  # de créer un nouvel identifiant technique, en complément du ReID long terme
-  # de IdentityManager (qui, lui, opère après expiration de la piste technique).
-  with_reid: true
-  match_thresh: 0.9         # seuil d'association IoU principal
-  proximity_thresh: 0.5     # seuil de proximité du ReID natif
-  appearance_thresh: 0.25   # seuil d'apparence du ReID natif
-  # Caméra FIXE : aucune compensation de mouvement ne doit être estimée (une GMC
-  # active introduirait une instabilité de boîte et d'identifiant sans cause).
-  gmc_method: none
+    # -- Persistance de piste et ré-identification native -------------------
+    # track_buffer : nombre de frames pendant lesquelles une piste perdue reste
+    # vivante côté tracker. Valeur réglée sur les occlusions RÉELLEMENT mesurées
+    # dans results/*/events.jsonl (OCCLUDED -> réapparition) : médiane 2,5 s,
+    # p90 5,1 s, maximum 13,5 s à la cadence source (~30 ips). Porté de 150 à 240
+    # frames (~8 s à 30 ips) : couvre le p90 mesuré + une marge, ce qui réduit le
+    # nombre de handoffs vers le ReID long terme (niveau 2) sans dépasser le p90
+    # mesuré + marge (le maximum de 13,5 s reste couvert par la galerie ReID).
+    # Compromis : plus long = moins de changements d'identifiant technique, mais
+    # plus de mémoire/calcul et un risque légèrement accru de réassociation
+    # erronée en forte densité de personnes d'apparence similaire.
+    track_buffer: 240
+    # fuse_score : fusionne le score de détection dans la matrice de coût IoU
+    # (réglage standard BoT-SORT, doublé dans custom_botsort.yaml).
+    fuse_score: true
+    # with_reid : module d'apparence de BoT-SORT. Il tente une réassociation AVANT
+    # de créer un nouvel identifiant technique, en complément du ReID long terme
+    # de IdentityManager (qui, lui, opère après expiration de la piste technique).
+    with_reid: true
+    # model : modèle de descripteur d'apparence utilisé par BoT-SORT pour le ReID
+    # natif. « auto » laisse le tracker choisir un backbone disponible.
+    model: auto
+    match_thresh: 0.9 # seuil d'association IoU principal
+    proximity_thresh: 0.5 # seuil de proximité du ReID natif
+    # Seuil d'apparence du ReID natif : relevé de 0.25 à 0.35 pour exiger une
+    # apparence plus proche avant une réassociation (lutte contre les swaps).
+    appearance_thresh: 0.35 # seuil d'apparence du ReID natif
+    # Caméra FIXE : aucune compensation de mouvement ne doit être estimée (une GMC
+    # active introduirait une instabilité de boîte et d'identifiant sans cause).
+    gmc_method: none
 
 reid:
-  # Niveau 1 : ReID natif BoT-SORT (réassociation intra-buffer), activé par
-  # `with_reid: true` dans la configuration du tracker. Aucune logique
-  # supplémentaire n'est nécessaire (spec 3.2).
-  short_term: native_botsort
-  # Niveau 2 : galerie de personnes pour la réassociation après expiration de
-  # la piste technique (spec 3.3). Désactivable pour la baseline 1 (spec 9.4).
-  long_term:
-    enabled: true
-    similarity_threshold: 0.40   # PROVISOIRE — à calibrer
-    safety_margin: 0.10          # PROVISOIRE — écart minimal au second candidat
-    v_max_ratio: 1.5             # hauteurs de bbox / seconde
-    spatial_margin_ratio: 0.3    # tolérance additionnelle (fraction de hauteur)
-    ambiguous_policy: provisional_person  # provisional_person | defer
-    # Qualité exigée pour qu'une apparence soit écrite dans la galerie. Une
-    # détection faible, un crop minuscule, une boîte tronquée ou une image floue
-    # produisent un descripteur qui ne doit JAMAIS remplacer une apparence
-    # connue : le rejet est journalisé (REID_DESCRIPTOR_REJECTED).
-    gallery_min_confidence: 0.70
-    gallery_min_crop_height_px: 32
-    gallery_min_crop_width_px: 16
-    gallery_min_sharpness: 0.0   # variance du Laplacien ; 0 = contrôle désactivé
-    # Rétention de la galerie d'apparence APRÈS purge de l'identité. null =
-    # alignée sur timing.grace_period_seconds : la mémoire d'apparence n'est
-    # jamais libérée avant que la personne n'ait eu une chance réaliste de
-    # réapparaître (fenêtre totale = grâce + rétention, soit 2 × grâce par
-    # défaut). Une valeur explicite découple la mémoire ReID de la grâce
-    # d'occupation et doit être justifiée.
-    gallery_retention_seconds: null
-    # Tolérance progressive du seuil d'apparence selon la durée d'absence (une
-    # longue occultation change un peu l'apparence : angle, luminosité). Le seuil
-    # descend linéairement de similarity_threshold vers ce plancher au bout de
-    # long_absence_seconds. null = aucun assouplissement (défaut) : le compromis
-    # est choisi explicitement pour ne pas provoquer de fausses réassociations.
-    long_absence_seconds: 2.0
-    long_absence_similarity_floor: null
-  # Extracteur d'apparence profond (MobileNetV3 / OSNet). Expérience d'ablation
-  # uniquement : si false, le descripteur léger HSV est utilisé.
-  external_reid:
-    enabled: false
-    model_path: osnet_x0_25_msmt17.pt
-    weights: osnet_x0_25
-    image_size: [256, 128]
+    # Niveau 1 : ReID natif BoT-SORT (réassociation intra-buffer), activé par
+    # `with_reid: true` dans la configuration du tracker. Aucune logique
+    # supplémentaire n'est nécessaire (spec 3.2).
+    short_term: native_botsort
+    # Niveau 2 : galerie de personnes pour la réassociation après expiration de
+    # la piste technique (spec 3.3). Désactivable pour la baseline 1 (spec 9.4).
+    long_term:
+        enabled: true
+        similarity_threshold: 0.40 # PROVISOIRE — à calibrer
+        safety_margin: 0.10 # PROVISOIRE — écart minimal au second candidat
+        v_max_ratio: 1.5 # hauteurs de bbox / seconde
+        spatial_margin_ratio: 0.3 # tolérance additionnelle (fraction de hauteur)
+        ambiguous_policy: provisional_person # provisional_person | defer
+        # Qualité exigée pour qu'une apparence soit écrite dans la galerie. Une
+        # détection faible, un crop minuscule, une boîte tronquée ou une image floue
+        # produisent un descripteur qui ne doit JAMAIS remplacer une apparence
+        # connue : le rejet est journalisé (REID_DESCRIPTOR_REJECTED).
+        # Abaissé de 0.70 à 0.50 : une personne partiellement occultée produit une
+        # détection plus faible mais son apparence reste exploitable. À 0.70, elle
+        # n'entrait jamais en galerie, ce qui empêchait toute réassociation après
+        # une longue occultation (symptôme 2).
+        gallery_min_confidence: 0.50
+        gallery_min_crop_height_px: 32
+        gallery_min_crop_width_px: 16
+        gallery_min_sharpness: 0.0 # variance du Laplacien ; 0 = contrôle désactivé
+        # Rétention de la galerie d'apparence APRÈS purge de l'identité.
+        # Explicitement fixée à 10 s : combinée à timing.grace_period_seconds (6 s),
+        # la fenêtre totale de mémoire vaut 16 s, soit l'occlusion max mesurée
+        # (13,5 s) plus une marge. null reviendrait à l'aligner sur
+        # timing.grace_period_seconds (fenêtre totale = 2 × grâce = 12 s, insuffisant
+        # pour la plus longue occultation observée).
+        gallery_retention_seconds: 10.0
+        # Tolérance progressive du seuil d'apparence selon la durée d'absence (une
+        # longue occultation change un peu l'apparence : angle, luminosité).
+        # Assouplissement ACTIVÉ : le seuil descend linéairement de
+        # similarity_threshold (0.40) vers 0.30 au bout de long_absence_seconds, et
+        # jamais sous ce plancher (null désactiverait l'assouplissement).
+        # long_absence_seconds porté de 2,0 à 6,0 s : la décroissance couvre
+        # désormais les occlusions longues mesurées (p90 5,1 s) avant d'atteindre le
+        # plancher, au lieu de saturer dès 2 s.
+        long_absence_seconds: 6.0
+        long_absence_similarity_floor: 0.30
+        # -- Chemin de secours « galerie » (personne assise/immobile) --------
+        # Une réapparition dont le score tombe dans
+        # [tracker.track_low_thresh, tracker.new_track_thresh[ ne reçoit AUCUN
+        # identifiant technique : BoT-SORT l'écarte avant qu'IdentityManager ne
+        # la voie, et la personne reste indéfiniment dans la borne haute de
+        # l'occupation (occupancy_uncertain). Ce chemin présente ces détections
+        # non trackées à la galerie, avec le filtre spatio-temporel et le seuil
+        # d'apparence NORMAUX (similarity_threshold + safety_margin, inchangés),
+        # et ne réattribue une identité que si un candidat UNIQUE les dépasse.
+        # Jamais de création d'identité : une observation non retenue est ignorée.
+        # DÉSACTIVÉ par défaut : l'activation est une décision mesurée (tableau
+        # avant/après « avec / sans gallery_rescue » sur les vidéos de test),
+        # jamais un défaut silencieux.
+        gallery_rescue_enabled: false
+        # Confiance minimale de l'observation non trackée. null = repli sur
+        # tracker.track_low_thresh (0.1) : en dessous, la détection n'a même pas
+        # nourri le second étage de BoT-SORT, elle n'est pas plus exploitable par
+        # la galerie. PROVISOIRE — à calibrer avec gallery_rescue_enabled.
+        gallery_rescue_min_confidence: null
+    # Extracteur d'apparence profond (MobileNetV3 / OSNet) ACTIVÉ : améliore la
+    # robustesse du descripteur lors des longues occultations. Il retombe
+    # proprement sur le descripteur HSV si torch/torchvision sont indisponibles ou
+    # si les poids ne sont pas déjà en cache local (aucun téléchargement réseau
+    # implicite au milieu du pipeline). `false` = descripteur HSV seul.
+    external_reid:
+        enabled: true
+        model_path: osnet_x0_25_msmt17.pt
+        weights: osnet_x0_25
+        image_size: [256, 128]
 
-  # -- Garde-fou « inversement d'identifiant » (swap) ----------------------
-  # Un swap n'est PAS une perte de piste : deux identifiants BoT-SORT restent
-  # actifs en continu mais échangent la personne qu'ils suivent. Il se produit à
-  # l'intérieur du matching du tracker, donc ni TECHNICAL_ID_CHANGED ni
-  # TRACK_ID_ABSENT ne le signalent. Ce garde-fou le mesure : sur une piste qui
-  # n'a jamais été perdue, une chute brutale de similarité d'apparence d'une
-  # frame à l'autre est journalisée en TRACK_ID_APPEARANCE_DISCONTINUITY.
-  # Aucune correction automatique : réaffecter les identités sur un faux positif
-  # serait pire que le swap lui-même.
-  appearance_continuity:
-    enabled: true
-    # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4) : trop élevé
-    # multiplie les diagnostics (faux positifs), trop bas ne voit que les
-    # échanges francs.
-    similarity_threshold: 0.50
-    # Écart maximal (frames traitées) pour qu'une piste reste « continue ».
-    # Au-delà, la piste a réellement été perdue : c'est le chemin de
-    # réassociation normal, pas un swap.
-    max_gap_frames: 2
-    # Limitation de débit par piste : une discontinuité n'est écrite qu'une fois
-    # tant que la continuité n'est pas rétablie, et au plus une fois par
-    # intervalle.
-    min_interval_seconds: 1.0
+    # -- Garde-fou « inversement d'identifiant » (swap) ----------------------
+    # Un swap n'est PAS une perte de piste : deux identifiants BoT-SORT restent
+    # actifs en continu mais échangent la personne qu'ils suivent. Il se produit à
+    # l'intérieur du matching du tracker, donc ni TECHNICAL_ID_CHANGED ni
+    # TRACK_ID_ABSENT ne le signalent. Ce garde-fou le mesure : sur une piste qui
+    # n'a jamais été perdue, une chute brutale de similarité d'apparence d'une
+    # frame à l'autre est journalisée en TRACK_ID_APPEARANCE_DISCONTINUITY.
+    # Aucune correction automatique : réaffecter les identités sur un faux positif
+    # serait pire que le swap lui-même.
+    appearance_continuity:
+        enabled: true
+        # PROVISOIRE — à calibrer sur l'ensemble de calibration (9.4) : trop élevé
+        # multiplie les diagnostics (faux positifs), trop bas ne voit que les
+        # échanges francs.
+        # Calibré sur le p1 des similarités consécutives d'une piste continue
+        # (IdentityManager.continuity_similarity_summary) mesuré AVEC
+        # external_reid activé (OSNet) — results/step7_deep_reid.jsonl :
+        #   fort_occ4  p1=0,901  min=0,851  n=495
+        #   video1     p1=0,869  min=0,808  n=480
+        #   médiane ≈ 0,969, 0 échantillon sous le seuil.
+        # Avec le descripteur HSV seul, le p1 tombait à ≈ 0,63-0,91 et le min à
+        # ≈ 0,28-0,72. Fixé à 0.55 : sous toute la distribution mesurée (aucun
+        # faux diagnostic sur une piste continue), il ne signale que les ruptures
+        # franches d'apparence.
+        similarity_threshold: 0.55
+        # Écart maximal (frames traitées) pour qu'une piste reste « continue ».
+        # Au-delà, la piste a réellement été perdue : c'est le chemin de
+        # réassociation normal, pas un swap.
+        max_gap_frames: 2
+        # Limitation de débit par piste : une discontinuité n'est écrite qu'une fois
+        # tant que la continuité n'est pas rétablie, et au plus une fois par
+        # intervalle.
+        min_interval_seconds: 1.0
 
-  # -- Correction active des inversions d'identité (swap) ------------------
-  # Réintroduit le comportement [RE-ID-LOCK] de l'ancien IDManager : compare
-  # l'apparence directe vs croisée entre paires de pistes connues et corrige
-  # le mapping si le croisement dépasse la marge.
-  swap_correction:
-    enabled: true              # PROVISOIRE — comparer avec/sans sur les vidéos de test
-    margin: 0.12               # même valeur que l'ancien [RE-ID-LOCK], à recalibrer
+    # -- Correction active des inversions d'identité (swap) ------------------
+    # Réintroduit le comportement [RE-ID-LOCK] de l'ancien IDManager : compare
+    # l'apparence directe vs croisée entre paires de pistes connues et corrige
+    # le mapping si le croisement dépasse la marge.
+    swap_correction:
+        enabled: true # PROVISOIRE — comparer avec/sans sur les vidéos de test
+        # Passage au ReID profond (OSNet) : apparences nettement plus
+        # discriminantes (marges direct/croisé observées sur les swaps francs de
+        # results/f5_swaps.jsonl), ce qui permet de resserrer la marge de 0.12 à
+        # 0.08 sans multiplier les fausses corrections.
+        margin: 0.08 # resserré (0.12 -> 0.08) pour ne corriger que les swaps francs
+        # Distance (fraction de la hauteur de bbox) sous laquelle deux pistes
+        # présentes sur la même frame forment un MÊME groupe résolu globalement.
+        # Le chevauchement de boîtes suffit à réunir deux pistes ; ce seuil
+        # couvre en plus les boîtes très proches mais disjointes (embrasure de
+        # porte). Au-delà de deux pistes d'un groupe, la résolution devient
+        # globale (matrice N×N + affectation optimale) : une permutation
+        # circulaire à trois (A->B, B->C, C->A) n'est pas décomposable en
+        # décisions par paires indépendantes.
+        group_proximity_ratio: 0.5
 
 # Ligne virtuelle : les deux points ne sont PAS configurables. Ils sont
 # obligatoirement définis par l'opérateur au démarrage (première image affichée,
@@ -148,103 +218,111 @@ reid:
 # annuler, « I » pour inverser intérieur/extérieur). Aucune ligne par défaut
 # n'est utilisée : sans validation explicite, le comptage ne démarre pas.
 line:
-  inside_side: negative     # orientation INITIALE proposée dans la fenêtre (positive|negative)
-  on_line_policy: indeterminate  # jamais « inside » par défaut
-  min_length_ratio: 0.05    # rejet d'une ligne dégénérée ou trop courte (5.7)
+    inside_side: negative # orientation INITIALE proposée dans la fenêtre (positive|negative)
+    on_line_policy: indeterminate # jamais « inside » par défaut
+    min_length_ratio: 0.05 # rejet d'une ligne dégénérée ou trop courte (5.7)
 
 geometry:
-  # Toutes les marges sont RELATIVES à l'échelle locale (hauteur médiane des
-  # bbox observées) : jamais de pixels absolus (règle 0.3).
-  dead_zone_ratio: 0.15         # PROVISOIRE — fraction de la hauteur médiane
-  anchor_edge_margin_ratio: 0.02 # PROVISOIRE — marge de rejet au bord image
-  scale_window: 61              # nombre de hauteurs de bbox de l'échelle locale
-  # Rayon (fraction de la hauteur médiane) dans lequel une apparition intérieure
-  # peut être confondue avec une personne déjà comptée dont l'observation est
-  # perdue : NEW est alors différé, jamais confirmé.
-  occlusion_ambiguity_ratio: 0.5
-  # Filtre géométrique : élimine les faux positifs tout en acceptant les personnes assises
-  min_aspect_ratio_wh: 0.1       # ratio W/H minimum (rejet des artefacts verticaux)
-  max_aspect_ratio_wh: 2.5       # ratio W/H maximum plausible (personne assise tolérée)
-  min_box_height_px: 10.0        # hauteur minimale de bounding box
-  min_box_width_px: 10.0         # largeur minimale de bounding box
-  multi_person_box:
-    enabled: true
-    max_growth_ratio: 1.6      # PROVISOIRE — à calibrer sur des cas confirmés de fusion
+    # Toutes les marges sont RELATIVES à l'échelle locale (hauteur médiane des
+    # bbox observées) : jamais de pixels absolus (règle 0.3).
+    dead_zone_ratio: 0.15 # PROVISOIRE — fraction de la hauteur médiane
+    anchor_edge_margin_ratio: 0.02 # PROVISOIRE — marge de rejet au bord image
+    scale_window: 61 # nombre de hauteurs de bbox de l'échelle locale
+    # Rayon (fraction de la hauteur médiane) dans lequel une apparition intérieure
+    # peut être confondue avec une personne déjà comptée dont l'observation est
+    # perdue : NEW est alors différé, jamais confirmé.
+    occlusion_ambiguity_ratio: 0.5
+    # Filtre géométrique : élimine les faux positifs tout en acceptant les personnes assises
+    min_aspect_ratio_wh: 0.1 # ratio W/H minimum (rejet des artefacts verticaux)
+    max_aspect_ratio_wh: 2.5 # ratio W/H maximum plausible (personne assise tolérée)
+    min_box_height_px: 10.0 # hauteur minimale de bounding box
+    min_box_width_px: 10.0 # largeur minimale de bounding box
+    multi_person_box:
+        enabled: true
+        max_growth_ratio: 1.6 # PROVISOIRE — à calibrer sur des cas confirmés de fusion
 
 anchor:
-  height_history_window_frames: 30      # fenêtre pour estimer la hauteur "normale" de la piste
-  max_height_drop_ratio: 0.35           # chute relative de hauteur considérée comme anormale
-  height_drop_confirm_frames: 3         # nombre de frames pour confirmer une chute réelle vs bruit
-
+    height_history_window_frames: 30 # fenêtre pour estimer la hauteur "normale" de la piste
+    max_height_drop_ratio: 0.35 # chute relative de hauteur considérée comme anormale
+    height_drop_confirm_frames: 3 # nombre de frames pour confirmer une chute réelle vs bruit
 
 timing:
-  # Toutes les durées sont en SECONDES ; elles sont converties en frames au
-  # runtime avec le FPS réellement mesuré (règle 0.2).
-  fps_source: measured          # jamais une valeur supposée
-  # Warm-up : terminé quand warmup_min_frames frames ONT été observées ET que
-  # warmup_seconds se sont écoulées. Exiger les deux bornes évite une fin
-  # prématurée à faible FPS (temps écoulé mais 3 frames vues) comme à haut FPS
-  # (15 frames vues en 0,15 s).
-  warmup_seconds: 0.5
-  warmup_min_frames: 15
-  confirmation_seconds: 0.5
-  grace_period_seconds: 5.0
-  fps_estimate_window: 30       # frames pour la moyenne glissante du FPS
+    # Toutes les durées sont en SECONDES ; elles sont converties en frames au
+    # runtime avec le FPS réellement mesuré (règle 0.2).
+    fps_source: measured # jamais une valeur supposée
+    # Warm-up : terminé quand warmup_min_frames frames ONT été observées ET que
+    # warmup_seconds se sont écoulées. Exiger les deux bornes évite une fin
+    # prématurée à faible FPS (temps écoulé mais 3 frames vues) comme à haut FPS
+    # (15 frames vues en 0,15 s).
+    warmup_seconds: 0.5
+    warmup_min_frames: 15
+    confirmation_seconds: 0.5
+    # Portée de 5,0 à 6,0 s : couvre la plupart des occultations mesurées avant
+    # expiration de la piste logique. Combinée à
+    # reid.long_term.gallery_retention_seconds (10 s), la fenêtre totale de mémoire
+    # vaut 16 s, soit l'occlusion max mesurée (13,5 s) plus une marge.
+    grace_period_seconds: 6.0
+    fps_estimate_window: 30 # frames pour la moyenne glissante du FPS
 
 occupancy:
-  in_progress_disappearance_policy: deferred_confirmation
-  snapshot_interval_seconds: 1.0
-  in_progress_policy: [deferred_confirmation, ambiguous_on_expiry]
+    in_progress_disappearance_policy: deferred_confirmation
+    snapshot_interval_seconds: 1.0
+    in_progress_policy: [deferred_confirmation, ambiguous_on_expiry]
 
 output:
-  session_root: results         # jamais le répertoire courant (6.4)
-  events_filename: events.jsonl
-  video_filename: annotated.mp4
-  write_mode: append_incremental
-  flush_every_n_events: 1
-  write_video: false
-  annotated_video_codec: mp4v
+    session_root: results # jamais le répertoire courant (6.4)
+    events_filename: events.jsonl
+    video_filename: annotated.mp4
+    write_mode: append_incremental
+    flush_every_n_events: 1
+    write_video: false
+    annotated_video_codec: mp4v
 
 stabilization:
-  # Verrouillage de hauteur des bounding boxes : ACTIF dans le pipeline officiel.
-  # Sans lui, une chute brutale de hauteur (jambes masquées, personne assise,
-  # flou) fait remonter le bas de boîte, donc l'ancre pieds : le calcul de zone
-  # dans geometry.py voit une fausse transition. Le profil de hauteur est indexé
-  # par person_id (stable), jamais par l'identifiant technique de BoT-SORT, et il
-  # survit donc à une occultation / un changement d'identifiant technique.
-  # La boîte brute et la raison de la correction restent journalisées (spec 7) et
-  # la chute anormale est signalée en ANCHOR_UNRELIABLE (prioritaire sur tout
-  # changement de zone dans la FSM).
-  use_bbox_locker: true
-  bbox_locker_min_height_ratio: 0.70   # PROVISOIRE — à calibrer sur l'ensemble de calibration
-  use_anchor_stabilizer: false
-  anchor_stabilizer_tolerance_ratio: 0.15  # fraction de la hauteur médiane
+    # Verrouillage de hauteur des bounding boxes : ACTIF dans le pipeline officiel.
+    # Sans lui, une chute brutale de hauteur (jambes masquées, personne assise,
+    # flou) fait remonter le bas de boîte, donc l'ancre pieds : le calcul de zone
+    # dans geometry.py voit une fausse transition. Le profil de hauteur est indexé
+    # par person_id (stable), jamais par l'identifiant technique de BoT-SORT, et il
+    # survit donc à une occultation / un changement d'identifiant technique.
+    # La boîte brute et la raison de la correction restent journalisées (spec 7) et
+    # la chute anormale est signalée en ANCHOR_UNRELIABLE (prioritaire sur tout
+    # changement de zone dans la FSM).
+    use_bbox_locker: true
+    bbox_locker_min_height_ratio: 0.70 # PROVISOIRE — à calibrer sur l'ensemble de calibration
+    use_anchor_stabilizer: false
+    anchor_stabilizer_tolerance_ratio: 0.15 # fraction de la hauteur médiane
 
 display:
-  enabled: true                 # false = mode headless réel
-  window_name: People counting
+    enabled: true # false = mode headless réel
+    window_name: People counting
 
 logging:
-  level: INFO
-  print_state_transitions: false
+    level: INFO
+    print_state_transitions: false
 
 diagnostics:
-  # Diagnostics de détection / d'association (perte de piste, identifiant
-  # technique absent, détections faibles). Journalisés dans events.jsonl, avec
-  # limitation de débit pour ne pas noyer les événements métier : le front
-  # montant est toujours écrit, puis au plus un événement par intervalle.
-  enabled: true
-  min_interval_seconds: 1.0
+    # Diagnostics de détection / d'association (perte de piste, identifiant
+    # technique absent, détections faibles). Journalisés dans events.jsonl, avec
+    # limitation de débit pour ne pas noyer les événements métier : le front
+    # montant est toujours écrit, puis au plus un événement par intervalle.
+    enabled: true
+    min_interval_seconds: 1.0
 
 # -- Assistance par détection de tête (additif, désactivé par défaut) ------
 # Utilise yolo11s-pose.pt (17 points-clés COCO) pour maintenir la présence
 # d'une personne dont les pieds sont occultés (tables, chaises). Le point
 # tête ne participe JAMAIS au calcul de franchissement de ligne.
 presence:
-  head_assist:
-    enabled: false                       # additif, désactivé par défaut
-    pose_model_path: models/yolo11s-pose.pt
-    pose_model_expected_sha256: null      # à renseigner une fois le poids téléchargé
-    min_keypoint_confidence: 0.5          # PROVISOIRE — à calibrer
-    keypoints_used: [nose, left_eye, right_eye]
-    max_presence_extension_seconds: 10.0  # PROVISOIRE — borne de sécurité
+    head_assist:
+        # ACTIVÉ (B1) : maintient la présence d'une personne dont les pieds sont
+        # occultés. Si models/yolo11s-pose.pt est absent, main.py journalise un
+        # CONFIG_WARNING (head_assist_model_missing) et retombe proprement sur le
+        # modèle de détection standard : le flag peut rester à true, l'exécution
+        # ne prétend jamais l'inverse dans la config résolue de session.
+        enabled: true
+        pose_model_path: models/yolo11s-pose.pt
+        pose_model_expected_sha256: null # à renseigner une fois le poids téléchargé
+        min_keypoint_confidence: 0.5 # PROVISOIRE — à calibrer
+        keypoints_used: [nose, left_eye, right_eye]
+        max_presence_extension_seconds: 10.0 # PROVISOIRE — borne de sécurité

@@ -37,8 +37,13 @@ def base_event(event_type: str = "IN", **fields) -> dict:
 
 def minimal_event(event_type: str) -> dict:
     """Construit un événement minimal valide pour un type donné."""
-    required = {name: 1 for name in EVENT_SCHEMA[event_type].required}
-    if EVENT_SCHEMA[event_type].crossing:
+    spec = EVENT_SCHEMA[event_type]
+    required = {name: 1 for name in spec.required}
+    # Un type à variantes (ex. ``IDENTITY_SWAP_CORRECTED`` paire / groupe) est
+    # minimalement valide avec la **première** variante complétée.
+    if spec.any_of:
+        required.update({name: 1 for name in spec.any_of[0]})
+    if spec.crossing:
         required["direction"] = "in"
     # Les champs de comptage doivent rester numériques et bornés.
     if "occupancy_range" in required:
@@ -116,6 +121,54 @@ def test_type_specific_required_fields(event_type, missing):
     del event[missing]
     with pytest.raises(SchemaError):
         validate_event(event)
+
+
+def test_identity_swap_corrected_accepts_both_variants():
+    """Forme « paire » et forme « groupe » (3+ pistes) sont toutes deux valides."""
+    pair = base_event(
+        "IDENTITY_SWAP_CORRECTED",
+        technical_track_id_a=1,
+        technical_track_id_b=2,
+        person_id_a_before=1,
+        person_id_a_after=2,
+        person_id_b_before=2,
+        person_id_b_after=1,
+        similarity_direct=0.5,
+        similarity_crossed=0.9,
+        margin_applied=0.08,
+        group_size=2,
+        reason="cross_appearance_correction",
+    )
+    validate_event(pair)
+
+    group = base_event(
+        "IDENTITY_SWAP_CORRECTED",
+        technical_track_id=8,
+        person_id_before=2,
+        person_id_after=3,
+        group_size=3,
+        group_person_ids=[2, 3, 1],
+        similarity_direct=0.0,
+        similarity_crossed=3.0,
+        margin_applied=0.08,
+        reason="group_appearance_correction",
+    )
+    validate_event(group)
+
+
+def test_identity_swap_corrected_rejects_an_incomplete_variant():
+    """Ni paire complète ni groupe complet : l'événement est refusé."""
+    incomplete = base_event(
+        "IDENTITY_SWAP_CORRECTED",
+        technical_track_id_a=1,  # paire incomplète (pas de b)
+        similarity_direct=0.5,
+        similarity_crossed=0.9,
+        margin_applied=0.08,
+        reason="cross_appearance_correction",
+    )
+    with pytest.raises(SchemaError) as error:
+        validate_event(incomplete)
+    assert "aucun jeu de champs requis n'est complet" in str(error.value)
 
 
 def test_non_finite_float_is_rejected():

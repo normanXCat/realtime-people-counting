@@ -228,6 +228,80 @@ def test_swap_correction_desactivee_ne_corrige_rien(sink):
     assert sink.count("IDENTITY_SWAP_CORRECTED") == 0
 
 
+def _merge_manager(sink):
+    """Gestionnaire à seuil strict : plancher d'assouplissement très bas."""
+    return IdentityManager(
+        long_term=LongTermReidConfig(
+            enabled=True,
+            similarity_threshold=0.8,
+            safety_margin=0.0,
+            long_absence_seconds=0.1,
+            long_absence_similarity_floor=0.3,
+            v_max_ratio=1e6,
+            spatial_margin_ratio=1e6,
+        ),
+        grace_period_seconds=5.0,
+        event_sink=sink,
+    )
+
+
+def test_reappariement_apres_fusion_exige_une_similarite_stricte(sink):
+    """Une boîte multi-personnes fige l'empreinte ; après séparation, un ID
+    ancien n'est réattribué que si la similarité dépasse le seuil nominal (aucun
+    assouplissement progressif autorisé pendant l'épisode de fusion).
+    """
+    manager = _merge_manager(sink)
+    original = unit(1, 0, 0)
+    changed = unit(0.7, 0.713, 0)  # similarité ≈ 0,7 avec l'original
+
+    # Frame 1 : identité 1 établie.
+    manager.assign([observation(7, feature=original)], FRAME, 0.0, 1)
+    assert manager.person_of(7) == 1
+    record = manager.records[1]
+
+    # Frame 2 : la boîte fusionne (deux personnes dans une boîte).
+    multi = observation(7, feature=original)
+    multi.possible_multi_person = True
+    manager.assign([multi], FRAME, 0.1, 2)
+    manager.note_multi_person_box(1, 0.1)
+
+    assert record.merge_fingerprint is not None
+    np.testing.assert_array_almost_equal(record.merge_fingerprint, original)
+    assert record.merge_flagged_at_s == pytest.approx(0.1)
+
+    # Frame 3 : séparation -> nouvelle piste technique. L'apparence a dérivé
+    # jusqu'à ≈ 0,7 (au-dessus du plancher 0,3, sous le seuil nominal 0,8).
+    sink.events.clear()
+    second = manager.assign([observation(9, feature=changed)], FRAME, 1.0, 3)[0]
+    assert second.person_id == 2, "pas de réattribution de l'ID 1 sans similarité stricte"
+    assert second.reason == "below_strict_similarity_threshold"
+
+    # Frame 4 : une apparence quasi identique est bien réappariée à l'ID 1.
+    close = unit(1, 0.05, 0)
+    real = manager.assign([observation(11, feature=close)], FRAME, 1.1, 4)[0]
+    assert real.person_id == 1
+    assert real.reason == "reid_match"
+    match_event = sink.of_type("REID_MATCH")[-1]
+    assert match_event["strict_reappearance"] is True
+    assert match_event["reference"] == "merge_fingerprint"
+    assert record.strict_rematches == 1
+    # L'épisode de fusion est clos : l'empreinte est libérée.
+    assert record.merge_fingerprint is None
+
+
+def test_sans_fusion_l_assouplissement_progressif_reste_actif(sink):
+    """Contre-épreuve : hors fusion, la même apparence dérivée est réacceptée."""
+    manager = _merge_manager(sink)
+    original = unit(1, 0, 0)
+    changed = unit(0.7, 0.713, 0)
+
+    manager.assign([observation(7, feature=original)], FRAME, 0.0, 1)
+    # Aucune fusion : pas de note_multi_person_box.
+    assignment = manager.assign([observation(9, feature=changed)], FRAME, 1.0, 2)[0]
+    assert assignment.person_id == 1
+    assert assignment.reason == "reid_match"
+
+
 def test_trois_pistes_avec_un_seul_swap_corrige_uniquement_la_paire(sink):
     """3 pistes simultanées, seules 7 et 8 s'inversent, 9 reste intacte."""
     manager = build_manager(sink, swap_margin=0.12)
@@ -270,8 +344,182 @@ def test_trois_pistes_avec_un_seul_swap_corrige_uniquement_la_paire(sink):
     assert assignments[1].person_id == 1
     assert assignments[2].person_id == 3
 
-    assert manager.swap_corrections_applied == 1
+    # Groupe de 3 résolu globalement : la transposition 7↔8 ne déplace que deux
+    # pistes, mais l'événement est émis **par piste corrigée** (avec
+    # ``group_size``), conformément à la résolution de groupe. La 3e piste, qui
+    # garde son identité, ne produit aucun événement.
+    assert manager.swap_corrections_applied == 2
     events = sink.of_type("IDENTITY_SWAP_CORRECTED")
-    assert len(events) == 1
-    assert events[0]["technical_track_id_a"] == 7
-    assert events[0]["technical_track_id_b"] == 8
+    assert len(events) == 2
+    assert all(event["group_size"] == 3 for event in events)
+    assert {event["technical_track_id"] for event in events} == {7, 8}
+    by_track = {event["technical_track_id"]: event for event in events}
+    assert by_track[7]["person_id_before"] == 1
+    assert by_track[7]["person_id_after"] == 2
+    assert by_track[8]["person_id_before"] == 2
+    assert by_track[8]["person_id_after"] == 1
+    assert all(event["reason"] == "group_appearance_correction" for event in events)
+    assert all(event["group_person_ids"] == [2, 1, 3] for event in events)
+
+
+def test_permutation_circulaire_a_trois_pistes_est_corrigee_en_une_fois(sink):
+    """Permutation circulaire ``A→B``, ``B→C``, ``C→A`` : corrigée intégralement.
+
+    L'implémentation par paires ne résout pas ce cas : elle corrige la paire
+    (7, 8) puis exclut la piste 8 de toute décision, laissant 8 et 9 mappées à la
+    mauvaise personne (1 piste sur 3 correcte, mapping partiellement erroné).
+    La résolution globale N×N doit retrouver la permutation complète.
+    """
+    manager = build_manager(sink, swap_margin=0.08)
+    desc_a = unit(1, 0, 0)
+    desc_b = unit(0, 1, 0)
+    desc_c = unit(0, 0, 1)
+
+    manager.assign(
+        [
+            observation(7, feature=desc_a),
+            observation(8, feature=desc_b),
+            observation(9, feature=desc_c),
+        ],
+        FRAME,
+        0.0,
+        1,
+    )
+    assert (manager.person_of(7), manager.person_of(8), manager.person_of(9)) == (1, 2, 3)
+    sink.events.clear()
+
+    # Permutation circulaire : chaque piste porte l'apparence de la suivante.
+    assignments = manager.assign(
+        [
+            observation(7, feature=desc_b),
+            observation(8, feature=desc_c),
+            observation(9, feature=desc_a),
+        ],
+        FRAME,
+        0.1,
+        2,
+    )
+
+    assert manager.person_of(7) == 2
+    assert manager.person_of(8) == 3
+    assert manager.person_of(9) == 1
+    assert [assignment.person_id for assignment in assignments] == [2, 3, 1]
+    assert manager.swap_corrections_applied == 3
+
+    events = sink.of_type("IDENTITY_SWAP_CORRECTED")
+    assert len(events) == 3
+    assert all(event["group_size"] == 3 for event in events)
+    assert {event["technical_track_id"] for event in events} == {7, 8, 9}
+    assert all(event["group_person_ids"] == [2, 3, 1] for event in events)
+    # Le gain total (3 - 0 = 3) dépasse largement la marge.
+    for event in events:
+        assert event["similarity_crossed"] > event["similarity_direct"] + event["margin_applied"]
+
+
+@pytest.mark.parametrize(
+    "margin,expected_corrections",
+    [
+        (0.01, 2),  # gain 0,02 > marge : le groupe est corrigé
+        (0.50, 0),  # gain 0,02 < marge : le bruit ne réécrit pas le mapping
+    ],
+)
+def test_groupe_a_trois_pistes_le_gain_doit_depasser_la_marge(
+    sink, margin, expected_corrections
+):
+    """Même permutation, seule la marge change : c'est bien elle qui tranche.
+
+    Deux apparences très proches s'échangent (gain total ≈ 0,02), la troisième
+    reste intacte. Sous la marge, la correction est refusée : un écart de bruit ne
+    doit pas réécrire le mapping.
+    """
+    manager = build_manager(sink, swap_margin=margin)
+    desc_a = unit(1, 0, 0)
+    desc_b = unit(0.99, 0.1414, 0.0)
+    desc_c = unit(0, 0, 1)
+
+    manager.assign(
+        [
+            observation(7, feature=desc_a),
+            observation(8, feature=desc_b),
+            observation(9, feature=desc_c),
+        ],
+        FRAME,
+        0.0,
+        1,
+    )
+    sink.events.clear()
+
+    manager.assign(
+        [
+            observation(7, feature=desc_b),
+            observation(8, feature=desc_a),
+            observation(9, feature=desc_c),
+        ],
+        FRAME,
+        0.1,
+        2,
+    )
+
+    assert manager.swap_corrections_applied == expected_corrections
+    assert sink.count("IDENTITY_SWAP_CORRECTED") == expected_corrections
+    if expected_corrections:
+        assert manager.person_of(7) == 2
+        assert manager.person_of(8) == 1
+        assert manager.person_of(9) == 3
+        gains = sink.of_type("IDENTITY_SWAP_CORRECTED")
+        assert all(event["group_size"] == 3 for event in gains)
+        assert all(
+            event["similarity_crossed"] > event["similarity_direct"] + event["margin_applied"]
+            for event in gains
+        )
+    else:
+        assert manager.person_of(7) == 1
+        assert manager.person_of(8) == 2
+        assert manager.person_of(9) == 3
+
+
+def test_groupe_de_trois_pistes_eloignees_n_est_pas_resolu_ensemble(sink):
+    """Contre-épreuve de proximité : trois pistes disjointes restent indépendantes.
+
+    Les trois permutations sont inverses, mais les pistes sont à plus d'une
+    hauteur de bbox l'une de l'autre : elles ne forment pas un groupe, donc le
+    `group_proximity_ratio` les exclut l'une de l'autre et seule la paire
+    chevauchante peut être corrigée.
+    """
+    manager = build_manager(sink, swap_margin=0.08)
+    desc_a = unit(1, 0, 0)
+    desc_b = unit(0, 1, 0)
+    desc_c = unit(0, 0, 1)
+    boxes = {
+        7: [0.0, 100.0, 40.0, 300.0],
+        8: [500.0, 100.0, 540.0, 300.0],
+        9: [1000.0, 100.0, 1040.0, 300.0],
+    }
+
+    manager.assign(
+        [
+            observation(7, anchor=(20.0, 300.0), feature=desc_a, box=boxes[7]),
+            observation(8, anchor=(520.0, 300.0), feature=desc_b, box=boxes[8]),
+            observation(9, anchor=(1020.0, 300.0), feature=desc_c, box=boxes[9]),
+        ],
+        FRAME,
+        0.0,
+        1,
+    )
+    sink.events.clear()
+    manager.assign(
+        [
+            observation(7, anchor=(20.0, 300.0), feature=desc_b, box=boxes[7]),
+            observation(8, anchor=(520.0, 300.0), feature=desc_c, box=boxes[8]),
+            observation(9, anchor=(1020.0, 300.0), feature=desc_a, box=boxes[9]),
+        ],
+        FRAME,
+        0.1,
+        2,
+    )
+    # Aucun groupe de plus de deux pistes : aucune résolution globale appliquée.
+    assert manager.swap_corrections_applied == 0
+    assert manager.person_of(7) == 1
+    assert manager.person_of(8) == 2
+    assert manager.person_of(9) == 3
+    assert sink.count("IDENTITY_SWAP_CORRECTED") == 0

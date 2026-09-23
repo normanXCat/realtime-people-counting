@@ -39,11 +39,28 @@ def test_default_config_loads_and_is_valid():
     assert config.stabilization.use_bbox_locker is True
     assert config.stabilization.use_anchor_stabilizer is False
     assert config.reid.long_term.enabled is True
-    assert config.reid.external_reid.enabled is False
-    # Garde-fou de swap : actif, mais purement diagnostique.
+    # L'extracteur ReID profond est ACTIVÉ dans la configuration de référence
+    # (avec repli HSV propre si la dépendance/poids sont absents).
+    assert config.reid.external_reid.enabled is True
+    # Garde-fou de swap : actif, seuil calibré sur le p1 mesuré (0.55).
     assert config.reid.appearance_continuity.enabled is True
-    assert config.reid.appearance_continuity.similarity_threshold == pytest.approx(0.5)
+    assert config.reid.appearance_continuity.similarity_threshold == pytest.approx(0.55)
     assert config.reid.appearance_continuity.max_gap_frames == 2
+    # Calibrations anti-swap (ReID profond).
+    assert config.reid.swap_correction.margin == pytest.approx(0.08)
+    # Durcissement du ReID natif (A2) : apparence plus proche exigée avant
+    # réassociation — doublé dans custom_botsort.yaml (test de synchronisation).
+    assert config.tracker.appearance_thresh == pytest.approx(0.35)
+    # Résolution globale par groupe (A1) : proximité exprimée en hauteur de bbox.
+    assert config.reid.swap_correction.group_proximity_ratio == pytest.approx(0.5)
+    # Chemin de secours « galerie » (B3) : désactivé par défaut, plancher de
+    # confiance replié sur ``track_low_thresh`` quand il n'est pas déclaré.
+    assert config.reid.long_term.gallery_rescue_enabled is False
+    assert config.reid.long_term.gallery_rescue_min_confidence == pytest.approx(
+        config.tracker.track_low_thresh
+    )
+    assert config.model.nms_iou == pytest.approx(0.40)
+    assert config.timing.grace_period_seconds == pytest.approx(6.0)
 
 
 def test_frame_budget_uses_measured_fps():
@@ -82,7 +99,8 @@ def test_yolo_threshold_is_low_enough_for_the_tracker_low_stage():
     assert config.tracker.track_high_thresh == pytest.approx(0.4)
     assert config.tracker.new_track_thresh == pytest.approx(0.7)
     assert config.model.confidence <= config.tracker.track_low_thresh
-    assert coherence_warnings(config) == []
+    codes = [code for code, _message in coherence_warnings(config)]
+    assert "yolo_confidence_above_tracker_low_thresh" not in codes
 
 
 def test_high_yolo_threshold_is_warned_about_not_silently_accepted():
@@ -91,11 +109,15 @@ def test_high_yolo_threshold_is_warned_about_not_silently_accepted():
 
     raised = override_config(load_config(), {"model": {"confidence": 0.42}})
     warnings = coherence_warnings(raised)
-    assert [code for code, _message in warnings] == [
-        "yolo_confidence_above_tracker_low_thresh"
-    ]
-    assert "track_low_thresh" in warnings[0][1]
-    assert "blou" in warnings[0][1] or "flou" in warnings[0][1]
+    codes = [code for code, _message in warnings]
+    assert "yolo_confidence_above_tracker_low_thresh" in codes
+    yolo_warning = next(
+        message
+        for code, message in warnings
+        if code == "yolo_confidence_above_tracker_low_thresh"
+    )
+    assert "track_low_thresh" in yolo_warning
+    assert "blou" in yolo_warning or "flou" in yolo_warning
 
 
 def test_tracker_thresholds_must_stay_distinct_and_ordered():
@@ -112,55 +134,71 @@ def test_tracker_thresholds_must_stay_distinct_and_ordered():
     assert "new_track_thresh" in str(error.value)
 
 
+def _tracker_values_match(left, right) -> bool:
+    """Égalité de valeurs YAML (booléens, nombres, chaînes) tolérante au typage."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return bool(left) == bool(right)
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) < 1e-9
+    return left == right
+
+
 def test_botsort_yaml_is_synchronised_with_the_configuration():
     """Divergence silencieuse interdite entre le YAML lu par Ultralytics et la config.
 
-    La synchronisation porte sur **toutes** les valeurs de persistance et de ReID
-    natif, pas seulement sur les trois seuils : un ``track_buffer`` réglé dans le
-    YAML mais oublié dans la configuration piloterait le comportement sans que le
-    journal ni le protocole ne le sachent.
+    La synchronisation porte sur **100 % des clés** du fichier lu par Ultralytics
+    (``tracker_type``, ``fuse_score``, ``model`` compris), pas seulement sur les
+    trois seuils : une clé réglée dans le YAML mais oubliée dans la configuration
+    piloterait le comportement sans que le journal ni le protocole ne le sachent.
     """
-    from config import REPO_ROOT
+    from dataclasses import fields
+
+    from config import REPO_ROOT, TrackerConfig
 
     config = load_config()
-    tracker_yaml = yaml.safe_load(
-        (REPO_ROOT / config.tracker.config_path).read_text(encoding="utf-8")
+    tracker_path = REPO_ROOT / config.tracker.config_path
+    tracker_yaml = yaml.safe_load(tracker_path.read_text(encoding="utf-8"))
+
+    # 1. Chaque clé du YAML est portée par TrackerConfig, valeur identique.
+    for key, value in tracker_yaml.items():
+        assert hasattr(config.tracker, key), (
+            f"clé BoT-SORT {key!r} absente de TrackerConfig : divergence silencieuse"
+        )
+        assert _tracker_values_match(getattr(config.tracker, key), value), (
+            f"tracker.{key} diverge : YAML={value!r} config={getattr(config.tracker, key)!r}"
+        )
+
+    # 2. Aucune clé de TrackerConfig propre au YAML n'est oubliée (sauf les
+    #    métadonnées internes : chemin du fichier et persistance Ultralytics).
+    metadata = {"config_path", "persist"}
+    config_keys = {field.name for field in fields(TrackerConfig)} - metadata
+    assert config_keys == set(tracker_yaml), (
+        "le YAML BoT-SORT et TrackerConfig ne portent pas exactement les mêmes clés"
     )
-    assert tracker_yaml["track_high_thresh"] == pytest.approx(
-        config.tracker.track_high_thresh
-    )
-    assert tracker_yaml["track_low_thresh"] == pytest.approx(
-        config.tracker.track_low_thresh
-    )
-    assert tracker_yaml["new_track_thresh"] == pytest.approx(
-        config.tracker.new_track_thresh
-    )
-    assert tracker_yaml["track_buffer"] == config.tracker.track_buffer
-    assert tracker_yaml["with_reid"] == config.tracker.with_reid
-    assert tracker_yaml["match_thresh"] == pytest.approx(config.tracker.match_thresh)
-    assert tracker_yaml["proximity_thresh"] == pytest.approx(
-        config.tracker.proximity_thresh
-    )
-    assert tracker_yaml["appearance_thresh"] == pytest.approx(
-        config.tracker.appearance_thresh
-    )
-    assert tracker_yaml["gmc_method"] == config.tracker.gmc_method
+
+    # 3. pipeline.yaml déclare explicitement les mêmes clés que le YAML lu par
+    #    Ultralytics : la duplication est volontaire, la divergence interdite.
+    pipeline_tracker_keys = set(_raw()["tracker"]) - metadata
+    assert pipeline_tracker_keys == set(tracker_yaml)
 
 
 def test_track_buffer_covers_the_measured_occlusion_duration():
     """``track_buffer`` est réglé sur les occlusions **mesurées**, pas par défaut.
 
     Occlusions mesurées dans ``results/*/events.jsonl`` (OCCLUDED -> réapparition) :
-    médiane 2,5 s, p90 5,1 s. Le buffer doit couvrir au moins la médiane ; 150
-    frames valent 5 s à la cadence source de 30 ips, soit le p90 observé.
+    médiane 2,5 s, p90 5,1 s, maximum 13,5 s. Porté à 240 frames ≈ 8 s à 30 ips :
+    couvre le p90 + une marge (ce qui réduit les handoffs vers le ReID long
+    terme) sans dépasser l'occlusion maximale observée.
     """
     config = load_config()
     source_fps = 30.0
     typical_occlusion_s = 2.5
     p90_occlusion_s = 5.1
+    max_occlusion_s = 13.5
     covered_s = config.tracker.track_buffer / source_fps
     assert covered_s >= typical_occlusion_s
-    assert covered_s == pytest.approx(p90_occlusion_s, abs=0.2)
+    assert covered_s >= p90_occlusion_s + 1.0
+    assert covered_s <= max_occlusion_s
     assert config.tracker.track_buffer > 0
 
 
@@ -193,19 +231,21 @@ def test_diagnostics_section_is_exposed_and_configurable():
     assert "diagnostics" in config.to_dict()
 
 
-def test_gallery_retention_defaults_to_the_occupancy_grace_period():
-    """Par défaut, la mémoire d'apparence n'est pas libérée avant la grâce."""
+def test_gallery_retention_covers_the_longest_measured_occlusion():
+    """Grâce (6 s) + rétention (10 s) = 16 s, au-delà de l'occlusion max (13,5 s)."""
     config = load_config()
-    assert config.reid.long_term.gallery_retention_seconds is None
+    assert config.reid.long_term.gallery_retention_seconds == pytest.approx(10.0)
     from identity_manager import IdentityManager
 
     manager = IdentityManager(
         long_term=config.reid.long_term,
         grace_period_seconds=config.timing.grace_period_seconds,
     )
-    assert manager.purge_retention_seconds == pytest.approx(
-        config.timing.grace_period_seconds
-    )
+    assert manager.purge_retention_seconds == pytest.approx(10.0)
+    # Couverture totale = grâce d'occupation + rétention >= occlusion max mesurée.
+    covered = config.timing.grace_period_seconds + manager.purge_retention_seconds
+    assert covered >= 13.5
+    assert covered == pytest.approx(16.0)
 
 
 def test_gallery_retention_can_be_decoupled_explicitly():
@@ -222,13 +262,51 @@ def test_gallery_retention_can_be_decoupled_explicitly():
 
 def test_progressive_similarity_floor_cannot_exceed_the_nominal_threshold():
     config = load_config()
-    assert config.reid.long_term.long_absence_similarity_floor is None
+    # Assouplissement progressif activé dans la configuration de référence.
+    assert config.reid.long_term.long_absence_similarity_floor == pytest.approx(0.30)
+    assert (
+        config.reid.long_term.long_absence_similarity_floor
+        <= config.reid.long_term.similarity_threshold
+    )
     with pytest.raises(ConfigError) as error:
         override_config(
             load_config(),
             {"reid": {"long_term": {"long_absence_similarity_floor": 0.95}}},
         )
     assert "long_absence_similarity_floor" in str(error.value)
+
+
+def test_fps_source_accepts_video_native_for_offline_runs():
+    """``video_native`` est accepté pour horodater un fichier hors temps réel."""
+    from config import ALLOWED_FPS_SOURCES
+
+    assert "video_native" in ALLOWED_FPS_SOURCES
+    updated = override_config(load_config(), {"timing": {"fps_source": "video_native"}})
+    assert updated.timing.fps_source == "video_native"
+    with pytest.raises(ConfigError) as error:
+        override_config(load_config(), {"timing": {"fps_source": "guess"}})
+    assert "fps_source" in str(error.value)
+
+
+def test_progressive_floor_decays_over_the_configured_long_absence_window():
+    """Le plancher est atteint linéairement au bout de long_absence_seconds (6 s)."""
+    from identity_manager import IdentityManager
+
+    config = load_config()
+    long_term = config.reid.long_term
+    assert long_term.long_absence_seconds == pytest.approx(6.0)
+    assert long_term.safety_margin == pytest.approx(0.10)
+    manager = IdentityManager(
+        long_term=long_term,
+        grace_period_seconds=config.timing.grace_period_seconds,
+    )
+    base = long_term.similarity_threshold
+    floor = long_term.long_absence_similarity_floor
+    assert floor == pytest.approx(0.30)
+    assert manager.effective_similarity_threshold(0.0) == pytest.approx(base)
+    assert manager.effective_similarity_threshold(3.0) == pytest.approx((base + floor) / 2)
+    assert manager.effective_similarity_threshold(6.0) == pytest.approx(floor)
+    assert manager.effective_similarity_threshold(60.0) == pytest.approx(floor)
 
 
 def test_appearance_continuity_guard_is_exposed_and_configurable():
@@ -473,14 +551,30 @@ def test_paths_are_resolved_against_repository_root():
     assert config.resolve_path("models/yolo11n.pt").name == "yolo11n.pt"
 
 
-def test_default_config_has_head_assist_disabled():
+def test_default_config_has_head_assist_enabled():
     config = load_config()
     assert hasattr(config, "presence")
-    assert config.presence.head_assist.enabled is False
+    assert config.presence.head_assist.enabled is True
     assert config.presence.head_assist.pose_model_path == "models/yolo11s-pose.pt"
     assert config.presence.head_assist.min_keypoint_confidence == pytest.approx(0.5)
     assert config.presence.head_assist.max_presence_extension_seconds == pytest.approx(10.0)
     assert config.model.device == "cpu"
+
+
+def test_missing_pose_weights_are_reported_as_a_coherence_warning():
+    """Un flag head_assist actif sans poids ne doit pas faire échouer le chargement.
+
+    L'absence est signalée en ``CONFIG_WARNING`` (et ``main`` se rabat proprement
+    sur le modèle de détection standard).
+    """
+    from config import REPO_ROOT, coherence_warnings
+
+    config = load_config()
+    pose_path = REPO_ROOT / config.presence.head_assist.pose_model_path
+    if pose_path.exists():
+        pytest.skip("poids de pose présents : cas non reproductible sur cette machine")
+    codes = [code for code, _message in coherence_warnings(config)]
+    assert "head_assist_model_missing" in codes
 
 
 def test_head_assist_invalid_confidence_rejected():
@@ -525,4 +619,65 @@ def test_head_assist_empty_keypoints_rejected():
     with pytest.raises(ConfigError) as exc_info:
         build_config(raw)
     assert "presence.head_assist.keypoints_used" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Résolution de groupe de swap (A1) et chemin de secours galerie (B3)
+# ---------------------------------------------------------------------------
+def test_swap_group_proximity_is_configurable_and_validated():
+    config = override_config(
+        load_config(), {"reid": {"swap_correction": {"group_proximity_ratio": 1.25}}}
+    )
+    assert config.reid.swap_correction.group_proximity_ratio == pytest.approx(1.25)
+    assert "group_proximity_ratio" in config.to_dict()["reid"]["swap_correction"]
+
+    with pytest.raises(ConfigError) as error:
+        override_config(
+            load_config(),
+            {"reid": {"swap_correction": {"group_proximity_ratio": -0.1}}},
+        )
+    assert "reid.swap_correction.group_proximity_ratio" in str(error.value)
+
+
+def test_gallery_rescue_defaults_and_floor_resolution():
+    """``null`` se replie sur ``track_low_thresh`` ; une valeur explicite est honorée."""
+    config = load_config()
+    assert config.reid.long_term.gallery_rescue_enabled is False
+    assert config.reid.long_term.gallery_rescue_min_confidence == pytest.approx(
+        config.tracker.track_low_thresh
+    )
+    assert "gallery_rescue_enabled" in config.to_dict()["reid"]["long_term"]
+
+    explicit = override_config(
+        load_config(),
+        {"reid": {"long_term": {"gallery_rescue_min_confidence": 0.33}}},
+    )
+    assert explicit.reid.long_term.gallery_rescue_min_confidence == pytest.approx(0.33)
+
+    with pytest.raises(ConfigError) as error:
+        override_config(
+            load_config(),
+            {"reid": {"long_term": {"gallery_rescue_min_confidence": 1.5}}},
+        )
+    assert "reid.long_term.gallery_rescue_min_confidence" in str(error.value)
+
+
+def test_gallery_rescue_without_long_term_reid_is_warned_about():
+    """Activer le secours sans galerie est journalisé, jamais silencieux."""
+    from config import coherence_warnings
+
+    config = override_config(
+        load_config(),
+        {"reid": {"long_term": {"enabled": False, "gallery_rescue_enabled": True}}},
+    )
+    codes = [code for code, _message in coherence_warnings(config)]
+    assert "gallery_rescue_without_long_term_reid" in codes
+
+    # Cohérent : aucun avertissement de ce type.
+    ok = override_config(
+        load_config(),
+        {"reid": {"long_term": {"enabled": True, "gallery_rescue_enabled": True}}},
+    )
+    codes = [code for code, _message in coherence_warnings(ok)]
+    assert "gallery_rescue_without_long_term_reid" not in codes
 

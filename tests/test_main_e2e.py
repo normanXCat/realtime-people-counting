@@ -37,6 +37,16 @@ from events import read_events  # noqa: E402
 FRAME_SIDE = 600
 
 
+def business_types(events) -> list[str]:
+    """Types d'événements métier, hors ``CONFIG_WARNING`` de démarrage.
+
+    Une configuration peut signaler une dégradation (par ex. poids de pose
+    absents → assistance tête désactivée) sans que cela constitue un événement
+    du parcours testé.
+    """
+    return [event["type"] for event in events if event["type"] != "CONFIG_WARNING"]
+
+
 def validated_line(
     p1=(0.2, 0.4), p2=(0.8, 0.4), inside_side="negative"
 ) -> ValidatedLine:
@@ -280,7 +290,7 @@ def test_annulation_par_l_operateur_ne_lance_aucun_comptage(tmp_path: Path, monk
 
     assert code == 4
     root = session_dir(tmp_path, "session-annulee")
-    types = [event["type"] for event in read_events(root / "events.jsonl")]
+    types = business_types(read_events(root / "events.jsonl"))
     assert types == ["SESSION_START", "LINE_CALIBRATION_CANCELLED", "SESSION_END"]
     assert not (root / "calibration.json").exists()
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
@@ -306,7 +316,7 @@ def test_no_show_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch, 
 
     assert code == 4
     root = tmp_path / "results" / "session-headless"
-    types = [event["type"] for event in read_events(root / "events.jsonl")]
+    types = business_types(read_events(root / "events.jsonl"))
     assert types == ["SESSION_START", "LINE_CALIBRATION_UNAVAILABLE", "SESSION_END"]
     assert not (root / "calibration.json").exists()
     stderr = capsys.readouterr().err
@@ -331,7 +341,7 @@ def test_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch):
 
     assert code == 4
     root = tmp_path / "results" / "session-ecran-absent"
-    types = [event["type"] for event in read_events(root / "events.jsonl")]
+    types = business_types(read_events(root / "events.jsonl"))
     assert types == ["SESSION_START", "LINE_CALIBRATION_UNAVAILABLE", "SESSION_END"]
     assert not (root / "calibration.json").exists()
 
@@ -349,5 +359,5 @@ def test_source_inouvrable_pendant_la_selection(tmp_path: Path):
 
     assert code == 5
     root = tmp_path / "results" / "session-source-absente"
-    types = [event["type"] for event in read_events(root / "events.jsonl")]
+    types = business_types(read_events(root / "events.jsonl"))
     assert types == ["SESSION_START", "SOURCE_ERROR", "SESSION_END"]

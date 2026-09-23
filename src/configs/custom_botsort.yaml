@@ -1,18 +1,20 @@
 # Configuration BoT-SORT lue directement par Ultralytics.
 #
-# TOUTES les valeurs ci-dessous sont DOUBLÉES dans config/pipeline.yaml (section
-# `tracker`) : le pipeline les valide, les publie et journalise leur cohérence
-# avec le seuil d'inférence YOLO. Un test vérifie que les deux sources ne
-# divergent pas — une divergence serait sinon totalement silencieuse.
+# TOUTES les clés ci-dessous (tracker_type, fuse_score et model compris) sont
+# DOUBLÉES dans config/pipeline.yaml (section `tracker`) : le pipeline les
+# valide, les publie et journalise leur cohérence avec le seuil d'inférence YOLO.
+# Un test vérifie que les deux sources ne divergent pas **clé par clé** — une
+# divergence serait sinon totalement silencieuse.
 #
 # track_low_thresh reste volontairement bas (0.1) : c'est lui qui conserve les
 # détections faibles (personne floue) pour le second étage d'association. Le
 # garde-fou contre les faux positifs est new_track_thresh (0.7), pas le seuil
 # d'inférence YOLO (model.confidence = 0.10 dans pipeline.yaml).
 #
-# track_buffer (150 frames ≈ 5 s à 30 ips) couvre le p90 des occlusions mesurées
-# sur les vidéos de test (médiane 2,5 s, p90 5,1 s) ; au-delà, la galerie ReID
-# long terme prend le relais. with_reid active l'apparence native de BoT-SORT en
+# track_buffer (240 frames ≈ 8 s à 30 ips) couvre le p90 des occlusions mesurées
+# sur les vidéos de test (médiane 2,5 s, p90 5,1 s) avec une marge, ce qui
+# réduit les handoffs vers le ReID long terme ; au-delà, la galerie ReID long
+# terme prend le relais. with_reid active l'apparence native de BoT-SORT en
 # complément du ReID long terme de IdentityManager.
 tracker_type: botsort
 
@@ -20,7 +22,7 @@ tracker_type: botsort
 track_high_thresh: 0.4
 track_low_thresh: 0.1
 new_track_thresh: 0.7
-track_buffer: 150
+track_buffer: 240
 match_thresh: 0.9
 fuse_score: True
 
@@ -28,7 +30,9 @@ fuse_score: True
 with_reid: True
 model: auto
 proximity_thresh: 0.5
-appearance_thresh: 0.25
+# Relevé de 0.25 à 0.35 : exige une apparence plus proche avant de réassocier,
+# ce qui limite les échanges d'identifiant (swaps) entre personnes proches.
+appearance_thresh: 0.35
 
 # Caméra fixe.
 gmc_method: none

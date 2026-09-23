@@ -283,10 +283,18 @@ def test_absent_boxes_are_reported_as_such(tmp_path, monkeypatch):
     assert absent[0]["reason"] == "boxes_missing"
 
 
-def test_default_session_reports_no_configuration_warning(tmp_path, monkeypatch):
+def test_default_session_reports_no_seuil_incoherent(tmp_path, monkeypatch):
+    """Les seuils livrés sont cohérents : aucun avertissement de seuil YOLO.
+
+    D'autres ``CONFIG_WARNING`` peuvent exister (ex. poids de pose absents) ;
+    ce test ne porte que sur la cohérence des seuils de détection/association.
+    """
     root = run_main(tmp_path, monkeypatch, "session-coherente", lambda: None)
     events = read_events(root / "events.jsonl")
-    assert not [event for event in events if event["type"] == "CONFIG_WARNING"]
+    warnings = [event for event in events if event["type"] == "CONFIG_WARNING"]
+    assert "yolo_confidence_above_tracker_low_thresh" not in {
+        event.get("code") for event in warnings
+    }
     start = events[0]
     assert start["tracker_low_thresh"] == pytest.approx(
         load_config().tracker.track_low_thresh
