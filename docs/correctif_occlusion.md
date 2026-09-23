@@ -3452,3 +3452,124 @@ couverture **93,79 %**.
 Reprises d'une piste perdue sur une autre personne (4) : le seul réglage qui
 les réduit (`track_high_thresh` 0,30) crée un OUT fantôme par rattachement
 faux. `visible_count` (9), inversions (10), fusion non signalée (s12).
+
+# 21. Post-Occlusion Recovery, étape 1 (2026-09-23)
+
+> Mesuré sur un corpus contenant 4 reprises d'une piste perdue sur une autre
+> personne et une erreur `visible_count` max de 9 (`soutenance-finale2`).
+> Fonctionnalité **désactivée par défaut** ; décision à la personne responsable.
+
+## 21.1 Faisabilité (lecture seule)
+
+- **Détections brutes avant tracker, sans seconde inférence : possible.**
+  `model.track` enregistre le rappel du tracker
+  (`ultralytics/trackers/track.py`, `on_predict_postprocess_end`) **au
+  démarrage** ; un rappel ajouté avant par `model.add_callback` s'exécute donc
+  avant lui et lit `predictor.results[0].boxes` intact. Vérifié sur
+  `fort_occ4` : le rappel voit 7 à 9 boîtes sans identifiant quand le tracker
+  en rend 4.
+- **L'état OCCULTEE conserve ce qu'il faut** : `PersonTrack.bbox`,
+  `bbox_height`, `anchor`, `last_seen_s` ; le descripteur OSNet est dans
+  `IdentityRecord.feature` (galerie, rafraîchi toutes les
+  `gallery_refresh_seconds` = 1 s en mode `on_demand`).
+
+## 21.2 Implémentation
+
+- `src/post_occlusion_recovery.py` : détection brute libre = confiance ≥ 0,25,
+  IoU < 0,3 avec toute boîte suivie. Identité éligible : `OCCULTEE`,
+  `inside_occupancy`, perdue depuis moins de la grâce, centre de la détection à
+  moins de 1,0 × sa hauteur de sa dernière boîte, descripteur de galerie
+  connu. Descripteur OSNet calculé seulement pour une détection libre ayant au
+  moins une identité éligible dans son rayon. Similarité ≥ 0,66, écart ≥ 0,10
+  avec le second candidat (et avec une autre détection pour la même identité),
+  appariement un pour un glouton, confirmation sur 2 images (1 manquée
+  tolérée). Une identité récupérée est ensuite suivie par recouvrement
+  (IoU ≥ 0,3) tant que la détection brute persiste.
+- `src/occupancy_manager.py` : l'identité récupérée **reste `OCCULTEE`** et
+  n'est pas passée à `_handle_missing` sur l'image : aucune transition,
+  aucune ancre recalculée, aucun comptage. `PersonTrack.recovery_active`
+  la rend visible (`is_visible`, donc `visible_count`) ; sa boîte et
+  `last_seen_*` sont mis à jour (affichage, relevé par seconde, grâce
+  repartant de la dernière image récupérée).
+- `src/main.py` : rappel de capture enregistré seulement si
+  `post_occlusion_recovery.enabled`.
+- `config/pipeline.yaml` / `src/config.py` : section
+  `post_occlusion_recovery`, `enabled: false`, seuils `PROVISOIRE`, publiée
+  dans `config_resolved.yaml`.
+- `src/events.py` : `POST_OCCLUSION_RECOVERED`, `_AMBIGUOUS`, `_REJECTED` ;
+  chaque couple (événement, raison) une fois par épisode d'occultation. Une
+  première version ne dédupliquait que la dernière raison : 330 AMBIGUOUS et
+  294 REJECTED sur `fort_occ4` quand la raison alternait ; corrigé (40 et 27).
+
+## 21.3 Mesures
+
+Relevés `results/lot4/trace/{inclREC0,inclREC1}_fort_occ4`,
+`rec{0,1}_rare_occ2` ; jugement des récupérations par
+`results/lot7/judge_recovery.py` (étiquette de l'identité à sa dernière
+seconde suivie normalement, contre l'étiquette de la boîte récupérée par
+transfert IoU > 0,5 depuis la correspondance validée). Désactivé = relevé
+identique à `soutenance-finale2` (§20.4). Compteurs identiques sur les trois
+rejouages FPS de chaque condition.
+
+**`fort_occ4`, ligne de référence (12 attendus)** :
+
+| | Désactivé | Activé |
+|---|---|---|
+| `visible_count` erreur max / somme | 9 / 148 | **8 / 142** |
+| Récupérations (événements) justes / fausses / indéterminées | — | **3 / 4 / 5** (12) |
+| Secondes visibles par récupération justes / fausses / indéterminées | — | 5 / 4 / 1 |
+| `operational` en fin contre 12 | 12 | 12 |
+| `NEW` / OUT parasites | 0 / 0 | 0 / 0 |
+| Inversions (comptage robuste), dont reprises d'une piste perdue | 10 (4) | **11 (6)** |
+| AMBIGUOUS / REJECTED | — | 40 / 27 |
+| Descripteurs OSNet calculés | 160 | **2 367** |
+
+Récupérations fausses : `P5` rattaché deux fois à une boîte de `P1` (s16.9,
+s20.2), `P4` à `P3` (s17.0), `P10` à `P6` (s25.9), similarités 0,67 à 0,79.
+Elles apparaissent comme reprises d'une piste perdue sur une autre personne
+dans le comptage des inversions (4 → 6).
+
+**`rare_occ2`, ligne de convention** : IN / OUT / NEW 2 / 0 / 2 →
+`operational` 4 dans les deux cas ; `visible_count` max 4, moyenne 3,32 →
+3,36 ; identités 5 ; 3 récupérations, 2 REJECTED (non jugeables, pas de
+vérité terrain) ; descripteurs 53 → 120.
+
+**FPS, mesuré seul** (3 rejouages, désactivé et activé alternés ; une
+première série, trop bruitée, est conservée dans `results/lot7/fps_serie1/`) :
+
+| | Désactivé | Activé |
+|---|---|---|
+| `fort_occ4` | 3,300 / 4,074 / 3,866 → **3,87** | 2,501 / 3,416 / 3,080 → **3,08** (−20 %) |
+| `rare_occ2` | 4,044 / 4,103 / 3,655 → **4,04** | 2,500 / 4,143 / 3,576 → **3,58** |
+
+Le bruit machine est élevé sur cette série (premières passes basses), mais
+l'écart sur `fort_occ4` est cohérent avec le coût mesuré : 2 207 descripteurs
+en plus × 15,5 ms ≈ 34 s sur 1055 images, soit ≈ 32 ms par image. Le plancher
+de 3,06 ips n'est tenu que de justesse (3,08).
+
+## 21.4 Position par rapport au §4
+
+Comptage intact (`operational` exact, aucun IN/OUT/NEW parasite). Gain visible
+d'une personne sur l'erreur max (9 → 8, cible ≤ 1 non tenue). Mais 4
+récupérations sur 7 jugeables sont fausses, les inversions augmentent
+(10 → 11) et le FPS tombe à la limite du plancher. **Non recommandé à
+l'activation en l'état.**
+
+Pistes pour une étape suivante, non faites : exiger la même détection brute
+sur plus d'images, relever `similarity_threshold` pour la récupération (les
+fausses sont à 0,67–0,79), ou restreindre le calcul du descripteur (les 2 207
+calculs viennent surtout de détections libres rejetées image après image).
+
+## 21.5 Tests
+
+`tests/test_post_occlusion_recovery.py` (nouveau, 12 cas) : récupération sans
+IN/OUT/NEW ni variation d'occupation, identité restant `OCCULTEE` et visible
+au-delà de la grâce, fin de visibilité quand la détection cesse ; une image
+manquée tolérée ; aucune récupération sans candidat (hors rayon, confiance
+insuffisante, recouvrement d'une boîte suivie) ; rejet journalisé une fois ;
+ambiguïté entre deux identités ; identité extérieure non récupérable ;
+appariement un pour un ; une détection pour une seule identité ; raisons
+alternées journalisées une fois ; désactivé identique ; défaut `false` et
+publication. `tests/test_protocol.py` : section `post_occlusion_recovery`
+ajoutée à l'ensemble attendu (publiée même désactivée). Suite complète :
+**712 collectés, 711 passés, 1 ignoré**, couverture **93,88 %**.

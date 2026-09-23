@@ -307,6 +307,19 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
         required=("person_id", "duration_s", "max_extension_seconds"),
         optional=("frame", "reason"),
     ),
+    # -- Post-Occlusion Recovery, étape 1 (visibilité seule, jamais de comptage)
+    "POST_OCCLUSION_RECOVERED": EventSpec(
+        required=("person_id", "similarity", "confidence", "bbox"),
+        optional=("technical_track_id", "lost_seconds", "confirmations"),
+    ),
+    "POST_OCCLUSION_AMBIGUOUS": EventSpec(
+        required=("person_id", "reason", "similarity", "second_similarity"),
+        optional=("bbox", "confidence", "candidates"),
+    ),
+    "POST_OCCLUSION_REJECTED": EventSpec(
+        required=("person_id", "reason", "similarity"),
+        optional=("bbox", "confidence"),
+    ),
 }
 
 

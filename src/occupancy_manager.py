@@ -77,6 +77,7 @@ from geometry import (
 from identity_manager import IdentityManager, Observation
 from metrics import LatencyProfiler, Timer
 from occupancy_types import OccupancySnapshot, OriginType, PersonTrack
+from post_occlusion_recovery import PostOcclusionRecovery
 
 _log = logging.getLogger("occupancy_manager")
 
@@ -163,6 +164,18 @@ class OccupancyManager:
         )
         self.bbox_locker = bbox_locker
         self.anchor_stabilizer = anchor_stabilizer
+        #: Post-Occlusion Recovery, étape 1 (``None`` si désactivé : comportement
+        #: strictement identique à la version sans récupération).
+        self.recovery = (
+            PostOcclusionRecovery(
+                config.post_occlusion_recovery,
+                describe=self.identities.describe,
+                reference_feature=self._reference_feature,
+                emit=self._emit,
+            )
+            if config.post_occlusion_recovery.enabled
+            else None
+        )
 
         self.tracks: dict[int, PersonTrack] = {}
         self.initial_occupancy = 0
@@ -356,8 +369,14 @@ class OccupancyManager:
         frame: np.ndarray,
         timestamp_s: float,
         frame_index: int,
+        raw_detections: np.ndarray | None = None,
     ) -> None:
-        """Traite une frame complète : identités, FSM, comptage, occupation."""
+        """Traite une frame complète : identités, FSM, comptage, occupation.
+
+        ``raw_detections`` : détections YOLO brutes, avant tracker
+        (``x1, y1, x2, y2, conf, ...``), utilisées seulement par la
+        récupération post-occultation.
+        """
         self._frames += 1
         height, width = frame.shape[:2]
         self._frame_size = (width, height)
@@ -618,9 +637,12 @@ class OccupancyManager:
                             provisional=track.provisional,
                         )
                     )
+            recovered = self._recover_post_occlusion(
+                detections, raw_detections, seen, frame, timestamp_s, frame_index, views
+            )
             self._views = views
             for person_id, track in list(self.tracks.items()):
-                if person_id in seen:
+                if person_id in seen or person_id in recovered:
                     continue
                 self._handle_missing(track, budget, timestamp_s, frame_index)
         if self.profiler is not None:
@@ -764,6 +786,54 @@ class OccupancyManager:
             budget_frames=budget.warmup_frames,
             fps=round(budget.fps, 3),
         )
+
+    def _reference_feature(self, person_id: int) -> np.ndarray | None:
+        record = self.identities.record(person_id)
+        return None if record is None else record.feature
+
+    def _recover_post_occlusion(
+        self,
+        detections: Sequence[Detection],
+        raw_detections: np.ndarray | None,
+        seen: set[int],
+        frame: np.ndarray,
+        timestamp_s: float,
+        frame_index: int,
+        views: list[_View],
+    ) -> set[int]:
+        """Post-Occlusion Recovery (étape 1) : visibilité seule.
+
+        L'identité récupérée reste ``OCCULTEE`` pour la FSM et n'est pas passée
+        à :meth:`_handle_missing` sur cette frame : aucune transition, aucun
+        comptage. Sa boîte est celle de la détection brute ; son ancre n'est
+        pas recalculée.
+        """
+        if self.recovery is None:
+            return set()
+        recovered = self.recovery.step(
+            self.tracks, raw_detections, [d.bbox for d in detections], seen, frame,
+            timestamp_s, frame_index, self.config.timing.grace_period_seconds,
+        )
+        for person_id, track in self.tracks.items():
+            track.recovery_active = person_id in recovered
+            if not track.recovery_active:
+                continue
+            box, confidence = recovered[person_id]
+            track.bbox = np.asarray(box, dtype=float)
+            track.confidence = float(confidence)
+            track.last_seen_frame = frame_index
+            track.last_seen_s = timestamp_s
+            views.append(
+                _View(
+                    person_id=track.person_id,
+                    technical_track_id=track.technical_track_id,
+                    bbox=track.bbox,
+                    anchor=track.anchor,
+                    state=track.state,
+                    provisional=track.provisional,
+                )
+            )
+        return set(recovered)
 
     def _occlusion_ambiguity_radius_px(self) -> float | None:
         """Rayon (relatif à l'échelle locale) d'ambiguïté avec une personne occultée.

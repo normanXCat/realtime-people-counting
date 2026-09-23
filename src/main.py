@@ -928,6 +928,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     lambda ms: profiler.record("preprocessing", ms),
                 ),
             )
+        #: Détections YOLO brutes de la frame courante, relevées AVANT le
+        #: tracker (Post-Occlusion Recovery, étape 1). Le rappel est ajouté
+        #: avant `model.track`, qui enregistre ensuite celui du tracker : il
+        #: s'exécute donc en premier, sans seconde inférence.
+        raw_holder: dict[str, Any] = {}
+        if config.post_occlusion_recovery.enabled:
+            model.add_callback(
+                "on_predict_postprocess_end",
+                lambda predictor: raw_holder.__setitem__(
+                    "dets", predictor.results[0].boxes.data.cpu().numpy().copy()
+                    if predictor.results and predictor.results[0].boxes is not None
+                    else None
+                ),
+            )
         generator = model.track(
             source=source,
             tracker=str(tracker_path),
@@ -1193,7 +1207,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "track_buffer converti : %d frames (appliqué=%s)", frames, applied
                 )
 
-            occupancy.process_frame(detections, frame, timestamp_s, frame_index)
+            occupancy.process_frame(
+                detections, frame, timestamp_s, frame_index,
+                raw_detections=raw_holder.pop("dets", None),
+            )
             if second_tracer is not None:
                 second_tracer.observe(
                     frame_index, frame, occupancy,

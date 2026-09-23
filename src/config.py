@@ -639,6 +639,26 @@ class PreprocessingConfig:
 
 
 @dataclass(frozen=True)
+class PostOcclusionRecoveryConfig:
+    """Post-Occlusion Recovery, étape 1 : visibilité seule, jamais de comptage.
+
+    Une détection YOLO brute (avant tracker), sans piste et ne recouvrant
+    aucune boîte suivie, peut rendre visible une identité comptée ``OCCULTEE``
+    depuis moins de la grâce. Tous les seuils sont ``PROVISOIRE``.
+    """
+
+    enabled: bool = False
+    min_confidence: float = 0.25
+    max_iou_with_tracked: float = 0.3
+    radius_height_ratio: float = 1.0
+    similarity_threshold: float = 0.66
+    min_margin: float = 0.10
+    confirm_frames: int = 2
+    max_missed_frames: int = 1
+    follow_min_iou: float = 0.3
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     """Configuration résolue et validée du pipeline."""
 
@@ -659,6 +679,9 @@ class PipelineConfig:
     anchor: AnchorConfig = field(default_factory=AnchorConfig)
     presence: PresenceConfig = field(default_factory=PresenceConfig)
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
+    post_occlusion_recovery: PostOcclusionRecoveryConfig = field(
+        default_factory=PostOcclusionRecoveryConfig
+    )
     config_path: Path = DEFAULT_CONFIG_PATH
 
     # -- Accès pratiques ---------------------------------------------------
@@ -751,6 +774,7 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         "schema_version", "source", "model", "tracker", "reid", "line", "geometry",
         "timing", "occupancy", "output", "stabilization", "display", "logging",
         "diagnostics", "anchor", "presence", "preprocessing",
+        "post_occlusion_recovery",
     }
     for key in raw:
         if key not in known:
@@ -1207,6 +1231,19 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
         if cols is not None and rows is not None:
             clahe_grid = (cols, rows)
 
+    por_raw = _section(raw, "post_occlusion_recovery")
+    por_values = {
+        "min_confidence": _bounded(por_raw.get("min_confidence", 0.25), "post_occlusion_recovery.min_confidence", problems, low=0.0, high=1.0),
+        "max_iou_with_tracked": _bounded(por_raw.get("max_iou_with_tracked", 0.3), "post_occlusion_recovery.max_iou_with_tracked", problems, low=0.0, high=1.0),
+        "radius_height_ratio": _positive(por_raw.get("radius_height_ratio", 1.0), "post_occlusion_recovery.radius_height_ratio", problems),
+        "similarity_threshold": _bounded(por_raw.get("similarity_threshold", 0.66), "post_occlusion_recovery.similarity_threshold", problems, low=0.0, high=1.0),
+        "min_margin": _bounded(por_raw.get("min_margin", 0.10), "post_occlusion_recovery.min_margin", problems, low=0.0, high=1.0),
+        "confirm_frames": _positive_int(por_raw.get("confirm_frames", 2), "post_occlusion_recovery.confirm_frames", problems),
+        "max_missed_frames": _non_negative_int(por_raw.get("max_missed_frames", 1), "post_occlusion_recovery.max_missed_frames", problems),
+        "follow_min_iou": _bounded(por_raw.get("follow_min_iou", 0.3), "post_occlusion_recovery.follow_min_iou", problems, low=0.0, high=1.0),
+    }
+    por_defaults = PostOcclusionRecoveryConfig()
+
     presence_raw = _section(raw, "presence")
     head_assist_raw = _section(presence_raw, "head_assist")
     head_assist_enabled = bool(head_assist_raw.get("enabled", False))
@@ -1481,6 +1518,13 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                 clip_limit=float(clahe_clip or 2.0),
                 tile_grid_size=clahe_grid,
             ),
+        ),
+        post_occlusion_recovery=PostOcclusionRecoveryConfig(
+            enabled=bool(por_raw.get("enabled", False)),
+            **{
+                name: (getattr(por_defaults, name) if value is None else type(getattr(por_defaults, name))(value))
+                for name, value in por_values.items()
+            },
         ),
         config_path=config_path or DEFAULT_CONFIG_PATH,
     )

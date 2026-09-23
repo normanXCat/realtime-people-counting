@@ -140,4 +140,6 @@ def test_config_resolue_ne_contient_que_des_sections_du_schema(tmp_path: Path):
         # Lot 7 : la section de prétraitement est toujours publiée, même
         # désactivée, pour que la config résolue dise si CLAHE a tourné.
         "preprocessing",
+        # Post-Occlusion Recovery (étape 1) : publiée même désactivée.
+        "post_occlusion_recovery",
     }

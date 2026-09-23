@@ -115,6 +115,10 @@ class PersonTrack:
     head_point_frame_index: int | None = None
     #: Diagnostic : ensemble des track_id techniques ayant porté ce person_id.
     aliases: set[int] = field(default_factory=set)
+    #: Post-Occlusion Recovery (étape 1) : l'identité, restée ``OCCULTEE`` pour
+    #: la FSM, est visible sur cette frame grâce à une détection brute
+    #: rattachée. N'influe que sur la visibilité, jamais sur le comptage.
+    recovery_active: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -123,6 +127,8 @@ class PersonTrack:
 
     @property
     def is_visible(self) -> bool:
+        if self.recovery_active and self.state is TrackState.OCCULTEE:
+            return True
         return self.state in (
             TrackState.INITIALISATION,
             TrackState.EXTERIEUR,

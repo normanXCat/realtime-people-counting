@@ -593,3 +593,23 @@ preprocessing:
     enabled: false        # PROVISOIRE — désactivé par défaut, décision en attente (§19 du journal)
     clip_limit: 2.0       # valeur standard OpenCV, non calibrée
     tile_grid_size: [8, 8]
+
+# -- Post-Occlusion Recovery, étape 1 (docs/correctif_occlusion.md §21) -----
+# Une personne comptée, OCCULTEE depuis moins de la grâce, réapparaît souvent
+# détectée par YOLO entre 0,25 et new_track_thresh (0,70) : BoT-SORT ne lui crée
+# pas de piste. Une détection BRUTE (relevée avant le tracker, sans seconde
+# inférence), sans piste et ne recouvrant aucune boîte suivie, peut la rendre
+# VISIBLE à nouveau (visible_count, affichage), suivie ensuite par recouvrement.
+# Jamais de IN, OUT, NEW ni de variation d'occupation : l'identité reste
+# OCCULTEE pour la FSM, son ancre n'est pas recalculée. Seuils globaux du
+# tracker inchangés. Rattachement aux futures pistes BoT-SORT : étape 2.
+post_occlusion_recovery:
+  enabled: false              # désactivé par défaut, décision en attente
+  min_confidence: 0.25        # PROVISOIRE — confiance minimale de la détection brute
+  max_iou_with_tracked: 0.3   # PROVISOIRE — au-delà, la détection appartient à une boîte suivie
+  radius_height_ratio: 1.0    # PROVISOIRE — rayon autour de la dernière boîte, en hauteurs de boîte
+  similarity_threshold: 0.66  # même valeur que reid.long_term.similarity_threshold (OSNet, §17.2) — PROVISOIRE
+  min_margin: 0.10            # écart minimal avec le second candidat — PROVISOIRE
+  confirm_frames: 2           # images de confirmation avant récupération
+  max_missed_frames: 1        # images manquées tolérées pendant la confirmation
+  follow_min_iou: 0.3         # suivi par recouvrement d'une identité récupérée — PROVISOIRE
