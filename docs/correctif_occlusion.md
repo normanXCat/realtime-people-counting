@@ -3573,3 +3573,61 @@ alternées journalisées une fois ; désactivé identique ; défaut `false` et
 publication. `tests/test_protocol.py` : section `post_occlusion_recovery`
 ajoutée à l'ensemble attendu (publiée même désactivée). Suite complète :
 **712 collectés, 711 passés, 1 ignoré**, couverture **93,88 %**.
+
+# 22. Correction d'inversions par affectation globale (2026-09-23)
+
+> Mesuré sur un corpus contenant 10 inversions réelles (comptage robuste,
+> `soutenance-finale2`). Intégration sur instruction, portée de la branche
+> `feat-head-detector-mot-metrics` (binôme). Aucun seuil ni réglage modifié.
+
+## 22.1 Ce qui a été porté et adapté
+
+- `src/identity_manager.py` : `_correct_group_swaps`. Pistes éligibles =
+  identité non purgée avec empreinte de galerie **et** descripteur courant
+  **déjà disponible** (`_extract_valid_feature`) : en mode `on_demand`, rien
+  n'est calculé pour la correction, contrairement à la source qui suppose un
+  descripteur par image. Groupes = composantes connexes de boîtes qui se
+  touchent (`external_reid.proximity_margin_ratio`, critère existant du
+  déclencheur de proximité ; le `group_proximity_ratio` de la source n'est pas
+  repris pour ne créer aucun réglage). Groupe de 3+ : matrice N×N, algorithme
+  hongrois (`scipy.optimize.linear_sum_assignment`, coût 1 − similarité),
+  appliqué si ≥ 2 pistes changent et gain total > `swap_correction.margin`
+  (0,12, inchangé ; le facteur 1,5 « après fusion » de la source n'est pas
+  repris). Un événement `IDENTITY_SWAP_CORRECTED` par piste corrigée
+  (`group_size`, `group_person_ids`, `reason: group_appearance_correction`).
+- Groupes de 2 et pistes hors groupe : boucle par paires **inchangée** ; seules
+  les paires internes à un groupe déjà résolu sont sautées.
+- Sans `scipy` : aucune résolution de groupe, boucle par paires seule.
+  `scipy==1.17.1` déclaré dans `requirements.txt` (déjà installé, dépendance
+  d'Ultralytics).
+- `src/events.py` : `EventSpec.any_of` ; `IDENTITY_SWAP_CORRECTED` accepte la
+  forme paire (`*_a`/`*_b`) ou la forme groupe.
+
+## 22.2 Relevé de confirmation (configuration versionnée)
+
+| | `soutenance-finale2` | après |
+|---|---|---|
+| `fort_occ4` (ligne de référence) : IN / OUT / NEW / fin | 12 / 0 / 0 / 12 | identique |
+| `fort_occ4` : `visible_count` erreur max / somme | 9 / 148 | identique |
+| `fort_occ4` : inversions (comptage robuste) | 10 | 10 |
+| `IDENTITY_SWAP_CORRECTED` (`fort_occ4` / `rare_occ2`) | 0 / 0 | 0 / 0 |
+| `rare_occ2` : IN / OUT / NEW / fin, `visible_count` max | 2 / 0 / 2 / 4, 4 | identique |
+
+Relevés par seconde **identiques** à `soutenance-finale2` sur les deux vidéos
+(`results/lot4/trace/{inclFINALE3_fort_occ4,finale3_rare_occ2}`). Aucune
+correction, par paires ou par groupe, ne se déclenche sur ce corpus : en mode
+`on_demand` avec le déclencheur de proximité désactivé (§17.8), les pistes
+disposent rarement d'un descripteur courant sur la même image. Correctif
+**non concluant** sur ce corpus. FPS non mesuré (instruction).
+
+## 22.3 Tests
+
+`tests/test_swap_correction.py` : `test_permutation_circulaire_a_trois_pistes_est_corrigee_en_une_fois`
+porté ; ajout du repli sans `scipy` (permutation partiellement corrigée par
+paires) et d'un cas à trois boîtes disjointes (reste traité par paires).
+`test_trois_pistes_avec_un_seul_swap_corrige_uniquement_la_paire` **corrigé** :
+les trois boîtes de test se chevauchent, le groupe est désormais résolu
+globalement ; même mapping final, mais deux événements (un par piste, forme
+groupe) au lieu d'un événement de paire. `tests/test_events_schema.py` :
+l'événement minimal inclut la première variante `any_of` ; ajout d'un test de
+la forme groupe. Suite : **715 passés, 1 ignoré**, couverture **93,87 %**.

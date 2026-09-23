@@ -40,6 +40,14 @@ from typing import Any, Protocol, Sequence
 import cv2
 import numpy as np
 
+#: Affectation optimale (coût = 1 - similarité) pour la résolution globale d'un
+#: groupe de trois pistes ou plus. Sans ``scipy``, repli sur la correction par
+#: paires (comportement historique).
+try:  # pragma: no cover - dépend de l'environnement d'exécution
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment
+except Exception:  # pragma: no cover
+    _linear_sum_assignment = None  # type: ignore[assignment]
+
 from config import (
     AppearanceContinuityConfig,
     ExternalReidConfig,
@@ -715,11 +723,20 @@ class IdentityManager:
         directe (A↔A, B↔B) contre la similarité croisée (A↔B, B↔A). Si le croisement
         l'emporte d'au moins la marge configurée, le mapping technical_to_person est échangé
         et un événement IDENTITY_SWAP_CORRECTED est émis.
+
+        Les groupes de trois pistes ou plus dont les boîtes se touchent sont d'abord
+        résolus globalement (:meth:`_correct_group_swaps`) : une permutation
+        circulaire A→B, B→C, C→A n'est pas décomposable en décisions par paires.
+        Les paires internes à un groupe ainsi résolu ne sont plus réexaminées ;
+        toutes les autres suivent la comparaison par paires ci-dessous, inchangée.
         """
         if not self.swap_correction.enabled or len(observations) < 2:
             return
 
         corrected_tracks: set[int] = set()
+        group_of = self._correct_group_swaps(
+            observations, frame, frame_index, timestamp_s, corrected_tracks
+        )
 
         for i in range(len(observations)):
             obs_a = observations[i]
@@ -739,6 +756,8 @@ class IdentityManager:
                 tech_b = int(obs_b.technical_track_id)
                 if tech_b in corrected_tracks:
                     continue
+                if tech_a in group_of and group_of.get(tech_b) == group_of[tech_a]:
+                    continue  # paire déjà tranchée par la résolution de groupe
 
                 person_b = self.technical_to_person.get(tech_b)
                 if person_b is None or person_b not in self.records or person_b == person_a:
@@ -782,6 +801,109 @@ class IdentityManager:
                         reason="cross_appearance_correction",
                     )
                     break
+
+    def _correct_group_swaps(
+        self,
+        observations: Sequence[Observation],
+        frame: np.ndarray | None,
+        frame_index: int,
+        timestamp_s: float,
+        corrected_tracks: set[int],
+    ) -> dict[int, int]:
+        """Résolution globale des groupes de trois pistes ou plus (algorithme hongrois).
+
+        Éligible : piste mappée à une identité non purgée dont l'empreinte de
+        galerie existe, et dont le descripteur **courant** est déjà disponible.
+        En mode ``on_demand`` aucun descripteur n'est calculé ici : seules les
+        pistes décrites sur cette frame (rafraîchissement de galerie, déclencheur
+        de proximité) participent, comme pour la comparaison par paires.
+
+        Groupes : composantes connexes de boîtes qui se touchent
+        (``external_reid.proximity_margin_ratio``, le critère du déclencheur de
+        proximité). Matrice N×N (courant × référence), coût ``1 - similarité`` ;
+        appliquée si elle déplace au moins deux pistes et si le gain total dépasse
+        ``swap_correction.margin``. Sans ``scipy`` : rien n'est fait ici, la
+        comparaison par paires traite tout.
+
+        Returns:
+            ``{technical_track_id: indice de groupe}`` des groupes résolus.
+        """
+        if _linear_sum_assignment is None or len(observations) < 3:
+            return {}
+        entries: list[tuple[Observation, int, np.ndarray, np.ndarray]] = []
+        for obs in observations:
+            person_id = self.technical_to_person.get(int(obs.technical_track_id))
+            record = self.records.get(person_id) if person_id is not None else None
+            if record is None or record.purged_at_s is not None or record.feature is None:
+                continue
+            feature = self._extract_valid_feature(obs, frame)
+            if feature is None:
+                continue
+            entries.append((obs, person_id, feature, record.feature))
+        if len(entries) < 3:
+            return {}
+
+        parent = list(range(len(entries)))
+
+        def find(k: int) -> int:
+            while parent[k] != k:
+                parent[k] = parent[parent[k]]
+                k = parent[k]
+            return k
+
+        margin_ratio = float(self.external_reid.proximity_margin_ratio)
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                if self._boxes_touch(entries[i][0].bbox, entries[j][0].bbox, margin_ratio):
+                    parent[find(j)] = find(i)
+        groups: dict[int, list[int]] = {}
+        for k in range(len(entries)):
+            groups.setdefault(find(k), []).append(k)
+
+        group_of: dict[int, int] = {}
+        for index, members in enumerate(g for g in groups.values() if len(g) >= 3):
+            group = [entries[k] for k in members]
+            if len({person_id for _o, person_id, _f, _r in group}) < len(group):
+                continue  # deux pistes sur une même identité : pas une permutation
+            for obs, _p, _f, _r in group:
+                group_of[int(obs.technical_track_id)] = index
+            count = len(group)
+            similarity = np.array(
+                [[self.cosine_similarity(f, ref) for _o, _p, _f, ref in group] for _o, _p, f, _r in group],
+                dtype=float,
+            )
+            rows, columns = _linear_sum_assignment(1.0 - similarity)
+            assignment = {int(r): int(c) for r, c in zip(rows, columns)}
+            changed = [r for r in range(count) if assignment[r] != r]
+            current_total = float(np.trace(similarity))
+            optimal_total = float(sum(similarity[r, assignment[r]] for r in range(count)))
+            margin = float(self.swap_correction.margin)
+            if len(changed) < 2 or (optimal_total - current_total) <= margin:
+                continue
+            group_person_ids = [group[assignment[r]][1] for r in range(count)]
+            for r in changed:
+                obs, person_before = group[r][0], group[r][1]
+                tech = int(obs.technical_track_id)
+                person_after = group[assignment[r]][1]
+                self.technical_to_person[tech] = person_after
+                corrected_tracks.add(tech)
+                self.swap_corrections_applied += 1
+                self._emit(
+                    "IDENTITY_SWAP_CORRECTED",
+                    timestamp_s,
+                    frame_index,
+                    frame=int(frame_index),
+                    technical_track_id=tech,
+                    person_id_before=person_before,
+                    person_id_after=person_after,
+                    group_size=count,
+                    group_person_ids=group_person_ids,
+                    similarity_direct=round(current_total, 4),
+                    similarity_crossed=round(optimal_total, 4),
+                    margin_applied=round(margin, 4),
+                    reason="group_appearance_correction",
+                )
+        return group_of
 
     @staticmethod
     def _boxes_touch(a: Sequence[float], b: Sequence[float], margin_ratio: float) -> bool:

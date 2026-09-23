@@ -19,6 +19,9 @@ lap==0.5.13
 opencv-python==5.0.0.93
 numpy==2.5.2
 pillow==12.3.0
+# Affectation globale des groupes de 3+ pistes (correction d'inversions) ;
+# absent : repli sur la correction par paires.
+scipy==1.17.1
 
 # --- Configuration et métriques ------------------------------------------
 PyYAML==6.0.3

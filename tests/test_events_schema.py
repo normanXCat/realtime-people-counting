@@ -38,6 +38,9 @@ def base_event(event_type: str = "IN", **fields) -> dict:
 def minimal_event(event_type: str) -> dict:
     """Construit un événement minimal valide pour un type donné."""
     required = {name: 1 for name in EVENT_SCHEMA[event_type].required}
+    # Événement à plusieurs formes : la première variante complète suffit.
+    if EVENT_SCHEMA[event_type].any_of:
+        required.update({name: 1 for name in EVENT_SCHEMA[event_type].any_of[0]})
     if EVENT_SCHEMA[event_type].crossing:
         required["direction"] = "in"
     # Les champs de comptage doivent rester numériques et bornés.
@@ -232,3 +235,13 @@ def test_list_sink_obeys_the_same_contract():
     assert sink.of_type("NEW")[0]["session_id"] == "memory"
     with pytest.raises(SchemaError):
         sink.emit("NEW", 0.0, 1, person_id=1)  # direction manquante
+
+
+def test_swap_correction_accepte_la_forme_groupe_et_rejette_une_forme_incomplete():
+    common = dict(similarity_direct=1.0, similarity_crossed=2.0, margin_applied=0.12, reason="r")
+    validate_event(base_event(
+        "IDENTITY_SWAP_CORRECTED", technical_track_id=7, person_id_before=1,
+        person_id_after=2, group_size=3, **common,
+    ))
+    with pytest.raises(SchemaError):
+        validate_event(base_event("IDENTITY_SWAP_CORRECTED", technical_track_id=7, **common))

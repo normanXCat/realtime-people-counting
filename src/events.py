@@ -67,6 +67,9 @@ class EventSpec:
     optional: tuple[str, ...] = ()
     #: Si vrai, ``direction`` est obligatoire et doit valoir in/out/indeterminate.
     crossing: bool = False
+    #: Variantes acceptées : **au moins un** de ces groupes de champs doit être
+    #: entièrement présent (événement à deux formes, chacune restant contrainte).
+    any_of: tuple[tuple[str, ...], ...] = ()
 
 
 _CROSSING_FIELDS = ("person_id", "technical_track_id", "direction")
@@ -198,22 +201,39 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "descriptor_age_s", "threshold", "consecutive_frames",
         ),
     ),
-    # Correction active des inversions d'identité (swap) : le croisement
-    # d'apparence entre deux pistes connues dépasse la marge de sécurité.
+    # Correction active des inversions d'identité (swap). Deux formes :
+    #   - **paire** : le croisement d'apparence entre deux pistes connues dépasse
+    #     la marge de sécurité. Champs ``*_a`` / ``*_b`` ;
+    #   - **groupe** (3+ pistes dont les boîtes se touchent) : affectation
+    #     globale N×N, un événement par piste corrigée, avec ``group_size``.
+    # ``similarity_direct`` / ``similarity_crossed`` : similarité totale avant/après.
     "IDENTITY_SWAP_CORRECTED": EventSpec(
-        required=(
+        required=("similarity_direct", "similarity_crossed", "margin_applied", "reason"),
+        any_of=(
+            (
+                "technical_track_id_a",
+                "technical_track_id_b",
+                "person_id_a_before",
+                "person_id_a_after",
+                "person_id_b_before",
+                "person_id_b_after",
+            ),
+            ("technical_track_id", "person_id_before", "person_id_after", "group_size"),
+        ),
+        optional=(
+            "frame",
             "technical_track_id_a",
             "technical_track_id_b",
             "person_id_a_before",
             "person_id_a_after",
             "person_id_b_before",
             "person_id_b_after",
-            "similarity_direct",
-            "similarity_crossed",
-            "margin_applied",
-            "reason",
+            "technical_track_id",
+            "person_id_before",
+            "person_id_after",
+            "group_size",
+            "group_person_ids",
         ),
-        optional=("frame",),
     ),
     # Apparence refusée pour la galerie (jamais remplacée en silence).
     "REID_DESCRIPTOR_REJECTED": EventSpec(
@@ -354,6 +374,13 @@ def validate_event(event: Mapping[str, Any]) -> None:
     missing = [key for key in spec.required if event.get(key) is None]
     if missing:
         raise SchemaError(f"{event_type} : champs obligatoires manquants {missing}")
+    if spec.any_of and not any(
+        all(event.get(key) is not None for key in variant) for variant in spec.any_of
+    ):
+        raise SchemaError(
+            f"{event_type} : aucun jeu de champs requis n'est complet "
+            f"(attendu l'un de {[list(variant) for variant in spec.any_of]})"
+        )
 
     if spec.crossing:
         direction = event.get("direction")

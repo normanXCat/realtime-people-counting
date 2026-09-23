@@ -346,8 +346,87 @@ def test_trois_pistes_avec_un_seul_swap_corrige_uniquement_la_paire(sink):
     assert assignments[1].person_id == 1
     assert assignments[2].person_id == 3
 
-    assert manager.swap_corrections_applied == 1
+    # Les trois boîtes se touchent : groupe de 3 résolu globalement (algorithme
+    # hongrois). La transposition 7↔8 ne déplace que deux pistes ; l'événement
+    # est émis par piste corrigée, avec ``group_size``. La 3e ne produit rien.
+    assert manager.swap_corrections_applied == 2
+    events = sink.of_type("IDENTITY_SWAP_CORRECTED")
+    assert len(events) == 2
+    assert all(event["group_size"] == 3 for event in events)
+    by_track = {event["technical_track_id"]: event for event in events}
+    assert set(by_track) == {7, 8}
+    assert (by_track[7]["person_id_before"], by_track[7]["person_id_after"]) == (1, 2)
+    assert (by_track[8]["person_id_before"], by_track[8]["person_id_after"]) == (2, 1)
+    assert all(event["reason"] == "group_appearance_correction" for event in events)
+    assert all(event["group_person_ids"] == [2, 1, 3] for event in events)
+
+
+
+def _trois_pistes_en_permutation_circulaire(manager):
+    desc_a, desc_b, desc_c = unit(1, 0, 0), unit(0, 1, 0), unit(0, 0, 1)
+    manager.assign(
+        [observation(7, feature=desc_a), observation(8, feature=desc_b), observation(9, feature=desc_c)],
+        FRAME, 0.0, 1,
+    )
+    assert (manager.person_of(7), manager.person_of(8), manager.person_of(9)) == (1, 2, 3)
+    # Chaque piste porte l'apparence de la suivante.
+    return manager.assign(
+        [observation(7, feature=desc_b), observation(8, feature=desc_c), observation(9, feature=desc_a)],
+        FRAME, 0.1, 2,
+    )
+
+
+def test_permutation_circulaire_a_trois_pistes_est_corrigee_en_une_fois(sink):
+    """Permutation circulaire ``A→B``, ``B→C``, ``C→A`` : corrigée intégralement.
+
+    Porté de la branche du binôme. Par paires, la correction de (7, 8) exclut la
+    piste 8 de toute autre décision et laisse le mapping partiellement faux ; la
+    résolution globale N×N retrouve la permutation complète.
+    """
+    manager = build_manager(sink, swap_margin=0.08)
+    assignments = _trois_pistes_en_permutation_circulaire(manager)
+    sink_events = sink.of_type("IDENTITY_SWAP_CORRECTED")
+
+    assert (manager.person_of(7), manager.person_of(8), manager.person_of(9)) == (2, 3, 1)
+    assert [assignment.person_id for assignment in assignments] == [2, 3, 1]
+    assert manager.swap_corrections_applied == 3
+    assert len(sink_events) == 3
+    assert all(event["group_size"] == 3 for event in sink_events)
+    assert {event["technical_track_id"] for event in sink_events} == {7, 8, 9}
+    assert all(event["group_person_ids"] == [2, 3, 1] for event in sink_events)
+    for event in sink_events:
+        assert event["similarity_crossed"] > event["similarity_direct"] + event["margin_applied"]
+
+
+def test_sans_scipy_repli_sur_la_correction_par_paires(sink, monkeypatch):
+    """Sans ``scipy`` : aucune résolution de groupe, comportement par paires historique."""
+    import identity_manager
+
+    monkeypatch.setattr(identity_manager, "_linear_sum_assignment", None)
+    manager = build_manager(sink, swap_margin=0.08)
+    _trois_pistes_en_permutation_circulaire(manager)
+
+    events = sink.of_type("IDENTITY_SWAP_CORRECTED")
+    assert events and all("technical_track_id_a" in event for event in events)
+    assert all(event.get("group_size") is None for event in events)
+    # La permutation circulaire n'est que partiellement corrigée par paires.
+    assert (manager.person_of(7), manager.person_of(8), manager.person_of(9)) != (2, 3, 1)
+
+
+def test_groupe_de_trois_pistes_disjointes_reste_traite_par_paires(sink):
+    """Boîtes qui ne se touchent pas : pas de groupe, comparaison par paires."""
+    manager = build_manager(sink, swap_margin=0.08)
+    boxes = {7: [0.0, 100.0, 40.0, 300.0], 8: [200.0, 100.0, 240.0, 300.0], 9: [400.0, 100.0, 440.0, 300.0]}
+    desc_a, desc_b, desc_c = unit(1, 0, 0), unit(0, 1, 0), unit(0, 0, 1)
+    manager.assign(
+        [observation(t, feature=d, box=boxes[t]) for t, d in ((7, desc_a), (8, desc_b), (9, desc_c))],
+        FRAME, 0.0, 1,
+    )
+    sink.events.clear()
+    manager.assign(
+        [observation(t, feature=d, box=boxes[t]) for t, d in ((7, desc_b), (8, desc_a), (9, desc_c))],
+        FRAME, 0.1, 2,
+    )
     events = sink.of_type("IDENTITY_SWAP_CORRECTED")
     assert len(events) == 1
-    assert events[0]["technical_track_id_a"] == 7
-    assert events[0]["technical_track_id_b"] == 8
+    assert (events[0]["technical_track_id_a"], events[0]["technical_track_id_b"]) == (7, 8)
