@@ -3875,3 +3875,25 @@ inconnu, normalisation sur la taille réelle, cohérence du côté teinté avec
 calibration navigateur (ligne et sans ligne) et court-circuit par `--line` /
 `--no-line`, sondage du port. Suite : 762 collectés, 1 ignoré, couverture
 94,18 %.
+
+## 27.5 Précisions d'interface (2026-09-23)
+
+- Accueil de la calibration : « Voulez-vous tracer une ligne virtuelle ? »,
+  deux choix expliqués (« Avec ligne » : entrées et sorties à travers la ligne,
+  à tracer le long du seuil de la porte pour que toute la salle soit du même
+  côté de la droite prolongée ; « Sans ligne » : présents au démarrage et
+  apparitions, ni entrée ni sortie).
+- Écran de traçage : panneau d'aide toujours visible (Clic, C, G, I, Échap) ;
+  mêmes touches que la fenêtre OpenCV, au clavier et par des boutons portant
+  leur touche. Échap revient à la question « ligne ou pas » (ligne effacée).
+  Touches avec Ctrl / Cmd / Alt laissées au navigateur.
+- Démonstration : mode affiché discrètement (« Avec ligne » / « Sans ligne ») ;
+  sans ligne, Entrées et Sorties affichent « Non assigné » en texte atténué.
+- Logique pure isolée dans `src/web/interface.js` (raccourcis, textes),
+  exécutée par Node dans `tests/test_web_interface_js.py` (ignoré sans Node) :
+  touches C / G / I / Échap (majuscules, minuscules, modificateurs), « Non
+  assigné », mode, aide du HTML identique aux raccourcis, chaque bouton
+  déclenchant l'action de sa touche, branchement de `app.js`. Vérifié aussi
+  dans Chrome par de vraies frappes (Échap → question, G → ligne effacée,
+  C → démonstration ; mode sans ligne → « Non assigné »). Aucun changement
+  côté serveur ni comptage. Suite : 781 collectés, 1 ignoré.

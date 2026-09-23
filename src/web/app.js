@@ -4,8 +4,8 @@
 (function () {
   "use strict";
 
-  var TIRET = "—";
   var $ = function (id) { return document.getElementById(id); };
+  var Interface = window.Interface;
 
   var vues = { attente: $("vue-attente"), calibration: $("vue-calibration"), demo: $("vue-demo") };
   var vueCourante = null;
@@ -155,7 +155,7 @@
   toile.addEventListener("click", function (ev) {
     if ($("outils-ligne").hidden) { return; }
     if (calib.points.length >= 2) {
-      dire("Deux points sont déjà placés : « Recommencer » pour tracer une autre ligne.", true);
+      dire("Deux points sont déjà placés : G (Recommencer) pour tracer une autre ligne.", true);
       return;
     }
     var rect = toile.getBoundingClientRect();
@@ -170,23 +170,69 @@
     majOutils();
   });
 
+  function traceActif() { return vueCourante === "calibration" && !$("outils-ligne").hidden; }
+
   $("btn-ligne").addEventListener("click", function () {
     $("choix-mode").hidden = true;
     $("outils-ligne").hidden = false;
+    calib.points = [];
     calib.cote = (calib.info && calib.info.cote_interieur) || "negative";
     dire("");
     majOutils();
   });
 
-  $("btn-inverser").addEventListener("click", function () {
+  function inverser() {
+    if (calib.points.length < 2) { return; }
     calib.cote = calib.cote === "positive" ? "negative" : "positive";
     dessiner();
-  });
+  }
 
-  $("btn-recommencer").addEventListener("click", function () {
+  function recommencer() {
     calib.points = [];
     dire("");
     majOutils();
+  }
+
+  function retour() {
+    // Échap : retour à la question « ligne ou pas », ligne effacée.
+    calib.points = [];
+    dire("");
+    $("outils-ligne").hidden = true;
+    $("choix-mode").hidden = false;
+    dessiner();
+    $("btn-ligne").focus();
+  }
+
+  function valider() {
+    if (calib.points.length < 2) {
+      dire("Placez d'abord les deux extrémités de la ligne.", true);
+      return;
+    }
+    if (calib.enCours) { return; }
+    var a = calib.points[0], b = calib.points[1];
+    envoyer({
+      mode: "ligne",
+      p1: [a.x, a.y],
+      p2: [b.x, b.y],
+      cote_interieur: calib.cote,
+      largeur_affichee: image.clientWidth
+    });
+  }
+
+  var actions = { valider: valider, recommencer: recommencer, inverser: inverser, retour: retour };
+
+  $("btn-inverser").addEventListener("click", inverser);
+  $("btn-recommencer").addEventListener("click", recommencer);
+  $("btn-retour").addEventListener("click", retour);
+  $("btn-valider").addEventListener("click", valider);
+
+  // Mêmes touches que la fenêtre OpenCV : C, G, I, Échap (voir interface.js).
+  document.addEventListener("keydown", function (ev) {
+    if (!traceActif()) { return; }
+    var action = Interface.actionPourTouche(ev);
+    if (!action) { return; }
+    ev.preventDefault();
+    actions[action]();
   });
 
   function envoyer(corps) {
@@ -207,17 +253,6 @@
     });
   }
 
-  $("btn-valider").addEventListener("click", function () {
-    var a = calib.points[0], b = calib.points[1];
-    envoyer({
-      mode: "ligne",
-      p1: [a.x, a.y],
-      p2: [b.x, b.y],
-      cote_interieur: calib.cote,
-      largeur_affichee: image.clientWidth
-    });
-  });
-
   $("btn-sans-ligne").addEventListener("click", function () {
     envoyer({ mode: "sans_ligne" });
   });
@@ -235,8 +270,10 @@
   }
 
   function afficher(nom, valeur) {
-    // null = sans objet (mode sans ligne : ni entrée ni sortie).
-    $(nom).textContent = valeur === null || valeur === undefined ? TIRET : String(valeur);
+    // null = sans objet (mode sans ligne) : « Non assigné », texte atténué.
+    var t = Interface.texteCompteur(valeur);
+    $(nom).textContent = t.texte;
+    $(nom).classList.toggle("non-assigne", t.attenue);
   }
 
   function demarrerDemo() {
@@ -262,6 +299,7 @@
     afficher("entrees", v.entrees);
     afficher("sorties", v.sorties);
     afficher("nouvelles", v.nouvelles);
+    $("mode-texte").textContent = Interface.texteMode(v.sans_ligne);
     termine = v.etat === "termine";
     afficherEtat(v.etat);
   };

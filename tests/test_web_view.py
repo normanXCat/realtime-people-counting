@@ -238,13 +238,13 @@ def test_route_page(client_and_state):
     html = response.get_data(as_text=True)
     for label in (
         "Personnes présentes", "Entrées", "Sorties", "Nouvelles présences",
-        "Tracer une ligne", "Compter sans ligne", "Inverser le côté", "Recommencer",
-        "Valider et lancer",
+        "Voulez-vous tracer une ligne virtuelle ?", "Avec ligne", "Sans ligne",
+        "Inverser le côté", "Recommencer", "Valider et lancer", "Retour",
     ):
         assert label in html
     # Entièrement hors ligne : aucune ressource externe.
     assert "http://" not in html and "https://" not in html
-    for asset in ("/static/style.css", "/static/app.js"):
+    for asset in ("/static/style.css", "/static/interface.js", "/static/app.js"):
         served = client.get(asset)
         assert served.status_code == 200
         assert b"http://" not in served.data and b"https://" not in served.data

@@ -22,23 +22,42 @@
       <p class="etat" data-etat="calibration"><span class="pastille" aria-hidden="true"></span><span>Calibration</span></p>
 
       <div id="choix-mode">
-        <h1 class="titre">Mode de comptage</h1>
-        <p class="aide">Une ligne virtuelle compte les entrées et les sorties. Sans ligne,
-          toute l'image est l'intérieur : effectif initial puis nouvelles présences.</p>
-        <div class="actions">
-          <button type="button" class="bouton principal-btn" id="btn-ligne">Tracer une ligne</button>
-          <button type="button" class="bouton" id="btn-sans-ligne">Compter sans ligne</button>
+        <h1 class="titre">Voulez-vous tracer une ligne virtuelle ?</h1>
+        <div class="choix">
+          <button type="button" class="carte principal-carte" id="btn-ligne">
+            <span class="carte-titre">Avec ligne</span>
+            <span class="carte-texte">Le système compte les entrées et les sorties à travers la ligne,
+              en plus des personnes présentes. Tracez-la le long du seuil de la porte, pour que
+              toute la salle se trouve du même côté de la ligne prolongée.</span>
+          </button>
+          <button type="button" class="carte" id="btn-sans-ligne">
+            <span class="carte-titre">Sans ligne</span>
+            <span class="carte-texte">Le système compte les personnes présentes au démarrage et
+              celles qui apparaissent ensuite. Les entrées et les sorties ne sont pas comptées.</span>
+          </button>
         </div>
       </div>
 
       <div id="outils-ligne" hidden>
-        <h1 class="titre">Ligne de comptage</h1>
+        <h1 class="titre">Tracer la ligne</h1>
         <p class="aide" id="consigne">Cliquez le premier point de la ligne.</p>
-        <p class="aide discret">La droite prolongée (pointillés) décide du côté : la zone teintée est l'intérieur.</p>
+
+        <section class="aide-clavier" aria-label="Commandes">
+          <h2 class="aide-titre">Commandes</h2>
+          <dl class="commandes">
+            <div><dt><kbd>Clic</kbd></dt><dd>placer les deux extrémités de la ligne</dd></div>
+            <div><dt><kbd>C</kbd></dt><dd>valider la ligne et lancer le comptage</dd></div>
+            <div><dt><kbd>G</kbd></dt><dd>effacer la ligne et recommencer</dd></div>
+            <div><dt><kbd>I</kbd></dt><dd>inverser le côté intérieur (la zone teintée)</dd></div>
+            <div><dt><kbd>Échap</kbd></dt><dd>revenir à la question « ligne ou pas »</dd></div>
+          </dl>
+        </section>
+
         <div class="actions">
-          <button type="button" class="bouton" id="btn-inverser" disabled>Inverser le côté</button>
-          <button type="button" class="bouton" id="btn-recommencer">Recommencer</button>
-          <button type="button" class="bouton principal-btn" id="btn-valider" disabled>Valider et lancer</button>
+          <button type="button" class="bouton principal-btn" id="btn-valider" data-touche="c" aria-keyshortcuts="C" disabled><kbd>C</kbd> Valider et lancer</button>
+          <button type="button" class="bouton" id="btn-recommencer" data-touche="g" aria-keyshortcuts="G"><kbd>G</kbd> Recommencer</button>
+          <button type="button" class="bouton" id="btn-inverser" data-touche="i" aria-keyshortcuts="I" disabled><kbd>I</kbd> Inverser le côté</button>
+          <button type="button" class="bouton" id="btn-retour" data-touche="Escape" aria-keyshortcuts="Escape"><kbd>Échap</kbd> Retour</button>
         </div>
       </div>
 
@@ -59,6 +78,8 @@
       <p class="etat" id="etat" data-etat="en_cours">
         <span class="pastille" aria-hidden="true"></span>
         <span id="etat-texte">En cours</span>
+        <span class="separateur" aria-hidden="true">·</span>
+        <span id="mode-texte">Avec ligne</span>
       </p>
 
       <div class="principal">
@@ -83,6 +104,7 @@
     </aside>
   </main>
 
+  <script src="/static/interface.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
