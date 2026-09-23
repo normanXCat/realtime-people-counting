@@ -122,6 +122,11 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "calibration_path", "line_origin",
         ),
     ),
+    # Mode SANS ligne choisi explicitement (--no-line ou touche « N ») : aucun
+    # IN/OUT possible, effectif = warm-up + NEW.
+    "LINE_DISABLED": EventSpec(
+        required=("line_origin",), optional=("calibration_path",)
+    ),
     "LINE_CALIBRATION_CANCELLED": EventSpec(
         required=("reason",), optional=("frames_processed",)
     ),

@@ -3672,3 +3672,50 @@ Relevé par seconde **identique** à `soutenance-finale3` : IN / OUT / NEW
 Tests : aucun à ajuster (le défaut de `ExternalReidConfig` valait déjà `true` ;
 le seul test qui fixe l'option la passe explicitement). Relevés :
 `results/lot4/trace/{inclPROX_fort_occ4,prox_rare_occ2}`, `results/lot8/`.
+
+---
+
+# 24. Mode sans ligne réintégré (hors plan, sur instruction du 2026-09-23)
+
+> Instruction explicite de la personne responsable : comptage d'une vidéo sans
+> porte. Le mode avec ligne et sa logique IN/OUT/NEW ne sont **pas** modifiés
+> (§8 : la décision « interdit de modifier » reste entière pour ce mode).
+
+## 24.1 État trouvé
+
+Aucun mode sans ligne ne subsistait : `OccupancyManager` refusait `line=None`,
+`perform_line_selection` refusait `--no-show` sans `--line` (code 6, lot 0), la
+fenêtre de calibration n'offrait que C / G / I / Échap. Le warm-up
+(`EMPLACE_INITIAL`) et la règle `NEW` (apparition intérieure stable, jamais vue
+dehors, non bloquée par une occultation voisine) existaient déjà dans la FSM.
+
+## 24.2 Changement
+
+- Choix toujours explicite : `--no-line` (incompatible avec `--line`) ou touche
+  **N** dans la fenêtre de calibration, indiquée à l'écran ; HUD « MODE SANS
+  LIGNE ». `--no-show` sans `--line` reste refusé, sauf avec `--no-line`.
+- `OccupancyManager(line=None, no_line=True)` : zone et côté imposés à
+  l'intérieur (même condition d'échelle locale qu'avec ligne), aucun calcul de
+  franchissement ; la table de transition n'est pas touchée. Effectif = warm-up
+  + `NEW`, jamais de IN ni de OUT.
+- Traçabilité : `calibration.json` avec `line: null`, événement `LINE_DISABLED`
+  (`line_origin` = `no_line_argument` ou `operator_no_line_key`).
+- Tests : `tests/test_no_line_mode.py` (9). Suite : 726 collectés, verte,
+  couverture 93,86 %.
+
+## 24.3 Mesures (configuration `describe_on_proximity: true`, §23)
+
+| | IN / OUT | initial | NEW | `operational` en fin |
+|---|---|---|---|---|
+| `fort_occ4`, ligne de référence (contrôle) | 12 / 0 | 0 | 0 | 12 — relevé par seconde **identique** au §23 |
+| `fort_occ4`, sans ligne | 0 / 0 | 3 | 9 | **12** |
+| `rare_occ2`, sans ligne | 0 / 0 | 0 | 4 | 4 (4 avec ligne) |
+
+`fort_occ4` sans ligne, identités comptées rattachées à la vérité terrain
+(transfert IoU > 0,5) : 9 personnes réelles sur 12 entrées (P1–P8, P10) ;
+**manquées** P9, P11, P12 (reprises par des identités déjà comptées) ; **en
+trop** P13 deux fois (NEW à 29,0 s et 33,3 s — vu à travers la fenêtre, donc
+compté puisque toute l'image est l'intérieur) et un second fragment de P4
+(14,6 s). Le total 12 n'est juste **que par compensation** (9 + 3 − 0). Les 3
+initiaux sont aussi structurellement faux (salle vide à s0, personnes à la porte
+pendant le warm-up). Relevés : `results/lot4/trace/{inclPROX2_fort_occ4,noline_fort_occ4,noline_rare_occ2}`.

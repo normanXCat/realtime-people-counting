@@ -131,6 +131,7 @@ class OccupancyManager:
         config: PipelineConfig,
         event_sink: EventSink | None = None,
         line: VirtualLine | None = None,
+        no_line: bool = False,
         identity_manager: IdentityManager | None = None,
         budget: FrameBudget | None = None,
         machine: StateMachine | None = None,
@@ -145,7 +146,12 @@ class OccupancyManager:
         self.profiler = profiler
 
         self.line = line
-        if self.line is None:
+        #: Mode SANS ligne, toujours explicite (``--no-line`` ou touche « N ») :
+        #: toute l'image est l'intérieur, aucun franchissement n'est possible,
+        #: donc jamais de IN ni de OUT ; effectif = warm-up + NEW. La table de
+        #: transition est inchangée : seules la zone et le côté sont imposés.
+        self.no_line = bool(no_line) and line is None
+        if self.line is None and not self.no_line:
             # Aucune ligne par défaut : la ligne est obligatoirement celle validée
             # par l'opérateur au démarrage (voir :mod:`calibration`). Refuser ici
             # rend impossible toute divergence entre la ligne affichée et celle
@@ -1101,9 +1107,16 @@ class OccupancyManager:
                 )
                 return
 
-        distance = self.line.distance(effective_anchor, width, height)
-        side = side_of(distance, self.line.inside_side, self.line.on_line_policy)
-        zone = zone_of(distance, dead_zone_px, self.line.inside_side)
+        if self.no_line:
+            distance = 0.0
+            side = Side.INTERIEURE
+            # Même condition d'échelle que le mode avec ligne (zone_of rend
+            # None sans échelle locale), sans zone morte ni extérieur.
+            zone = Zone.INTERIEURE if dead_zone_px is not None else None
+        else:
+            distance = self.line.distance(effective_anchor, width, height)
+            side = side_of(distance, self.line.inside_side, self.line.on_line_policy)
+            zone = zone_of(distance, dead_zone_px, self.line.inside_side)
 
         if reliable and zone is Zone.EXTERIEURE:
             # Historique extérieur : dès qu'il existe, ``NEW`` est interdit par
@@ -1120,7 +1133,7 @@ class OccupancyManager:
             track.new_deferred_reported = False
 
         crossed: str | None = None
-        if reliable and track.previous_anchor is not None:
+        if reliable and track.previous_anchor is not None and not self.no_line:
             crossed = self.line.crossing(
                 track.previous_anchor, effective_anchor, width, height
             )
@@ -1753,16 +1766,17 @@ class OccupancyManager:
     def draw_overlay(self, frame: np.ndarray) -> None:
         """Dessine la ligne, la zone morte relative, les boîtes et le HUD."""
         height, width = frame.shape[:2]
-        start, end = self.line.to_pixels(width, height)
-        cv2.line(
-            frame,
-            (int(start[0]), int(start[1])),
-            (int(end[0]), int(end[1])),
-            (0, 255, 0),
-            3,
-            cv2.LINE_AA,
-        )
-        self._draw_dead_zone(frame, start, end)
+        if self.line is not None:
+            start, end = self.line.to_pixels(width, height)
+            cv2.line(
+                frame,
+                (int(start[0]), int(start[1])),
+                (int(end[0]), int(end[1])),
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            self._draw_dead_zone(frame, start, end)
 
         for view in self._views:
             color = STATE_COLORS.get(view.state, (255, 255, 255))
@@ -1823,6 +1837,8 @@ class OccupancyManager:
             f"IN: {snapshot.total_in}  OUT: {snapshot.total_out}  NEW: {snapshot.total_new}",
             f"Visibles: {snapshot.visible}  Occultees: {snapshot.occluded}  Phase: {self.phase}",
         ]
+        if self.no_line:
+            lines.append("MODE SANS LIGNE : effectif = warm-up + NEW")
         font = cv2.FONT_HERSHEY_SIMPLEX
         f_scale = 0.5 * scale
         thickness = max(1, int(1.5 * scale))

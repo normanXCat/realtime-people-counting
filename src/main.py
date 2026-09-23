@@ -148,6 +148,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
              "drapeau, la sélection manuelle par clics est inchangée. La ligne "
              "fournie subit exactement la même validation que la ligne cliquée.",
     )
+    parser.add_argument(
+        "--no-line", action="store_true",
+        help="Mode SANS ligne, choisi explicitement (vidéo sans porte) : toute "
+             "l'image est l'intérieur, effectif = warm-up + NEW, jamais de IN ni "
+             "de OUT. Seul moyen d'utiliser --no-show sans --line. Équivalent de "
+             "la touche « N » dans la fenêtre de sélection.",
+    )
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
     parser.add_argument(
         "--trace-per-second", action="store_true",
@@ -399,7 +406,7 @@ def calibrate(
     window_name: str | None = None,
     inside_side: str | None = None,
     min_length_ratio: float | None = None,
-) -> ValidatedLine:
+) -> ValidatedLine | None:
     """Affiche la première image et attend que l'utilisateur définisse manuellement la ligne.
 
     Comportement strict :
@@ -522,9 +529,13 @@ def perform_line_selection(
     *,
     headless_requested: bool = False,
     line_argument: str | None = None,
+    no_line: bool = False,
     **kwargs: Any,
-) -> ValidatedLine:
+) -> ValidatedLine | None:
     """Point d'entrée du pipeline pour la définition de la ligne.
+
+    ``None`` signifie le mode SANS ligne, toujours choisi explicitement
+    (``--no-line`` ou touche « N ») — jamais un repli.
 
     Trois cas, sans aucun repli automatique :
 
@@ -536,6 +547,10 @@ def perform_line_selection(
        serait une erreur silencieuse, et c'est précisément ce que le dépôt a
        supprimé.
     """
+    if line_argument is not None and no_line:
+        raise LineError("--line et --no-line sont incompatibles : choisir un seul mode.")
+    if no_line:
+        return None
     if line_argument is not None:
         return line_from_argument(config, source, line_argument)
     if headless_requested:
@@ -543,7 +558,8 @@ def perform_line_selection(
             "Mode non interactif : --line est obligatoire. La ligne virtuelle "
             "ne peut pas être devinée (aucun repli automatique n'existe), et "
             "--no-show empêche de la définir par clics. Fournir "
-            "« --line x1,y1,x2,y2 » en coordonnées normalisées, ou retirer "
+            "« --line x1,y1,x2,y2 » en coordonnées normalisées, « --no-line » "
+            "pour un comptage sans ligne (warm-up + NEW), ou retirer "
             "--no-show pour la sélectionner à la main."
         )
     return calibrate(
@@ -797,6 +813,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         + (
             f"ligne virtuelle explicite (--line {args.line})"
             if args.line is not None
+            else "mode SANS ligne (--no-line) : effectif = warm-up + NEW"
+            if args.no_line
             else "définition manuelle de la ligne virtuelle "
                  "(la première image va s'afficher)"
         )
@@ -808,7 +826,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # jamais silencieux).
     try:
         validated = perform_line_selection(
-            config, source, headless_requested=args.no_show, line_argument=args.line
+            config, source, headless_requested=args.no_show, line_argument=args.line,
+            no_line=args.no_line,
         )
     except LineError as error:
         # `--line` mal formé ou refusé par la validation partagée : c'est une
@@ -826,49 +845,71 @@ def main(argv: Sequence[str] | None = None) -> int:
             start_s=start_s,
         )
 
-    # L'orientation effectivement retenue dans la fenêtre est celle appliquée à
-    # tout le reste du pipeline: dessin, distance signée, franchissements,
-    # comptage. Elle est figée dans la configuration résolue de la session.
-    config = override_config(config, {"line": {"inside_side": validated.inside_side}})
-    resolved_config_path = write_resolved_config(config, session_root, session_id)
-    line_origin = "argument" if args.line is not None else "operator_clicks"
-    calibration_path = session_root / "calibration.json"
-    write_json(
-        calibration_path,
-        {
-            "session_id": session_id,
-            "source": str(source),
-            "line": validated.to_dict(),
-            "line_origin": line_origin,
-        },
-    )
-    logger.emit(
-        "LINE_VALIDATED",
-        0.0,
-        0,
-        p1=list(validated.p1),
-        p2=list(validated.p2),
-        inside_side=validated.inside_side,
-        frame_resolution=[validated.frame_width, validated.frame_height],
-        length_normalized=round(validated.length_ratio, 6),
-        display_scale=round(validated.display_scale, 6),
-        confirmed_at=validated.confirmed_at,
-        calibration_path=str(calibration_path),
-        line_origin=line_origin,
-    )
-
-    try:
-        line = VirtualLine(
-            p1=validated.p1,
-            p2=validated.p2,
-            inside_side=validated.inside_side,
-            on_line_policy=config.line.on_line_policy,
-            min_length_ratio=config.line.min_length_ratio,
+    if validated is None:
+        # Mode SANS ligne, choisi explicitement (--no-line ou « N ») : aucune
+        # distance signée, aucun franchissement ; toute l'image est l'intérieur.
+        # La logique IN/OUT/NEW du mode avec ligne n'est pas touchée.
+        line = None
+        resolved_config_path = write_resolved_config(config, session_root, session_id)
+        line_origin = "no_line_argument" if args.no_line else "operator_no_line_key"
+        calibration_path = session_root / "calibration.json"
+        write_json(
+            calibration_path,
+            {
+                "session_id": session_id,
+                "source": str(source),
+                "line": None,
+                "line_origin": line_origin,
+            },
         )
-    except (LineError, KeyError) as error:  # défense en profondeur : ligne déjà validée
-        print(f"[LINE] {error}", file=sys.stderr)
-        logger.close()
-        return 4
+        logger.emit(
+            "LINE_DISABLED", 0.0, 0,
+            line_origin=line_origin, calibration_path=str(calibration_path),
+        )
+    else:
+        # L'orientation effectivement retenue dans la fenêtre est celle appliquée à
+        # tout le reste du pipeline: dessin, distance signée, franchissements,
+        # comptage. Elle est figée dans la configuration résolue de la session.
+        config = override_config(config, {"line": {"inside_side": validated.inside_side}})
+        resolved_config_path = write_resolved_config(config, session_root, session_id)
+        line_origin = "argument" if args.line is not None else "operator_clicks"
+        calibration_path = session_root / "calibration.json"
+        write_json(
+            calibration_path,
+            {
+                "session_id": session_id,
+                "source": str(source),
+                "line": validated.to_dict(),
+                "line_origin": line_origin,
+            },
+        )
+        logger.emit(
+            "LINE_VALIDATED",
+            0.0,
+            0,
+            p1=list(validated.p1),
+            p2=list(validated.p2),
+            inside_side=validated.inside_side,
+            frame_resolution=[validated.frame_width, validated.frame_height],
+            length_normalized=round(validated.length_ratio, 6),
+            display_scale=round(validated.display_scale, 6),
+            confirmed_at=validated.confirmed_at,
+            calibration_path=str(calibration_path),
+            line_origin=line_origin,
+        )
+
+        try:
+            line = VirtualLine(
+                p1=validated.p1,
+                p2=validated.p2,
+                inside_side=validated.inside_side,
+                on_line_policy=config.line.on_line_policy,
+                min_length_ratio=config.line.min_length_ratio,
+            )
+        except (LineError, KeyError) as error:  # défense en profondeur : ligne déjà validée
+            print(f"[LINE] {error}", file=sys.stderr)
+            logger.close()
+            return 4
 
     locker = (
         BBoxHeightLocker(
@@ -888,6 +929,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config,
         event_sink=logger,
         line=line,
+        no_line=line is None,
         bbox_locker=locker,
         anchor_stabilizer=stabilizer,
         profiler=profiler,
@@ -910,8 +952,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
-        f"| ligne(manuelle)={line.p1}->{line.p2} | intérieur={line.inside_side} "
-        f"| headless={not display_enabled}"
+        + (
+            f"| ligne(manuelle)={line.p1}->{line.p2} | intérieur={line.inside_side} "
+            if line is not None
+            else "| SANS ligne (warm-up + NEW, aucun IN/OUT) "
+        )
+        + f"| headless={not display_enabled}"
     )
 
     try:

@@ -43,6 +43,8 @@ from geometry import LineError, Point, line_length_normalized, sign_of_side, val
 KEY_CONFIRM = (ord("c"), ord("C"))
 KEY_RESET = (ord("g"), ord("G"))
 KEY_INVERT = (ord("i"), ord("I"))
+#: Démarrage explicite SANS ligne (vidéo sans porte) : effectif = warm-up + NEW.
+KEY_NO_LINE = (ord("n"), ord("N"))
 KEY_CANCEL = 27  # Échap
 
 #: Durée d'attente entre deux itérations de la boucle d'événements (ms).
@@ -380,6 +382,7 @@ class LineSelection:
         lines = [
             "Ligne de comptage : cliquer les DEUX extremites (point 1 puis point 2)",
             "C : valider la ligne   |   G : recommencer   |   I : inverser IN/OUT   |   Echap : annuler",
+            "N : demarrer SANS ligne (aucune porte : effectif = warm-up + NEW, jamais IN/OUT)",
             (
                 "Aucune ligne par defaut : le comptage ne demarre qu'apres validation."
                 if not self.ready
@@ -428,12 +431,13 @@ def select_line(
     min_length_ratio: float = 0.05,
     window_name: str = DEFAULT_WINDOW_NAME,
     max_display_side: int = MAX_DISPLAY_SIDE,
-) -> ValidatedLine:
+) -> ValidatedLine | None:
     """Affiche la première image et exige une ligne validée par l'opérateur.
 
     Returns:
         La :class:`ValidatedLine` sélectionnée, seule ligne utilisée ensuite par
-        le pipeline (dessin, distance signée, franchissements, comptage).
+        le pipeline (dessin, distance signée, franchissements, comptage) ; ou
+        ``None`` si l'opérateur choisit explicitement le mode sans ligne (« N »).
 
     Raises:
         SourceUnreadable: première image illisible.
@@ -509,6 +513,8 @@ def select_line(
                 selection.reset()
             elif key in KEY_INVERT:
                 selection.invert_inside_side()
+            elif key in KEY_NO_LINE:
+                return None
             elif key == KEY_CANCEL:
                 raise CalibrationCancelled(
                     "Sélection de la ligne annulée par l'opérateur (Échap)."
