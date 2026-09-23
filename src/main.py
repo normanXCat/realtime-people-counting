@@ -157,6 +157,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
     parser.add_argument(
+        "--web", action="store_true",
+        help="Interface web de démonstration (lecture seule) : vidéo avec la seule "
+             "ligne virtuelle, et les compteurs Personnes présentes / IN / OUT / NEW. "
+             "Le serveur démarre après la validation de la ligne.",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="Port de l'interface web (défaut : 8000)")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Adresse d'écoute de l'interface web (défaut : 127.0.0.1, machine locale "
+             "seulement). La vidéo montre des personnes identifiables : ne l'exposer "
+             "sur le réseau (ex. 0.0.0.0) qu'en connaissance de cause.",
+    )
+    parser.add_argument(
         "--trace-per-second", action="store_true",
         help="Outillage de mesure : relevé de l'état du pipeline à la première "
              "frame de chaque seconde vidéo (trace_per_second.jsonl + images), "
@@ -950,6 +963,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     live_timebase_logger = logging.getLogger(__name__)
 
+    # Interface web (--web) : lecture seule. Le serveur tourne dans un thread
+    # démon ; la boucle ci-dessous ne fait qu'y déposer une copie de l'image
+    # avec la seule ligne, et les quatre compteurs affichés.
+    web_state = None
+    web_server = None
+    if args.web:
+        from web_view import WebState, render_line_only, start_server
+
+        web_state = WebState(no_line=line is None)
+        try:
+            web_server = start_server(web_state, args.host, args.port)
+        except OSError as error:
+            print(f"[WEB] Démarrage du serveur impossible sur {args.host}:{args.port} : {error}",
+                  file=sys.stderr)
+            logger.close()
+            return 2
+        print(f"[WEB] Interface : http://{args.host}:{args.port}/")
+
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
         + (
@@ -1276,6 +1307,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 occupancy.draw_overlay(rendered)
             profiler.record("render", render_timer.ms)
 
+            if web_state is not None:
+                web_state.publish(
+                    render_line_only(frame, line),
+                    confirmed=occupancy.occupancy_confirmed,
+                    total_in=occupancy.total_in,
+                    total_out=occupancy.total_out,
+                    total_new=occupancy.total_new,
+                )
+
             if not detections:
                 if timestamp_s - last_detection_s >= no_detection_seconds:
                     if not no_detection_announced:
@@ -1370,6 +1410,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             track_buffer_frames=track_buffer_frames,
         )
         logger.close()
+
+    if web_state is not None:
+        # Fin de la vidéo : la dernière image et les valeurs finales restent
+        # servies jusqu'à l'arrêt explicite (Ctrl+C).
+        web_state.finish()
+        print("\n[WEB] Traitement terminé ; interface toujours servie sur "
+              f"http://{args.host}:{args.port}/ (Ctrl+C pour quitter)")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            web_server.shutdown()
 
     return exit_code
 

@@ -1,0 +1,122 @@
+/* Interface de démonstration : palette neutre, un seul accent, polices système. */
+:root {
+  --fond: #0e0f11;
+  --surface: #17191c;
+  --texte: #f5f5f4;
+  --texte-doux: #a8a29e;
+  --filet: #2a2d31;
+  --accent: #ffc800; /* même teinte que la ligne tracée sur la vidéo */
+  --espace: clamp(16px, 3vw, 48px);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+html, body { height: 100%; }
+
+body {
+  background: var(--fond);
+  color: var(--texte);
+  -webkit-font-smoothing: antialiased;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: var(--espace);
+  align-items: center;
+  min-height: 100%;
+  padding: var(--espace);
+}
+
+.video {
+  background: var(--surface);
+  border-radius: 8px;
+  overflow: hidden;
+  line-height: 0;
+}
+
+.video img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: calc(100vh - 2 * var(--espace));
+  object-fit: contain;
+}
+
+.chiffres {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(24px, 5vh, 64px);
+}
+
+.libelle {
+  color: var(--texte-doux);
+  font-size: clamp(1rem, 1.6vw, 1.5rem);
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+.valeur {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1;
+  font-size: clamp(2.5rem, 5vw, 5rem);
+}
+
+.valeur-grande {
+  font-size: clamp(6rem, 14vw, 13rem);
+  letter-spacing: -0.03em;
+  margin-top: 0.5rem;
+}
+
+.principal { border-left: 6px solid var(--accent); padding-left: clamp(16px, 2vw, 28px); }
+
+.secondaires {
+  display: grid;
+  gap: clamp(16px, 3vh, 32px);
+  padding-top: clamp(24px, 4vh, 48px);
+  border-top: 1px solid var(--filet);
+}
+
+.secondaires > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.secondaires dd { margin: 0; }
+
+.etat {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--texte-doux);
+  font-size: clamp(0.9rem, 1.1vw, 1.1rem);
+}
+
+.pastille {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.etat[data-etat="en_cours"] .pastille { animation: pulsation 1.6s ease-in-out infinite; }
+.etat[data-etat="termine"] .pastille { background: var(--texte-doux); }
+.etat[data-etat="hors_ligne"] .pastille { background: transparent; border: 2px solid var(--texte-doux); }
+
+@keyframes pulsation { 50% { opacity: 0.25; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .etat .pastille { animation: none !important; }
+}
+
+/* Écran étroit : les nombres passent sous la vidéo. */
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; align-items: start; align-content: start; }
+  .valeur { font-size: clamp(2rem, 9vw, 3.5rem); }
+  .valeur-grande { font-size: clamp(5rem, 24vw, 9rem); }
+  .libelle { font-size: 1rem; }
+}

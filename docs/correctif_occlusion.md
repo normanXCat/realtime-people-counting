@@ -3719,3 +3719,48 @@ compté puisque toute l'image est l'intérieur) et un second fragment de P4
 (14,6 s). Le total 12 n'est juste **que par compensation** (9 + 3 − 0). Les 3
 initiaux sont aussi structurellement faux (salle vide à s0, personnes à la porte
 pendant le warm-up). Relevés : `results/lot4/trace/{inclPROX2_fort_occ4,noline_fort_occ4,noline_rare_occ2}`.
+
+---
+
+# 25. Interface web de démonstration (hors plan, sur instruction du 2026-09-23)
+
+Aucune modification de la logique de comptage, du suivi ni des seuils :
+l'interface lit l'état du pipeline, elle ne le change pas.
+
+## 25.1 Ce qui a été ajouté
+
+- `src/main.py` : options `--web`, `--port` (8000) et `--host` (127.0.0.1 ;
+  la vidéo montre des personnes identifiables, l'exposition réseau exige une
+  option explicite). Le serveur démarre **après** la validation de la ligne
+  (`--line`, fenêtre de calibration, ou `--no-line` / touche N). Il tourne dans
+  un thread démon ; la boucle du pipeline reste dans le thread principal
+  (fenêtre de calibration OpenCV) et y dépose, à chaque image, une copie avec
+  la seule ligne et les quatre compteurs. En fin de vidéo, la dernière image et
+  les valeurs finales restent servies jusqu'à Ctrl+C.
+- `src/web_view.py` : `render_line_only` (rendu dédié : la ligne, rien d'autre ;
+  `draw_overlay` inchangé), `WebState` (objet partagé sous verrou), application
+  Flask : `/` (page), `/video` (MJPEG), `/stats` (SSE, envoi seulement sur
+  changement). Sans image nouvelle, la dernière est renvoyée chaque seconde :
+  sans cela, Chrome n'affiche jamais la dernière partie d'un flux MJPEG.
+- `src/web/` : `index.html`, `style.css`, `app.js`, sans framework ni
+  ressource externe, polices système. Affichés : « Personnes présentes »
+  (`occupancy_confirmed`), « Entrées » (IN), « Sorties » (OUT), « Nouvelles
+  présences » (NEW), et l'état En cours / Terminé. Sans ligne : aucune ligne
+  tracée, Entrées et Sorties à « — ».
+- `requirements.txt` : `flask==3.1.2`.
+
+## 25.2 Relevé de confirmation
+
+`fort_occ4`, ligne de référence, avec et sans `--web` : journaux d'événements
+**identiques** (1 077 événements, même type, frame, personne et piste
+technique), bilan 12 IN / 0 OUT / 0 NEW, occupation confirmée 12 dans les deux
+cas (`results/web/{noweb,web}_fort_occ4`). Le renvoi périodique de la
+dernière image, ajouté après ce relevé, ne touche que le serveur.
+
+## 25.3 Tests
+
+`tests/test_web_view.py` (11) : rendu dédié (seuls les pixels de la ligne
+changent ; image intacte sans ligne), objet partagé (publication, version
+inchangée si les valeurs ne changent pas, IN/OUT à `None` sans ligne, fin),
+routes `/`, `/video`, `/stats` par le client de test Flask, options par
+défaut. Suite : 737 collectés, 1 ignoré, couverture 93,85 %.

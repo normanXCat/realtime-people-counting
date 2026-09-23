@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Comptage de personnes</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="video" aria-label="Vidéo en cours de traitement">
+      <img id="flux" src="/video" alt="Vidéo en cours de traitement, avec la ligne de comptage">
+    </section>
+
+    <aside class="chiffres" aria-live="polite">
+      <p class="etat" id="etat" data-etat="en_cours">
+        <span class="pastille" aria-hidden="true"></span>
+        <span id="etat-texte">En cours</span>
+      </p>
+
+      <div class="principal">
+        <p class="libelle">Personnes présentes</p>
+        <p class="valeur valeur-grande" id="presentes">0</p>
+      </div>
+
+      <dl class="secondaires">
+        <div>
+          <dt class="libelle">Entrées</dt>
+          <dd class="valeur" id="entrees">0</dd>
+        </div>
+        <div>
+          <dt class="libelle">Sorties</dt>
+          <dd class="valeur" id="sorties">0</dd>
+        </div>
+        <div>
+          <dt class="libelle">Nouvelles présences</dt>
+          <dd class="valeur" id="nouvelles">0</dd>
+        </div>
+      </dl>
+    </aside>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

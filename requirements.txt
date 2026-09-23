@@ -23,6 +23,9 @@ pillow==12.3.0
 # absent : repli sur la correction par paires.
 scipy==1.17.1
 
+# --- Interface web de démonstration (--web, lecture seule) -------------
+flask==3.1.2
+
 # --- Configuration et métriques ------------------------------------------
 PyYAML==6.0.3
 
