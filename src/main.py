@@ -159,17 +159,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
     parser.add_argument(
         "--web", action="store_true",
-        help="Interface web de démonstration (lecture seule) : vidéo avec la seule "
-             "ligne virtuelle, et les compteurs Personnes présentes / IN / OUT / NEW. "
-             "Le serveur démarre après la validation de la ligne.",
+        help="Interface web (http://127.0.0.1:PORT/, machine locale uniquement) : "
+             "calibration dans le navigateur si ni --line ni --no-line, puis vidéo "
+             "avec la seule ligne virtuelle et les compteurs Personnes présentes / "
+             "Entrées / Sorties / Nouvelles présences. Aucune fenêtre OpenCV.",
     )
     parser.add_argument("--port", type=int, default=8000, help="Port de l'interface web (défaut : 8000)")
-    parser.add_argument(
-        "--host", default="127.0.0.1",
-        help="Adresse d'écoute de l'interface web (défaut : 127.0.0.1, machine locale "
-             "seulement). La vidéo montre des personnes identifiables : ne l'exposer "
-             "sur le réseau (ex. 0.0.0.0) qu'en connaissance de cause.",
-    )
     parser.add_argument(
         "--trace-per-second", action="store_true",
         help="Outillage de mesure : relevé de l'état du pipeline à la première "
@@ -211,7 +206,8 @@ def apply_cli_overrides(config: PipelineConfig, args: argparse.Namespace) -> Pip
         overrides["output"] = {"session_root": args.output_root}
     if args.write_video:
         overrides["output"] = {**overrides.get("output", {}), "write_video": True}
-    if args.no_show or not display_available():
+    if args.no_show or args.web or not display_available():
+        # --web : aucune fenêtre OpenCV, le navigateur remplace l'affichage.
         overrides["display"] = {"enabled": False}
 
     long_term: dict[str, Any] = {}
@@ -809,20 +805,58 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.line is not None
             else "mode SANS ligne (--no-line) : effectif = warm-up + NEW"
             if args.no_line
+            else "choix du mode et calibration dans le navigateur (--web)"
+            if args.web
             else "choix du mode dans la fenêtre de démarrage "
                  "(O : tracer une ligne — N : compter sans ligne)"
         )
     )
+
+    # Interface web (--web) : démarrée AVANT la sélection de la ligne, pour que
+    # la calibration puisse se faire dans le navigateur. Aucune logique de
+    # comptage n'y est déplacée : le navigateur ne fournit que la ligne (ou le
+    # choix « sans ligne »), validée par la même fonction que la calibration
+    # OpenCV, et lit ensuite l'état publié.
+    web_state = None
+    web_server = None
+    web_calibration = bool(args.web and args.line is None and not args.no_line)
+    if args.web:
+        from web_view import HOST, WebState, render_line_only, start_server
+
+        web_state = WebState()
+        try:
+            web_server = start_server(web_state, args.port)
+        except OSError as error:
+            print(f"[WEB] Démarrage du serveur impossible sur {HOST}:{args.port} : {error}",
+                  file=sys.stderr)
+            logger.close()
+            return 2
+        print(f"[WEB] Interface : http://{HOST}:{args.port}/")
 
     # -- Ligne virtuelle : explicite (--line) ou sélection manuelle ----------
     # Aucun repli n'est possible : sans ligne explicite ni ligne validée par
     # l'opérateur, le comptage ne démarre pas (et le refus est journalisé,
     # jamais silencieux).
     try:
-        validated = perform_line_selection(
-            config, source, headless_requested=args.no_show, line_argument=args.line,
-            no_line=args.no_line,
-        )
+        if web_calibration:
+            web_state.open_calibration(
+                read_first_frame(source),
+                inside_side=config.line.inside_side,
+                min_length_ratio=config.line.min_length_ratio,
+            )
+            print(f"[WEB] En attente de la calibration dans le navigateur : "
+                  f"http://{HOST}:{args.port}/ (Ctrl+C pour quitter)")
+            try:
+                _mode, validated = web_state.wait_calibration()
+            except KeyboardInterrupt:
+                raise CalibrationCancelled(
+                    "Calibration web interrompue (Ctrl+C) : comptage non lancé."
+                ) from None
+        else:
+            validated = perform_line_selection(
+                config, source, headless_requested=args.no_show, line_argument=args.line,
+                no_line=args.no_line,
+            )
     except LineError as error:
         # `--line` mal formé ou refusé par la validation partagée : c'est une
         # erreur d'argument, signalée avant toute ouverture de session de
@@ -845,7 +879,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # La logique IN/OUT/NEW du mode avec ligne n'est pas touchée.
         line = None
         resolved_config_path = write_resolved_config(config, session_root, session_id)
-        line_origin = "no_line_argument" if args.no_line else "operator_no_line_key"
+        line_origin = (
+            "no_line_argument" if args.no_line
+            else "web_no_line" if web_calibration
+            else "operator_no_line_key"
+        )
         calibration_path = session_root / "calibration.json"
         write_json(
             calibration_path,
@@ -866,7 +904,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # comptage. Elle est figée dans la configuration résolue de la session.
         config = override_config(config, {"line": {"inside_side": validated.inside_side}})
         resolved_config_path = write_resolved_config(config, session_root, session_id)
-        line_origin = "argument" if args.line is not None else "operator_clicks"
+        line_origin = (
+            "argument" if args.line is not None
+            else "web" if web_calibration
+            else "operator_clicks"
+        )
         calibration_path = session_root / "calibration.json"
         write_json(
             calibration_path,
@@ -944,23 +986,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     live_timebase_logger = logging.getLogger(__name__)
 
-    # Interface web (--web) : lecture seule. Le serveur tourne dans un thread
-    # démon ; la boucle ci-dessous ne fait qu'y déposer une copie de l'image
-    # avec la seule ligne, et les quatre compteurs affichés.
-    web_state = None
-    web_server = None
-    if args.web:
-        from web_view import WebState, render_line_only, start_server
-
-        web_state = WebState(no_line=line is None)
-        try:
-            web_server = start_server(web_state, args.host, args.port)
-        except OSError as error:
-            print(f"[WEB] Démarrage du serveur impossible sur {args.host}:{args.port} : {error}",
-                  file=sys.stderr)
-            logger.close()
-            return 2
-        print(f"[WEB] Interface : http://{args.host}:{args.port}/")
+    # Vue de démonstration : la boucle ci-dessous ne fait que déposer une copie
+    # de l'image avec la seule ligne, et les quatre compteurs affichés.
+    if web_state is not None:
+        web_state.start_demo(no_line=line is None)
 
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
@@ -1397,7 +1426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # servies jusqu'à l'arrêt explicite (Ctrl+C).
         web_state.finish()
         print("\n[WEB] Traitement terminé ; interface toujours servie sur "
-              f"http://{args.host}:{args.port}/ (Ctrl+C pour quitter)")
+              f"http://{HOST}:{args.port}/ (Ctrl+C pour quitter)")
         try:
             while True:
                 time.sleep(1.0)

@@ -7,12 +7,55 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <main class="layout">
-    <section class="video" aria-label="Vidéo en cours de traitement">
-      <img id="flux" src="/video" alt="Vidéo en cours de traitement, avec la ligne de comptage">
+  <p class="attente" id="vue-attente">Préparation de la source…</p>
+
+  <!-- Vue 1 : calibration (si ni --line ni --no-line) -->
+  <main class="layout" id="vue-calibration" hidden>
+    <section class="scene" aria-label="Première image de la vidéo">
+      <div class="cadre" id="cadre">
+        <img id="image-calibration" alt="Première image de la vidéo, pour tracer la ligne de comptage">
+        <canvas id="trace" aria-hidden="true"></canvas>
+      </div>
     </section>
 
-    <aside class="chiffres" aria-live="polite">
+    <aside class="panneau">
+      <p class="etat" data-etat="calibration"><span class="pastille" aria-hidden="true"></span><span>Calibration</span></p>
+
+      <div id="choix-mode">
+        <h1 class="titre">Mode de comptage</h1>
+        <p class="aide">Une ligne virtuelle compte les entrées et les sorties. Sans ligne,
+          toute l'image est l'intérieur : effectif initial puis nouvelles présences.</p>
+        <div class="actions">
+          <button type="button" class="bouton principal-btn" id="btn-ligne">Tracer une ligne</button>
+          <button type="button" class="bouton" id="btn-sans-ligne">Compter sans ligne</button>
+        </div>
+      </div>
+
+      <div id="outils-ligne" hidden>
+        <h1 class="titre">Ligne de comptage</h1>
+        <p class="aide" id="consigne">Cliquez le premier point de la ligne.</p>
+        <p class="aide discret">La droite prolongée (pointillés) décide du côté : la zone teintée est l'intérieur.</p>
+        <div class="actions">
+          <button type="button" class="bouton" id="btn-inverser" disabled>Inverser le côté</button>
+          <button type="button" class="bouton" id="btn-recommencer">Recommencer</button>
+          <button type="button" class="bouton principal-btn" id="btn-valider" disabled>Valider et lancer</button>
+        </div>
+      </div>
+
+      <p class="message" id="message" role="status" aria-live="polite"></p>
+    </aside>
+  </main>
+
+  <!-- Vue 2 : démonstration -->
+  <main class="layout" id="vue-demo" hidden>
+    <section class="scene" aria-label="Vidéo en cours de traitement">
+      <div class="cadre" id="cadre-flux">
+        <img id="flux" alt="Vidéo en cours de traitement, avec la ligne de comptage">
+        <p class="demarrage" id="demarrage">Démarrage du traitement…</p>
+      </div>
+    </section>
+
+    <aside class="panneau" aria-live="polite">
       <p class="etat" id="etat" data-etat="en_cours">
         <span class="pastille" aria-hidden="true"></span>
         <span id="etat-texte">En cours</span>
@@ -39,6 +82,7 @@
       </dl>
     </aside>
   </main>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

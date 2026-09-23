@@ -1,16 +1,19 @@
-/* Interface de démonstration : palette neutre, un seul accent, polices système. */
+/* Interface : palette neutre, un seul accent, polices système, aucune ressource externe. */
 :root {
   --fond: #0e0f11;
   --surface: #17191c;
+  --surface-haute: #202327;
   --texte: #f5f5f4;
   --texte-doux: #a8a29e;
   --filet: #2a2d31;
   --accent: #ffc800; /* même teinte que la ligne tracée sur la vidéo */
+  --erreur: #ff8a7a;
   --espace: clamp(16px, 3vw, 48px);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
 * { box-sizing: border-box; margin: 0; }
+[hidden] { display: none !important; }
 
 html, body { height: 100%; }
 
@@ -18,6 +21,12 @@ body {
   background: var(--fond);
   color: var(--texte);
   -webkit-font-smoothing: antialiased;
+}
+
+.attente {
+  padding: var(--espace);
+  color: var(--texte-doux);
+  font-size: 1.25rem;
 }
 
 .layout {
@@ -29,27 +38,102 @@ body {
   padding: var(--espace);
 }
 
-.video {
+.cadre {
+  position: relative;
   background: var(--surface);
   border-radius: 8px;
   overflow: hidden;
   line-height: 0;
 }
 
-.video img {
+.cadre img {
   display: block;
   width: 100%;
   height: auto;
-  max-height: calc(100vh - 2 * var(--espace));
-  object-fit: contain;
 }
 
-.chiffres {
+#vue-demo .cadre img { max-height: calc(100vh - 2 * var(--espace)); object-fit: contain; }
+
+/* Avant la première image du flux : cadre aux proportions de la vidéo. */
+#cadre-flux.vide { aspect-ratio: var(--ratio, 16 / 9); }
+#cadre-flux.vide img { display: none; }
+.demarrage {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--texte-doux);
+  font-size: clamp(1rem, 1.4vw, 1.3rem);
+  line-height: 1.4;
+}
+#cadre-flux.vide .demarrage { display: flex; }
+
+#trace {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+.panneau {
   display: flex;
   flex-direction: column;
   gap: clamp(24px, 5vh, 64px);
 }
 
+/* -- Calibration ----------------------------------------------------------- */
+.titre { font-size: clamp(1.5rem, 2.4vw, 2.25rem); font-weight: 700; letter-spacing: -0.01em; }
+
+.aide {
+  margin-top: 12px;
+  color: var(--texte-doux);
+  font-size: clamp(1rem, 1.3vw, 1.2rem);
+  line-height: 1.45;
+}
+
+.aide.discret { font-size: clamp(0.9rem, 1.05vw, 1rem); }
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.bouton {
+  font: inherit;
+  font-size: clamp(1rem, 1.2vw, 1.15rem);
+  font-weight: 600;
+  padding: 14px 22px;
+  border-radius: 8px;
+  border: 1px solid var(--filet);
+  background: var(--surface-haute);
+  color: var(--texte);
+  cursor: pointer;
+}
+
+.bouton:hover:not(:disabled) { border-color: var(--texte-doux); }
+.bouton:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.bouton:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.principal-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111;
+}
+
+.message {
+  min-height: 1.5em;
+  font-size: clamp(1rem, 1.2vw, 1.15rem);
+  line-height: 1.4;
+  color: var(--texte-doux);
+}
+
+.message.erreur { color: var(--erreur); }
+
+/* -- Démonstration ---------------------------------------------------------- */
 .libelle {
   color: var(--texte-doux);
   font-size: clamp(1rem, 1.6vw, 1.5rem);
@@ -113,7 +197,7 @@ body {
   .etat .pastille { animation: none !important; }
 }
 
-/* Écran étroit : les nombres passent sous la vidéo. */
+/* Écran étroit : le panneau passe sous l'image. */
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; align-items: start; align-content: start; }
   .valeur { font-size: clamp(2rem, 9vw, 3.5rem); }

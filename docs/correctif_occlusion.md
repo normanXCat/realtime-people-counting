@@ -3807,3 +3807,71 @@ question avant les séquences existantes, inchangées. Ajouts : réponses O / N 
 `--no-line` sans fenêtre, `--no-show` qui garde la calibration mais n'affiche
 aucune image de traitement. Suite : 744 collectés, 1 ignoré, couverture
 93,92 %.
+
+---
+
+# 27. Interface web avec calibration dans le navigateur (hors plan, sur instruction du 2026-09-23)
+
+Point de départ : `soutenance-finale5` (dernière étiquette ;
+`describe_on_proximity: true`). Aucune modification de la logique de comptage,
+du suivi ni des seuils.
+
+## 27.1 Étapes 1 et 2 : déjà en place
+
+Vérifiées dans le code et par la suite de tests, sans modification : mode sans
+ligne (§24 : `OccupancyManager(no_line=True)`, effectif = warm-up + NEW, jamais
+de IN/OUT), `--line` / `--no-line` qui court-circuitent le choix, question O / N
+de la fenêtre OpenCV et `--no-show` qui garde la calibration (§26, refus code 6
+retiré). Aucun commit pour ces deux étapes.
+
+## 27.2 Étape 3 : interface web
+
+- `--web` (`--port`, 8000) : écoute sur **127.0.0.1 uniquement** (option
+  `--host` retirée). Aucune fenêtre OpenCV : ni calibration, ni traitement.
+- Sans `--line` ni `--no-line`, le serveur démarre **avant** la sélection de la
+  ligne ; la page montre la première image, « Tracer une ligne » / « Compter
+  sans ligne ». Deux clics (un troisième est refusé), droite prolongée en
+  pointillés, côté intérieur teinté (même formule de signe que
+  `geometry.signed_perpendicular_distance`), « Inverser le côté »,
+  « Recommencer », « Valider et lancer ». Coordonnées normalisées ; validation
+  par `geometry.validate_line` (mêmes règles que la fenêtre OpenCV), messages
+  en français. `calibration.json` et `LINE_VALIDATED` / `LINE_DISABLED` écrits
+  comme avant, `line_origin` = `web` / `web_no_line`. Le pipeline attend la
+  validation (`WebState.wait_calibration`) avant la première image.
+- Routes : `/`, `/calibration` (état), `/calibration/image`, `POST
+  /calibration` (JSON exigé), `/video` (MJPEG), `/stats` (SSE, sur changement).
+- Vue de démonstration inchangée sur le fond ; ajout d'un espace réservé
+  « Démarrage du traitement… » tant que la première image n'est pas arrivée.
+- **Défaut corrigé** : sous Windows, Werkzeug (`SO_REUSEADDR`) laisse un second
+  serveur s'attacher silencieusement à un port déjà pris ; le navigateur
+  atteignait alors l'autre instance (constaté pendant la mesure : une ancienne
+  version tournait sur 8000 depuis une autre copie du dépôt). Le port est
+  désormais sondé avant démarrage ; un échec d'attache (SystemExit de
+  Werkzeug) est converti en OSError (sortie code 2, message clair).
+
+## 27.3 Relevés
+
+| | IN / OUT / NEW (initial) | Occupation en fin |
+|---|---|---|
+| `fort_occ4`, ligne de référence, sans `--web` | 12 / 0 / 0 (0) | 12 |
+| `fort_occ4`, ligne de référence, avec `--web` | 12 / 0 / 0 (0) | 12 |
+| `fort_occ4`, sans ligne | 0 / 0 / 9 (3) | 12, juste par compensation (§24) |
+| `rare_occ2`, sans ligne | 0 / 0 / 4 (0) | 4 |
+
+Avec et sans `--web`, journaux d'événements **identiques** à celui de
+`soutenance-finale5` (1 077 événements). Parcours complet de la calibration
+web piloté dans Chrome (protocole DevTools) : troisième clic refusé, inversion,
+validation, passage en démonstration ; la ligne validée dans le navigateur sur
+la porte donne (0,382 ; 0,995) – (0,559 ; 0,549), côté `negative` = la salle.
+Captures : `results/w2/captures/` (non versionnées : personnes identifiables).
+
+## 27.4 Tests
+
+`tests/test_web_view.py` (29) : rendu dédié, objet partagé, calibration web
+(points confondus, ligne trop courte, hors image, point mal formé, mode
+inconnu, normalisation sur la taille réelle, cohérence du côté teinté avec
+`VirtualLine.side` pour les deux orientations, validation unique), routes,
+`--web` sans fenêtre OpenCV ni option d'exposition réseau, `main --web` avec
+calibration navigateur (ligne et sans ligne) et court-circuit par `--line` /
+`--no-line`, sondage du port. Suite : 762 collectés, 1 ignoré, couverture
+94,18 %.
