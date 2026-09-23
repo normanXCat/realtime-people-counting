@@ -3631,3 +3631,44 @@ globalement ; même mapping final, mais deux événements (un par piste, forme
 groupe) au lieu d'un événement de paire. `tests/test_events_schema.py` :
 l'événement minimal inclut la première variante `any_of` ; ajout d'un test de
 la forme groupe. Suite : **715 passés, 1 ignoré**, couverture **93,87 %**.
+
+---
+
+# 23. Déclencheur de proximité réactivé (hors plan, décision du 2026-09-23)
+
+> Mesuré sur un corpus contenant 10 inversions réelles (comptage robuste,
+> `fort_occ4`, ligne de référence). Une seule correction déclenchée : portée
+> très faible.
+
+`external_reid.describe_on_proximity` : false → **true** `PROVISOIRE`, seul
+changement par rapport à `soutenance-finale3`. Décision de la personne
+responsable après la mesure ci-dessous.
+
+## 23.1 `fort_occ4`, ligne de référence
+
+| | `soutenance-finale3` | proximité activée |
+|---|---|---|
+| `IDENTITY_SWAP_CORRECTED` paires / groupe | 0 / 0 | 0 / **2** (un groupe de 3 pistes, t = 17,70 s) |
+| … justes / fausses (vérité terrain, transfert IoU > 0,5) | — | 1 / 1 |
+| Inversions (comptage robuste) | 10 | **8** |
+| `fragments_par_personne` total (13 personnes) | 36 | 34 |
+| IN / OUT / NEW, `operational` en fin (12 attendus) | 12 / 0 / 0, 12 | 12 / 0 / 0, 12 |
+| Étape `reid` p95 | 15,1 ms | 55,8 ms |
+| FPS, 3 rejouages alternés : médiane (min–max) | 4,03 (3,55–4,15) | 3,92 (**2,85**–4,15) |
+
+La correction : entre s17 et s18, le tracker échange les pistes 8 et 9 entre
+P2 et P6. Le pid 1 (P2) revient sur P2 (juste) ; P6 reçoit le pid 7, celui de
+P8, alors non visible (fausse — sans correction, P6 portait déjà l'identité de
+P2). Compteurs identiques sur les trois rejouages de chaque condition. FPS :
+écart entre conditions inférieur au bruit, un rejouage sous le plancher de
+3,06 ips ; non concluant.
+
+## 23.2 Confirmation `rare_occ2` (ligne de convention)
+
+Relevé par seconde **identique** à `soutenance-finale3` : IN / OUT / NEW
+2 / 0 / 2, `operational` 4, 5 identités, 0 `IDENTITY_SWAP_CORRECTED`,
+`visible_count` max 4.
+
+Tests : aucun à ajuster (le défaut de `ExternalReidConfig` valait déjà `true` ;
+le seul test qui fixe l'option la passe explicitement). Relevés :
+`results/lot4/trace/{inclPROX_fort_occ4,prox_rare_occ2}`, `results/lot8/`.
