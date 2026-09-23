@@ -31,7 +31,6 @@ from config import load_config  # noqa: E402
 from geometry import LineError  # noqa: E402
 import main as entry_point  # noqa: E402
 from main import (  # noqa: E402
-    NonInteractiveLineRequired,
     build_argument_parser,
     line_from_argument,
     parse_line_argument,
@@ -116,20 +115,28 @@ def test_la_source_est_lue_avant_de_construire_la_ligne(config, monkeypatch):
 # ---------------------------------------------------------------------------
 # 2. Mode non interactif
 # ---------------------------------------------------------------------------
-def test_sans_ligne_le_mode_non_interactif_refuse(config):
-    with pytest.raises(NonInteractiveLineRequired) as error:
-        perform_line_selection(config, "clip.mp4", headless_requested=True)
-    assert "--line" in str(error.value)
+def test_no_show_sans_ligne_ouvre_la_fenetre_de_demarrage(config, monkeypatch):
+    """`--no-show` sans `--line` ni `--no-line` : la fenêtre de démarrage s'ouvre.
 
-
-def test_le_refus_reste_une_calibration_indisponible(config):
-    """La nouvelle exception s'insère dans la hiérarchie existante.
-
-    Tout code qui rattrapait `CalibrationUnavailable` continue de fonctionner :
-    le lot n'introduit pas un chemin d'erreur parallèle.
+    Attente **modifiée le 2026-09-23** (docs/correctif_occlusion.md §26) : le
+    refus du lot 0 (code 6) est retiré. `--no-show` ne supprime plus que la
+    fenêtre de traitement ; la ligne n'est toujours jamais devinée.
     """
-    with pytest.raises(CalibrationUnavailable):
+    appels: list = []
+    monkeypatch.setattr(entry_point, "display_available", lambda: True)
+    monkeypatch.setattr(
+        entry_point, "select_line", lambda source, **kw: appels.append(source) or "ligne"
+    )
+    assert perform_line_selection(config, "clip.mp4", headless_requested=True) == "ligne"
+    assert appels == ["clip.mp4"]
+
+
+def test_sans_affichage_le_refus_reste_une_calibration_indisponible(config, monkeypatch):
+    """Sans interface graphique, le refus reste explicite et pointe --line / --no-line."""
+    monkeypatch.setattr(entry_point, "display_available", lambda: False)
+    with pytest.raises(CalibrationUnavailable) as error:
         perform_line_selection(config, "clip.mp4", headless_requested=True)
+    assert "--line" in str(error.value) and "--no-line" in str(error.value)
 
 
 def test_avec_ligne_la_selection_manuelle_n_est_pas_sollicitee(

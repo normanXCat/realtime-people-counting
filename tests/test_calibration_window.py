@@ -24,8 +24,13 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import calibration  # noqa: E402
 import cv2  # noqa: E402
 from calibration import (  # noqa: E402
+    MODE_CANCEL,
+    MODE_LINE,
+    MODE_NO_LINE,
+    MODE_QUESTION,
     CalibrationCancelled,
     CalibrationUnavailable,
+    mode_for_key,
     sanitize_window_name,
     select_line,
 )
@@ -35,6 +40,8 @@ KEY_CONFIRM = ord("c")
 KEY_RESET = ord("g")
 KEY_INVERT = ord("i")
 KEY_ESCAPE = 27
+KEY_MODE_LINE = ord("o")
+KEY_MODE_NO_LINE = ord("n")
 
 
 class FakeWindow:
@@ -94,7 +101,17 @@ class FakeWindow:
 
 @pytest.fixture
 def fake_window(monkeypatch):
-    def _install(sequence, visible: bool = True, frame: np.ndarray | None = None) -> FakeWindow:
+    def _install(
+        sequence,
+        visible: bool = True,
+        frame: np.ndarray | None = None,
+        answer: int | None = KEY_MODE_LINE,
+    ) -> FakeWindow:
+        # La fenêtre s'ouvre désormais sur la question de démarrage (§26) :
+        # ``answer`` y répond d'abord (« O » par défaut, calibration inchangée
+        # ensuite) ; ``None`` laisse la séquence répondre elle-même.
+        if answer is not None:
+            sequence = [([], answer), *sequence]
         window = FakeWindow(sequence, visible=visible)
         monkeypatch.setattr(calibration, "display_available", lambda: True)
         monkeypatch.setattr(calibration, "read_first_frame", lambda source: (frame if frame is not None else FRAME).copy())
@@ -301,3 +318,49 @@ def test_premiere_image_illisible_signalee_comme_source(monkeypatch):
 
     with pytest.raises(calibration.SourceUnreadable):
         select_line("chemin/inexistant.mp4")
+
+
+# ---------------------------------------------------------------------------
+# Question de démarrage : « O » ligne, « N » sans ligne (§26)
+# ---------------------------------------------------------------------------
+def test_reponses_a_la_question_de_demarrage():
+    assert mode_for_key(ord("o")) == mode_for_key(ord("O")) == MODE_LINE
+    assert mode_for_key(ord("n")) == mode_for_key(ord("N")) == MODE_NO_LINE
+    assert mode_for_key(KEY_ESCAPE) == MODE_CANCEL
+    assert mode_for_key(ord("c")) is None and mode_for_key(-1 & 0xFF) is None
+    assert "O : tracer une ligne virtuelle" in MODE_QUESTION
+    assert "N : compter sans ligne" in MODE_QUESTION
+
+
+def test_n_a_la_question_choisit_le_mode_sans_ligne(fake_window):
+    fake_window([([], KEY_MODE_NO_LINE)], answer=None)
+    assert select_line("clip.mp4") is None
+
+
+def test_la_question_est_affichee_avant_la_calibration(fake_window):
+    """La première image affichée porte la question, pas l'aide de calibration."""
+    window = fake_window([([(100, 300), (500, 300)], KEY_CONFIRM)])
+    select_line("clip.mp4")
+    question, calibration_view = window.rendered[0], window.rendered[-1]
+    assert not np.array_equal(question, calibration_view)
+    # Bandeau sombre au centre de l'image pendant la question.
+    assert question[300, 5].mean() < FRAME[300, 5].mean()
+
+
+def test_les_clics_sont_ignores_tant_que_le_mode_n_est_pas_choisi(fake_window):
+    fake_window(
+        [
+            ([(10, 10), (590, 10)], ord("x")),       # clics avant « O » : ignorés
+            ([], KEY_MODE_LINE),
+            ([(100, 300), (500, 300)], KEY_CONFIRM),
+        ],
+        answer=None,
+    )
+    line = select_line("clip.mp4")
+    assert line.clicks_px == ((100, 300), (500, 300))
+
+
+def test_echap_a_la_question_quitte_sans_compter(fake_window):
+    fake_window([([], KEY_ESCAPE)], answer=None)
+    with pytest.raises(CalibrationCancelled):
+        select_line("clip.mp4")

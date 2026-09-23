@@ -45,6 +45,16 @@ KEY_RESET = (ord("g"), ord("G"))
 KEY_INVERT = (ord("i"), ord("I"))
 #: Démarrage explicite SANS ligne (vidéo sans porte) : effectif = warm-up + NEW.
 KEY_NO_LINE = (ord("n"), ord("N"))
+#: Réponse « O » à la question de démarrage : tracer une ligne virtuelle.
+KEY_MODE_LINE = (ord("o"), ord("O"))
+
+#: Question posée à l'ouverture de la fenêtre, avant tout clic.
+MODE_QUESTION = "O : tracer une ligne virtuelle  —  N : compter sans ligne"
+
+#: Issues de la question de démarrage (voir :func:`mode_for_key`).
+MODE_LINE = "ligne"
+MODE_NO_LINE = "sans_ligne"
+MODE_CANCEL = "annuler"
 KEY_CANCEL = 27  # Échap
 
 #: Durée d'attente entre deux itérations de la boucle d'événements (ms).
@@ -405,6 +415,39 @@ class LineSelection:
             y += 26
 
 
+def mode_for_key(key: int) -> str | None:
+    """Réponse à la question de démarrage : « O », « N », Échap, ou ``None`` (attente)."""
+    if key in KEY_MODE_LINE:
+        return MODE_LINE
+    if key in KEY_NO_LINE:
+        return MODE_NO_LINE
+    if key == KEY_CANCEL:
+        return MODE_CANCEL
+    return None
+
+
+def draw_mode_question(canvas: Any) -> Any:
+    """Affiche la question de démarrage sur la première image, puis retourne l'image."""
+    height, width = canvas.shape[:2]
+    overlay = canvas.copy()
+    top = max(0, height // 2 - 70)
+    cv2.rectangle(overlay, (0, top), (width, min(height, top + 140)), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0, canvas)
+    lines = (
+        ("Mode de comptage ?", 0.7, (200, 200, 200)),
+        (MODE_QUESTION, 0.9, (255, 255, 255)),
+        ("Echap : quitter", 0.6, (200, 200, 200)),
+    )
+    y = top + 35
+    for text, scale, colour in lines:
+        safe_text = _clean_ascii(text)
+        (text_width, _), _ = cv2.getTextSize(safe_text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        x = max(10, (width - text_width) // 2)
+        cv2.putText(canvas, safe_text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, colour, 2, cv2.LINE_AA)
+        y += 45
+    return canvas
+
+
 def read_first_frame(source: int | str) -> Any:
     """Lit la **première** image de la source (exigence 1 de la sélection).
 
@@ -437,7 +480,8 @@ def select_line(
     Returns:
         La :class:`ValidatedLine` sélectionnée, seule ligne utilisée ensuite par
         le pipeline (dessin, distance signée, franchissements, comptage) ; ou
-        ``None`` si l'opérateur choisit explicitement le mode sans ligne (« N »).
+        ``None`` si l'opérateur choisit explicitement le mode sans ligne (« N »),
+        à la question de démarrage ou pendant le tracé.
 
     Raises:
         SourceUnreadable: première image illisible.
@@ -479,9 +523,17 @@ def select_line(
         min_length_ratio=min_length_ratio,
     )
     selection.set_message("Cliquer l'extremite 1 de la ligne.", error=False)
+    #: Question de démarrage (« O » ligne / « N » sans ligne) posée avant tout
+    #: clic ; la calibration elle-même est ensuite inchangée.
+    choosing_mode = True
+
+    def render() -> Any:
+        if choosing_mode:
+            return draw_mode_question(canvas.copy())
+        return selection.draw(canvas.copy())
 
     def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
-        if event == cv2.EVENT_LBUTTONDOWN:
+        if event == cv2.EVENT_LBUTTONDOWN and not choosing_mode:
             selection.click(x, y)
 
     try:
@@ -491,7 +543,7 @@ def select_line(
         # qu'au premier rendu réel : installer le callback souris avant ce
         # premier rendu échoue en « NULL window handler », ce qui rendait toute
         # calibration impossible. On force donc un affichage avant le callback.
-        cv2.imshow(window_name, selection.draw(canvas.copy()))
+        cv2.imshow(window_name, render())
         cv2.waitKey(1)
         cv2.setMouseCallback(window_name, on_mouse)
     except cv2.error as error:  # plateforme graphique indisponible en pratique
@@ -502,9 +554,19 @@ def select_line(
 
     try:
         while True:
-            cv2.imshow(window_name, selection.draw(canvas.copy()))
+            cv2.imshow(window_name, render())
             key = cv2.waitKey(POLL_INTERVAL_MS) & 0xFF
-            if key in KEY_CONFIRM:
+            if choosing_mode:
+                mode = mode_for_key(key)
+                if mode == MODE_LINE:
+                    choosing_mode = False
+                elif mode == MODE_NO_LINE:
+                    return None
+                elif mode == MODE_CANCEL:
+                    raise CalibrationCancelled(
+                        "Choix du mode annulé par l'opérateur (Échap) : comptage non lancé."
+                    )
+            elif key in KEY_CONFIRM:
                 try:
                     return selection.confirm()
                 except LineError as error:

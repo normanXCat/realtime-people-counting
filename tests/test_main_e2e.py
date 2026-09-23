@@ -288,14 +288,16 @@ def test_annulation_par_l_operateur_ne_lance_aucun_comptage(tmp_path: Path, monk
     assert summary["counters"] is None
 
 
-def test_no_show_sans_ligne_refuse_de_demarrer(tmp_path: Path, monkeypatch, capsys):
-    """`--no-show` sans `--line` : erreur claire, aucun comptage.
+def test_no_show_sans_ligne_et_sans_affichage_refuse_de_demarrer(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """`--no-show` sans `--line` ni `--no-line`, sans écran : refus clair, aucun comptage.
 
-    Attente **ajustée par le lot 0** (`docs/lot_0_outillage.md` §0.1). Avant, le
-    refus venait de l'absence d'interface graphique et sortait en code 4. Le
-    mode non interactif exige désormais `--line`, et ce refus-là porte un code
-    dédié (6) pour ne pas être confondu avec « aucun écran disponible » : les
-    deux situations se corrigent différemment.
+    Attente **modifiée le 2026-09-23** (docs/correctif_occlusion.md §26). Le
+    lot 0 refusait `--no-show` sans `--line` même avec un écran (code 6).
+    `--no-show` garde désormais la fenêtre de démarrage : seul l'absence
+    d'affichage empêche encore de choisir le mode, et ce refus-là sort en
+    code 4 (calibration indisponible) en pointant `--line` / `--no-line`.
 
     Ce qui est garanti reste identique : aucun comptage, aucune ligne devinée,
     aucun `calibration.json`, et un refus journalisé.
@@ -314,14 +316,34 @@ def test_no_show_sans_ligne_refuse_de_demarrer(tmp_path: Path, monkeypatch, caps
         ]
     )
 
-    assert code == 6
+    assert code == 4
     root = tmp_path / "results" / "session-headless"
     types = [event["type"] for event in read_events(root / "events.jsonl")]
     assert types == ["SESSION_START", "LINE_CALIBRATION_UNAVAILABLE", "SESSION_END"]
     assert not (root / "calibration.json").exists()
     stderr = capsys.readouterr().err
-    assert "--line" in stderr
-    assert "non interactif" in stderr
+    assert "--line" in stderr and "--no-line" in stderr
+
+
+def test_no_show_garde_la_calibration_mais_pas_la_fenetre_de_traitement(
+    tmp_path: Path, monkeypatch
+):
+    """`--no-show` sans `--line` : la fenêtre de démarrage s'ouvre, puis le
+    traitement tourne sans aucune fenêtre vidéo (§26)."""
+    line = validated_line(p1=(0.25, 0.40), p2=(0.75, 0.40))
+    ouvertures: list = []
+    shown = capture_display(monkeypatch)
+    monkeypatch.setattr(
+        entry_point, "select_line", lambda source, **kw: ouvertures.append(source) or line
+    )
+
+    code = run_main(tmp_path, monkeypatch)
+
+    assert code == 0
+    assert ouvertures == ["clip.mp4"], "la fenêtre de démarrage doit s'ouvrir"
+    assert shown == [], "aucune image de traitement ne doit être affichée"
+    types = [event["type"] for event in read_events(session_dir(tmp_path) / "events.jsonl")]
+    assert "LINE_VALIDATED" in types
 
 
 def test_sans_affichage_refuse_de_demarrer(tmp_path: Path, monkeypatch):

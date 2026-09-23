@@ -37,6 +37,7 @@ au moment de traiter le lot concerné.
 | Déclencheur de proximité réactivé (**hors plan**, sur décision) | `docs/correctif_occlusion.md` §23 | **appliqué** le 2026-09-23 : `describe_on_proximity` false → **true** `PROVISOIRE`. `fort_occ4` (ligne de référence) : inversions 10 → **8**, operational 12 contre 12, aucun NEW/OUT parasite. **Réserve** : une seule correction (groupe de 3, 1 juste / 1 fausse) ; FPS bruité (un rejouage à 2,85 ips). `rare_occ2` identique | voir `git log` | 2026-09-23 |
 | Mode sans ligne (**hors plan**, sur instruction) | `docs/correctif_occlusion.md` §24 | **réintégré** le 2026-09-23 : `--no-line` ou touche N, effectif = warm-up + NEW, jamais IN/OUT ; mode avec ligne inchangé (relevé `fort_occ4` identique). `fort_occ4` sans ligne : 3 initial + 9 NEW = 12, **juste par compensation** (P9, P11, P12 manqués ; P13 ×2 et un fragment de P4 en trop). `rare_occ2` : 4 NEW. Étiquette `soutenance-finale4` | voir `git log` | 2026-09-23 |
 | Interface web de démonstration (**hors plan**, sur instruction) | `docs/correctif_occlusion.md` §25 | **ajoutée** le 2026-09-23 : `--web` (`--port` 8000, `--host` 127.0.0.1), lecture seule : vidéo avec la seule ligne, Personnes présentes / Entrées / Sorties / Nouvelles présences. Aucune logique de comptage, de suivi ni de seuil modifiée ; `fort_occ4` : journal d'événements identique avec et sans `--web`. Étiquette `soutenance-web` | voir `git log` | 2026-09-23 |
+| Choix du mode au démarrage (**hors plan**, sur instruction) | `docs/correctif_occlusion.md` §26 | **appliqué** le 2026-09-23 : question « O : tracer une ligne — N : compter sans ligne » à l'ouverture ; `--line` / `--no-line` la court-circuitent ; `--no-show` ne masque plus que la fenêtre de traitement (refus code 6 du lot 0 retiré). Comptage inchangé : `fort_occ4` ligne de référence identique à `soutenance-web`. Étiquette `soutenance-finale5` | voir `git log` | 2026-09-23 |
 | Lot 2 — rétention hors zone (+ bord du cadre) | `docs/lot_2_retention.md` | à faire | — | — |
 | Lot 3 — ReID OSNet + galerie | `docs/lot_3_reid_osnet.md` | **3.a appliqué** le 2026-09-21, avancé avant le lot 2 sur instruction (`docs/correctif_occlusion.md` §16-§17) : OSNet-x0.25 ONNX FP32, calcul à la demande + déclencheur de proximité, `similarity_threshold` 0,66 `PROVISOIRE` ; marges mesurées et **inchangées** (0,10 / 0,12) ; déclencheur de proximité **désactivé** (0 inversion corrigée). Correspondance complète **validée** : inversions réelles 14 → 13, toutes au niveau de la piste technique (§17.8) ; `id_switches_reels` loin de la cible ≤ 1. **3.b reportée en perspective** (gel du code) | `107643d`, puis §17.8 | 2026-09-21 |
 | Lot 5 — retouches locales | `docs/lot_5_retouches.md` | à faire | — | — |
@@ -136,8 +137,8 @@ zone ou un franchissement.
   ```
 
   `--source` est obligatoire pour un fichier (`source.default` vaut `"0"`,
-  l'index caméra). **Cette commande exige un opérateur** : la ligne virtuelle se
-  définit par deux clics puis « C », sans aucun repli automatique — voir
+  l'index caméra). **Cette commande exige un opérateur** : question O / N, puis
+  la ligne virtuelle se définit par deux clics puis « C », sans aucun repli automatique — voir
   `docs/correctif_occlusion.md` §11.1 et §11.1.1. Elle ne peut donc pas servir à
   une mesure automatisée. Depuis le lot 0, `--line` lève ce blocage (§13.2.1).
 - **Ligne de mesure — FIGÉE pour tout le plan (lots 1 à 7).** Celle du lot 0,

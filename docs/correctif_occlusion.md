@@ -3764,3 +3764,46 @@ changent ; image intacte sans ligne), objet partagé (publication, version
 inchangée si les valeurs ne changent pas, IN/OUT à `None` sans ligne, fin),
 routes `/`, `/video`, `/stats` par le client de test Flask, options par
 défaut. Suite : 737 collectés, 1 ignoré, couverture 93,85 %.
+
+---
+
+# 26. Choix du mode au démarrage et sens de `--no-show` (hors plan, sur instruction du 2026-09-23)
+
+Point de départ : `soutenance-web` (dernière étiquette, contient
+`soutenance-finale4` ; `describe_on_proximity: true`). Aucune modification de
+la logique de comptage : le mode sans ligne (§24) est réutilisé tel quel.
+
+## 26.1 Changements
+
+- `src/calibration.py` : la fenêtre s'ouvre sur la question « O : tracer une
+  ligne virtuelle — N : compter sans ligne » (Échap : quitter). Les clics sont
+  ignorés tant que le mode n'est pas choisi. « O » mène à la calibration
+  inchangée (clics, C, G, I, Échap, et N toujours disponible) ; « N » renvoie
+  le mode sans ligne.
+- `src/main.py` : `--line` et `--no-line` court-circuitent la question (aucune
+  fenêtre). `--no-show` ne supprime plus que la fenêtre de traitement : sans
+  `--line` ni `--no-line`, la fenêtre de démarrage s'ouvre. Refus du lot 0
+  (`NonInteractiveLineRequired`, code 6) **retiré**. Sans affichage graphique,
+  le refus reste explicite (code 4) et indique `--line` / `--no-line`.
+  `scripts/measure_corpus.py` passe toujours `--line` : mesures inchangées.
+
+## 26.2 Relevés
+
+| | IN / OUT / NEW (initial) | Occupation confirmée en fin |
+|---|---|---|
+| `fort_occ4`, ligne de référence | 12 / 0 / 0 (0) | 12 — journal d'événements identique à `soutenance-web` (1 077 événements) |
+| `fort_occ4`, sans ligne | 0 / 0 / 9 (3) | 12 — identique au §24, juste par compensation |
+| `rare_occ2`, sans ligne | 0 / 0 / 4 (0) | 4 — identique au §24 |
+
+## 26.3 Tests
+
+Attentes **modifiées** (le comportement demandé change, la garantie « aucune
+ligne devinée » est conservée) : `test_main_units.py` (2), `test_main_e2e.py`
+(refus sans écran : code 6 → 4), `test_line_argument.py` (2),
+`test_no_line_mode.py` (1) — `--no-show` sans ligne ouvre désormais la fenêtre
+de démarrage. `test_calibration_window.py` : la fixture répond « O » à la
+question avant les séquences existantes, inchangées. Ajouts : réponses O / N /
+Échap, question affichée avant la calibration, clics ignorés avant le choix,
+`--no-line` sans fenêtre, `--no-show` qui garde la calibration mais n'affiche
+aucune image de traitement. Suite : 744 collectés, 1 ignoré, couverture
+93,92 %.

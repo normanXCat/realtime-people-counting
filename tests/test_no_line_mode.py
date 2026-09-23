@@ -12,7 +12,8 @@ from calibration import KEY_NO_LINE, LineSelection
 from conftest import TEST_FPS, StubAppearance, identity_vectors_by_x, person_box
 from geometry import LineError
 from identity_manager import IdentityManager
-from main import NonInteractiveLineRequired, build_argument_parser, perform_line_selection
+import main as entry_point
+from main import build_argument_parser, perform_line_selection
 from occupancy_manager import Detection, OccupancyManager
 
 # Positions qui, avec la ligne de test horizontale à y = 300, seraient
@@ -93,10 +94,12 @@ def test_selection_sans_ligne_explicite(test_config):
     )
 
 
-def test_no_show_sans_line_reste_refuse_sans_no_line(test_config):
-    with pytest.raises(NonInteractiveLineRequired) as error:
-        perform_line_selection(test_config, "clip.mp4", headless_requested=True)
-    assert "--no-line" in str(error.value)
+def test_no_show_sans_line_ouvre_la_question_de_demarrage(test_config, monkeypatch):
+    """Attente **modifiée le 2026-09-23** (§26) : plus de refus (code 6), la
+    fenêtre de démarrage s'ouvre ; « N » y choisit le mode sans ligne."""
+    monkeypatch.setattr(entry_point, "display_available", lambda: True)
+    monkeypatch.setattr(entry_point, "select_line", lambda source, **kw: None)
+    assert perform_line_selection(test_config, "clip.mp4", headless_requested=True) is None
 
 
 def test_line_et_no_line_incompatibles(test_config):
@@ -124,3 +127,17 @@ def test_touche_n_indiquee_dans_la_fenetre(monkeypatch):
     )
     selection._draw_help(None, 640, 480)
     assert any(text.startswith("N : demarrer SANS ligne") for text in written)
+
+
+def test_no_line_court_circuite_la_fenetre_de_demarrage(test_config, monkeypatch):
+    """`--no-line` : aucune fenêtre, avec ou sans `--no-show` (§26)."""
+    appels: list = []
+    monkeypatch.setattr(entry_point, "select_line", lambda source, **kw: appels.append(source))
+    for headless in (False, True):
+        assert (
+            perform_line_selection(
+                test_config, "clip.mp4", headless_requested=headless, no_line=True
+            )
+            is None
+        )
+    assert appels == []

@@ -136,8 +136,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-show", action="store_true",
-        help="Mode headless : aucune prévisualisation pendant le traitement "
-             "(sans --line, la sélection manuelle de la ligne reste obligatoire)",
+        help="Aucune fenêtre de traitement vidéo. Sans --line ni --no-line, la "
+             "fenêtre de démarrage s'ouvre quand même (question O / N, puis "
+             "tracé de la ligne) : seul le choix du mode l'évite.",
     )
     parser.add_argument(
         "--line",
@@ -152,8 +153,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--no-line", action="store_true",
         help="Mode SANS ligne, choisi explicitement (vidéo sans porte) : toute "
              "l'image est l'intérieur, effectif = warm-up + NEW, jamais de IN ni "
-             "de OUT. Seul moyen d'utiliser --no-show sans --line. Équivalent de "
-             "la touche « N » dans la fenêtre de sélection.",
+             "de OUT. Court-circuite la question de démarrage (sans fenêtre). "
+             "Équivalent de la touche « N » dans la fenêtre de sélection.",
     )
     parser.add_argument("--write-video", action="store_true", help="Écrire la vidéo annotée")
     parser.add_argument(
@@ -452,10 +453,10 @@ def calibrate(
 
     if is_headless and not display_available():
         raise CalibrationUnavailable(
-            "Calibration manuelle impossible : --no-show a été demandé et aucune "
-            "interface graphique n'est disponible, la première image ne peut donc "
-            "pas être affichée. La ligne virtuelle doit être définie à la main "
-            "(deux clics puis « C ») : le comptage n'est pas lancé."
+            "Fenêtre de démarrage impossible : aucune interface graphique n'est "
+            "disponible, la première image ne peut donc pas être affichée. "
+            "Choisir le mode en ligne de commande : « --line x1,y1,x2,y2 » ou "
+            "« --no-line ». Le comptage n'est pas lancé."
         )
 
     return select_line(
@@ -464,17 +465,6 @@ def calibrate(
         min_length_ratio=min_ratio,
         window_name=w_name,
     )
-
-
-class NonInteractiveLineRequired(CalibrationUnavailable):
-    """Mode non interactif demandé sans ligne explicite.
-
-    Sous-classe de :class:`CalibrationUnavailable` — c'est bien une calibration
-    impossible — mais **distincte**, pour porter son propre code de sortie : le
-    diagnostic « il manque ``--line`` » n'est pas le diagnostic « aucune
-    interface graphique disponible », et les confondre ferait chercher au mauvais
-    endroit.
-    """
 
 
 def parse_line_argument(raw: str) -> tuple[Point, Point]:
@@ -552,13 +542,14 @@ def perform_line_selection(
 
     Trois cas, sans aucun repli automatique :
 
-    1. ``--line`` fourni : la ligne est explicite, validée, tracée. Le mode
-       interactif n'est pas sollicité.
-    2. ``--line`` absent et mode interactif : comportement historique, inchangé
-       (deux clics puis « C »).
-    3. ``--line`` absent et ``--no-show`` : refus immédiat. Deviner une ligne
-       serait une erreur silencieuse, et c'est précisément ce que le dépôt a
-       supprimé.
+    1. ``--line`` fourni : la ligne est explicite, validée, tracée. Aucune
+       fenêtre.
+    2. ``--no-line`` fourni : mode sans ligne, aucune fenêtre.
+    3. Ni l'un ni l'autre, avec ou sans ``--no-show`` : la fenêtre de démarrage
+       s'ouvre (question « O » / « N », puis tracé inchangé). ``--no-show`` ne
+       supprime que la fenêtre de traitement ; le refus du lot 0 (code 6) est
+       retiré, la calibration restant possible. Sans affichage graphique, le
+       refus reste explicite (``CalibrationUnavailable``, code 4).
     """
     if line_argument is not None and no_line:
         raise LineError("--line et --no-line sont incompatibles : choisir un seul mode.")
@@ -566,15 +557,6 @@ def perform_line_selection(
         return None
     if line_argument is not None:
         return line_from_argument(config, source, line_argument)
-    if headless_requested:
-        raise NonInteractiveLineRequired(
-            "Mode non interactif : --line est obligatoire. La ligne virtuelle "
-            "ne peut pas être devinée (aucun repli automatique n'existe), et "
-            "--no-show empêche de la définir par clics. Fournir "
-            "« --line x1,y1,x2,y2 » en coordonnées normalisées, « --no-line » "
-            "pour un comptage sans ligne (warm-up + NEW), ou retirer "
-            "--no-show pour la sélectionner à la main."
-        )
     return calibrate(
         config,
         source,
@@ -584,12 +566,11 @@ def perform_line_selection(
 
 
 #: Type d'événement et code de sortie par cause d'échec de sélection.
-#: L'ordre compte : la première entrée dont le type correspond gagne, donc la
-#: sous-classe `NonInteractiveLineRequired` précède `CalibrationUnavailable`
-#: dont elle hérite — sinon son code dédié serait absorbé par le code 4.
+#: L'ordre compte : la première entrée dont le type correspond gagne. Le code 6
+#: (« --no-show sans --line », lot 0) est retiré : --no-show garde la fenêtre de
+#: démarrage.
 _LINE_FAILURES: tuple[tuple[type[BaseException], str, int], ...] = (
     (SourceUnreadable, "SOURCE_ERROR", 5),
-    (NonInteractiveLineRequired, "LINE_CALIBRATION_UNAVAILABLE", 6),
     (CalibrationUnavailable, "LINE_CALIBRATION_UNAVAILABLE", 4),
     (CalibrationCancelled, "LINE_CALIBRATION_CANCELLED", 4),
 )
@@ -828,8 +809,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.line is not None
             else "mode SANS ligne (--no-line) : effectif = warm-up + NEW"
             if args.no_line
-            else "définition manuelle de la ligne virtuelle "
-                 "(la première image va s'afficher)"
+            else "choix du mode dans la fenêtre de démarrage "
+                 "(O : tracer une ligne — N : compter sans ligne)"
         )
     )
 
