@@ -417,6 +417,13 @@ class IdentityManager:
         self.technical_id_changes = 0
         self.appearance_discontinuities = 0
         self.swap_corrections_applied = 0
+        self.technical_id_repurposed = 0
+        self.provisional_identities_merged = 0
+        #: Suivi des observations cohérentes consécutives d'identités provisoires :
+        #: ``provisional_person_id -> (target_person_id, streak_count)``
+        self._provisional_tracking: dict[int, tuple[int, int]] = {}
+        #: Fusions réalisées sur la frame courante : ``[(provisional_id, target_id), ...]``
+        self.last_merges: list[tuple[int, int]] = []
         #: Observations non trackées rattachées à une identité de galerie par le
         #: chemin de secours (``REID_GALLERY_RESCUE``). Compteur séparé des
         #: ``REID_MATCH`` : c'est la mesure d'impact du mécanisme, et le critère
@@ -878,6 +885,7 @@ class IdentityManager:
         et qui rend le filtre spatio-temporel utilisable dès la frame suivante.
         """
         self._claimed = set()
+        self.last_merges = []
         self._prune_track_appearance(frame_index)
 
         # Snapshot des identités « en sortie de fusion » : arrêté AVANT toute
@@ -924,6 +932,47 @@ class IdentityManager:
         if known_person is not None and known_person in self.records:
             record = self.records[known_person]
             if record.person_id in self._claimed:
+                # Avant de traiter une collision comme duplicate_claim, vérifier si l'observation
+                # entrante est géométriquement incohérente avec la dernière position connue du
+                # record actuellement verrouillé sur ce technical_id.
+                distance = _distance(observation.anchor, record.anchor)
+                reference_height = (
+                    record.bbox_height if record.bbox_height > 0 else observation.bbox_height
+                )
+                elapsed = max(0.0, float(timestamp_s - record.last_seen_s))
+                allowance_window = self.grace_period_seconds + self.purge_retention_seconds
+                allowed = (
+                    self.long_term.v_max_ratio * reference_height * min(elapsed, allowance_window)
+                    + self.long_term.spatial_margin_ratio * reference_height
+                )
+                if distance > allowed:
+                    # BoT-SORT a réutilisé l'ID technique pour une tout autre personne :
+                    # libérer l'ancien mapping technical_to_person[technical_id] vers l'identité
+                    # qui n'est plus plausible.
+                    repurposed_from_person = known_person
+                    del self.technical_to_person[technical_id]
+                    record.aliases.discard(technical_id)
+                    if record.technical_track_id == technical_id:
+                        record.technical_track_id = next(iter(record.aliases)) if record.aliases else -1
+
+                    # Laisser l'observation courante suivre le chemin normal de création/réassociation
+                    assignment = self._reid_associate_or_create(
+                        observation, feature, timestamp_s, frame_index, frame
+                    )
+                    self.technical_id_repurposed += 1
+                    self._emit(
+                        "TECHNICAL_ID_REPURPOSED",
+                        timestamp_s,
+                        frame_index,
+                        technical_track_id=technical_id,
+                        previous_person_id=repurposed_from_person,
+                        new_person_id=assignment.person_id,
+                        distance=round(float(distance), 2),
+                        allowed_distance=round(float(allowed), 2),
+                        reason="tracker_reused_technical_track_id",
+                    )
+                    return assignment
+
                 # Spec 4.5 : deux pistes ne peuvent pas viser la même identité.
                 self._inconsistent(
                     "duplicate_person_claim",
@@ -940,20 +989,36 @@ class IdentityManager:
                     frame=frame,
                 )
             self._touch(record, observation, feature, timestamp_s, frame_index, frame)
+            merged_target = self._maybe_merge_provisional(
+                record, observation, feature, timestamp_s, frame_index
+            )
+            person_id_assigned = merged_target if merged_target is not None else record.person_id
             return Assignment(
                 technical_track_id=technical_id,
-                person_id=record.person_id,
+                person_id=person_id_assigned,
                 bbox=observation.bbox,
                 confidence=observation.confidence,
                 anchor=observation.anchor,
                 bbox_height=observation.bbox_height,
-                provisional=record.provisional,
-                reason="technical_track_locked",
+                provisional=False if merged_target is not None else record.provisional,
+                reason="provisional_identity_merged" if merged_target is not None else "technical_track_locked",
                 anchor_reliable=observation.anchor_reliable,
                 head_point=observation.head_point,
                 head_confidence=observation.head_confidence,
             )
 
+        return self._reid_associate_or_create(
+            observation, feature, timestamp_s, frame_index, frame
+        )
+
+    def _reid_associate_or_create(
+        self,
+        observation: Observation,
+        feature: np.ndarray | None,
+        timestamp_s: float,
+        frame_index: int,
+        frame: np.ndarray | None,
+    ) -> Assignment:
         if not self.long_term.enabled:
             return self._create_new(
                 observation, feature, timestamp_s, frame_index,
@@ -1055,6 +1120,160 @@ class IdentityManager:
             threshold_applied=threshold,
             absence_s=absence_s,
             strict_reappearance=strict_reappearance,
+        )
+
+    def _evaluate_provisional_match(
+        self,
+        observation: Observation,
+        feature: np.ndarray | None,
+        provisional_record: IdentityRecord,
+        timestamp_s: float,
+    ) -> int | None:
+        """Évalue si l'observation courante d'une provisoire est cohérente avec une identité établie de galerie."""
+        if not self.long_term.enabled or feature is None:
+            return None
+        candidates: list[tuple[int, IdentityRecord, float, float]] = []
+        for person_id, record in self.records.items():
+            if person_id == provisional_record.person_id:
+                continue
+            if record.live or record.provisional or person_id in self._claimed:
+                continue
+            if not self.within_gallery_window(record, timestamp_s):
+                continue
+            reference_height = record.bbox_height
+            if reference_height <= 0:
+                continue
+            elapsed = timestamp_s - record.last_seen_s
+            allowance_window = self.grace_period_seconds + self.purge_retention_seconds
+            allowed = self.long_term.v_max_ratio * reference_height * min(
+                elapsed, allowance_window
+            ) + self.long_term.spatial_margin_ratio * reference_height
+            distance = _distance(observation.anchor, record.anchor)
+            if distance <= allowed:
+                candidates.append((person_id, record, allowed, distance))
+        if not candidates:
+            return None
+
+        scored: list[tuple[float, int, IdentityRecord]] = []
+        for person_id, record, _allowed, _distance_val in candidates:
+            reference = self._reference_feature(record)
+            if reference is None:
+                continue
+            scored.append((self.cosine_similarity(feature, reference), person_id, record))
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_similarity, best_person, best_record = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else None
+
+        absence_s = float(timestamp_s - best_record.last_seen_s)
+        strict_reappearance = (
+            best_person in self._merge_strict_ids
+            and best_record.merge_fingerprint is not None
+        )
+        if strict_reappearance:
+            threshold = max(
+                self.effective_similarity_threshold(absence_s),
+                float(self.long_term.similarity_threshold),
+            )
+        else:
+            threshold = self.effective_similarity_threshold(absence_s)
+
+        if best_similarity < threshold:
+            return None
+
+        margin = self.long_term.safety_margin
+        if runner_up is not None and (best_similarity - runner_up) < margin:
+            return None
+
+        return best_person
+
+    def _maybe_merge_provisional(
+        self,
+        record: IdentityRecord,
+        observation: Observation,
+        feature: np.ndarray | None,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> int | None:
+        """Vérifie et applique la fusion d'une identité provisoire dans une identité établie."""
+        if not record.provisional:
+            return None
+
+        target_candidate = self._evaluate_provisional_match(
+            observation, feature, record, timestamp_s
+        )
+        prov_id = record.person_id
+        if target_candidate is None:
+            self._provisional_tracking.pop(prov_id, None)
+            return None
+
+        prev_target, streak = self._provisional_tracking.get(prov_id, (None, 0))
+        if prev_target == target_candidate:
+            streak += 1
+        else:
+            prev_target = target_candidate
+            streak = 1
+        self._provisional_tracking[prov_id] = (prev_target, streak)
+
+        if streak >= int(self.long_term.provisional_merge_confirmation_frames):
+            target_id = prev_target
+            self._merge_provisional_into(prov_id, target_id, streak, timestamp_s, frame_index)
+            return target_id
+        return None
+
+    def _merge_provisional_into(
+        self,
+        provisional_person_id: int,
+        target_person_id: int,
+        consistent_observations: int,
+        timestamp_s: float,
+        frame_index: int,
+    ) -> None:
+        target_record = self.records[target_person_id]
+        prov_record = self.records[provisional_person_id]
+
+        all_aliases = set(prov_record.aliases)
+        if prov_record.technical_track_id is not None:
+            all_aliases.add(prov_record.technical_track_id)
+
+        for tech_id in all_aliases:
+            self.technical_to_person[tech_id] = target_person_id
+            target_record.aliases.add(tech_id)
+        for tech_id, pid in list(self.technical_to_person.items()):
+            if pid == provisional_person_id:
+                self.technical_to_person[tech_id] = target_person_id
+
+        target_record.live = True
+        target_record.technical_track_id = prov_record.technical_track_id
+        target_record.anchor = prov_record.anchor
+        target_record.bbox = prov_record.bbox
+        target_record.bbox_height = prov_record.bbox_height
+        target_record.last_seen_s = timestamp_s
+        target_record.observations += prov_record.observations
+        target_record.purged_at_s = None
+        target_record.purge_reason = None
+        if prov_record.feature is not None:
+            target_record.feature = _blend(target_record.feature, prov_record.feature, self.feature_momentum)
+
+        self._claimed.discard(provisional_person_id)
+        self._claimed.add(target_person_id)
+
+        self.provisional_ids.discard(provisional_person_id)
+        self.records.pop(provisional_person_id, None)
+        self._provisional_tracking.pop(provisional_person_id, None)
+        self.last_merges.append((provisional_person_id, target_person_id))
+        self.provisional_identities_merged += 1
+
+        self._emit(
+            "PROVISIONAL_IDENTITY_MERGED",
+            timestamp_s,
+            frame_index,
+            provisional_person_id=provisional_person_id,
+            target_person_id=target_person_id,
+            consistent_observations=consistent_observations,
+            technical_track_ids=sorted(list(all_aliases)),
         )
 
     # -- Garde-fou de swap (continuité d'apparence par piste technique) ----
@@ -1220,10 +1439,14 @@ class IdentityManager:
                 is None,
             )
         self._touch(record, observation, feature, timestamp_s, frame_index, frame)
+        merged_target = self._maybe_merge_provisional(
+            record, observation, feature, timestamp_s, frame_index
+        )
+        person_id_assigned = merged_target if merged_target is not None else person_id
         if similarity is not None:
             self._emit(
                 "REID_MATCH", timestamp_s, frame_index,
-                person_id=person_id,
+                person_id=person_id_assigned,
                 technical_track_id=int(observation.technical_track_id),
                 similarity=round(similarity, 4),
                 runner_up_similarity=None if runner_up is None else round(runner_up, 4),
@@ -1244,19 +1467,19 @@ class IdentityManager:
             )
         return Assignment(
             technical_track_id=int(observation.technical_track_id),
-            person_id=person_id,
+            person_id=person_id_assigned,
             bbox=observation.bbox,
             confidence=observation.confidence,
             anchor=observation.anchor,
             bbox_height=observation.bbox_height,
-            provisional=record.provisional,
+            provisional=False if merged_target is not None else record.provisional,
             matched=True,
             similarity=similarity,
             runner_up_similarity=runner_up,
             candidates_evaluated=candidates_evaluated,
             allowed_distance=allowed,
             distance=distance,
-            reason=reason,
+            reason="provisional_identity_merged" if merged_target is not None else reason,
             anchor_reliable=observation.anchor_reliable,
             head_point=observation.head_point,
             head_confidence=observation.head_confidence,
@@ -1746,6 +1969,7 @@ class IdentityManager:
         record.purged_at_s = timestamp_s
         record.purge_reason = reason
         record.live = False
+        self._provisional_tracking.pop(person_id, None)
 
     def release_expired(self, timestamp_s: float) -> list[int]:
         """Libère les identités dont la fenêtre de galerie est terminée."""
@@ -1760,6 +1984,7 @@ class IdentityManager:
                     if self.technical_to_person[technical_id] == person_id:
                         del self.technical_to_person[technical_id]
                 self.provisional_ids.discard(person_id)
+                self._provisional_tracking.pop(person_id, None)
         return released
 
     def forget(self, person_id: int) -> None:
@@ -1769,6 +1994,7 @@ class IdentityManager:
             if self.technical_to_person[technical_id] == person_id:
                 del self.technical_to_person[technical_id]
         self.provisional_ids.discard(person_id)
+        self._provisional_tracking.pop(person_id, None)
 
     # -- Émission ----------------------------------------------------------
     def _inconsistent(self, kind: str, timestamp_s: float, frame_index: int, **fields: Any) -> None:

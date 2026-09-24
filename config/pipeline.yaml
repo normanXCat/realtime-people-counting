@@ -146,6 +146,10 @@ reid:
         # nourri le second étage de BoT-SORT, elle n'est pas plus exploitable par
         # la galerie. PROVISOIRE — à calibrer avec gallery_rescue_enabled.
         gallery_rescue_min_confidence: null
+        # Recyclage des identités provisoires : nombre d'observations cohérentes
+        # consécutives requises pour fusionner une provisoire dans une identité
+        # de galerie non provisoire (casse la boucle ambiguïté -> provisoire -> galerie -> ambiguïté).
+        provisional_merge_confirmation_frames: 5 # PROVISOIRE — à calibrer
     # Extracteur d'apparence profond (MobileNetV3 / OSNet) ACTIVÉ : améliore la
     # robustesse du descripteur lors des longues occultations. Il retombe
     # proprement sur le descripteur HSV si torch/torchvision sont indisponibles ou
@@ -315,14 +319,16 @@ diagnostics:
 # tête ne participe JAMAIS au calcul de franchissement de ligne.
 presence:
     head_assist:
-        # ACTIVÉ (B1) : maintient la présence d'une personne dont les pieds sont
+        # ACTIVÉ (B1) : maintient la présence d'une personne dont les piedsx sont
         # occultés. Si models/yolo11s-pose.pt est absent, main.py journalise un
         # CONFIG_WARNING (head_assist_model_missing) et retombe proprement sur le
         # modèle de détection standard : le flag peut rester à true, l'exécution
         # ne prétend jamais l'inverse dans la config résolue de session.
         enabled: true
         pose_model_path: models/yolo11s-pose.pt
-        pose_model_expected_sha256: null # à renseigner une fois le poids téléchargé
+        # SHA-256 du poids téléchargé depuis la release officielle Ultralytics
+        # (github.com/ultralytics/assets, v8.3.0/yolo11s-pose.pt, 20 373 161 octets).
+        pose_model_expected_sha256: 1060bda4a27012060eca246f9b2adeea22eabb045a1e58f8d229be29b7ebc2ba
         min_keypoint_confidence: 0.5 # PROVISOIRE — à calibrer
         keypoints_used: [nose, left_eye, right_eye]
         max_presence_extension_seconds: 10.0 # PROVISOIRE — borne de sécurité

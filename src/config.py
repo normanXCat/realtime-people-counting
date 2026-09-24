@@ -219,6 +219,10 @@ class LongTermReidConfig:
     #: dessous, l'observation n'a même pas nourri le second étage de BoT-SORT et
     #: n'est donc pas exploitable non plus au niveau de la galerie.
     gallery_rescue_min_confidence: float | None = None
+    #: Recyclage des identités provisoires : nombre d'observations cohérentes
+    #: consécutives requises pour fusionner une provisoire dans une identité
+    #: de galerie non provisoire.
+    provisional_merge_confirmation_frames: int = 5
 
 
 @dataclass(frozen=True)
@@ -874,6 +878,21 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
             high=1.0,
         )
     )
+    merge_frames_raw = long_term_raw.get("provisional_merge_confirmation_frames", 5)
+    provisional_merge_confirmation_frames = _positive_int(
+        merge_frames_raw,
+        "reid.long_term.provisional_merge_confirmation_frames",
+        problems,
+    )
+    if (
+        provisional_merge_confirmation_frames is not None
+        and provisional_merge_confirmation_frames < 2
+    ):
+        problems.append(
+            "reid.long_term.provisional_merge_confirmation_frames doit être >= 2 "
+            f"(reçu {provisional_merge_confirmation_frames}) : ne jamais fusionner "
+            "sur une seule observation (règle 0.4)."
+        )
     if (
         long_absence_floor is not None
         and similarity_threshold is not None
@@ -1183,6 +1202,11 @@ def build_config(raw: Mapping[str, Any], config_path: Path | None = None) -> Pip
                     gallery_rescue_min_confidence
                     if gallery_rescue_min_confidence is not None
                     else (track_low_thresh if track_low_thresh is not None else 0.1)
+                ),
+                provisional_merge_confirmation_frames=int(
+                    provisional_merge_confirmation_frames
+                    if provisional_merge_confirmation_frames is not None
+                    else 5
                 ),
             ),
             external_reid=ExternalReidConfig(

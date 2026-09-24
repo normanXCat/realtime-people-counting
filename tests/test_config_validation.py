@@ -681,3 +681,23 @@ def test_gallery_rescue_without_long_term_reid_is_warned_about():
     codes = [code for code, _message in coherence_warnings(ok)]
     assert "gallery_rescue_without_long_term_reid" not in codes
 
+
+def test_provisional_merge_confirmation_frames_validation():
+    config = load_config()
+    assert config.reid.long_term.provisional_merge_confirmation_frames == 5
+
+    # Valide avec >= 2
+    updated = override_config(
+        config,
+        {"reid": {"long_term": {"provisional_merge_confirmation_frames": 3}}},
+    )
+    assert updated.reid.long_term.provisional_merge_confirmation_frames == 3
+
+    # Refuse < 2 (règle 0.4 : aucune décision sur signal faible / 1 observation)
+    with pytest.raises(ConfigError) as exc_info:
+        override_config(
+            config,
+            {"reid": {"long_term": {"provisional_merge_confirmation_frames": 1}}},
+        )
+    assert "provisional_merge_confirmation_frames" in str(exc_info.value)
+

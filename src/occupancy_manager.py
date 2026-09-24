@@ -537,6 +537,13 @@ class OccupancyManager:
             assignments = self.identities.assign(
                 observations, frame, timestamp_s, frame_index
             )
+            for prov_id, target_id in getattr(self.identities, "last_merges", []):
+                prov_track = self.tracks.pop(prov_id, None)
+                self._uncertain.discard(prov_id)
+                if prov_track is not None and target_id in self.tracks:
+                    self.tracks[target_id].aliases.update(prov_track.aliases)
+                    if prov_track.inside_occupancy:
+                        self.tracks[target_id].inside_occupancy = True
             # Chemin de secours « galerie » : les détections écartées par BoT-SORT
             # n'ont jamais atteint ``assign``. Elles lui sont présentées **après**
             # l'affectation nominale, pour qu'une identité encore active ne puisse

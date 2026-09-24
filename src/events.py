@@ -150,6 +150,25 @@ EVENT_SCHEMA: dict[str, EventSpec] = {
             "lifetime_s", "purge_kind", "is_exit",
         ),
     ),
+    # Réutilisation d'un identifiant technique par BoT-SORT pour une personne
+    # géométriquement incompatible avec le mapping existant : l'ancien mapping
+    # est libéré (l'identité réintégrera la galerie dès sa prochaine absence)
+    # et l'observation courante suit le chemin nominal de réassociation.
+    "TECHNICAL_ID_REPURPOSED": EventSpec(
+        required=(
+            "technical_track_id", "previous_person_id", "distance", "allowed_distance",
+        ),
+        optional=("new_person_id", "reason"),
+    ),
+    # Fusion d'une identité provisoire dans une identité établie après
+    # ``provisional_merge_confirmation_frames`` observations cohérentes :
+    # casse la boucle de rétroaction provisoire → candidate → ambiguïté.
+    "PROVISIONAL_IDENTITY_MERGED": EventSpec(
+        required=(
+            "provisional_person_id", "target_person_id", "consistent_observations",
+        ),
+        optional=("technical_track_ids",),
+    ),
     "REID_MATCH": EventSpec(
         required=("person_id", "technical_track_id", "similarity"),
         optional=(
