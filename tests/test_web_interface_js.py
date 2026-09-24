@@ -111,3 +111,26 @@ def test_ecran_d_accueil_explique_les_deux_choix():
             "même côté de la ligne prolongée.") in html
     assert ("Le système compte les personnes présentes au démarrage et celles qui apparaissent "
             "ensuite. Les entrées et les sorties ne sont pas comptées.") in html
+
+
+@needs_node
+def test_etat_relecture_et_etapes_de_demarrage():
+    result = run_interface(
+        "console.log(JSON.stringify([I.texteEtat('en_cours', false), I.texteEtat('en_cours', true),"
+        " I.texteEtat('termine', true), I.texteEtat('hors_ligne', true),"
+        " I.texteEtape('chargement_modeles'), I.texteEtape('demarrage')]))"
+    )
+    assert result == [
+        "En cours", "Relecture", "Relecture terminée", "Connexion perdue",
+        "Chargement des modèles…", "Démarrage du traitement…",
+    ]
+
+
+def test_calibration_sans_dessin_dans_la_page():
+    """La page ne dessine rien : chaque action part au serveur, qui renvoie l'image."""
+    app = (WEB / "app.js").read_text(encoding="utf-8")
+    assert "getContext" not in app and "setLineDash" not in app and "fillStyle" not in app
+    assert '"/calibration/action"' in app
+    for action in ("ligne", "sans_ligne", "clic", "valider", "recommencer", "inverser", "retour"):
+        assert f'action: "{action}"' in app
+    assert "Interface.texteEtat(valeur, relecture)" in app and "Interface.texteEtape(v.etape)" in app

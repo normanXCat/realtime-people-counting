@@ -3897,3 +3897,124 @@ calibration navigateur (ligne et sans ligne) et court-circuit par `--line` /
   dans Chrome par de vraies frappes (Échap → question, G → ligne effacée,
   C → démonstration ; mode sans ligne → « Non assigné »). Aucun changement
   côté serveur ni comptage. Suite : 779 collectés, 1 ignoré.
+
+# 28. Interface web : dessin OpenCV partagé, lenteur, relecture (hors plan, sur instruction du 2026-09-24)
+
+Affichage seulement : aucune modification du comptage, du suivi ni des seuils.
+Point de départ : `soutenance-web2` (+ §27.5).
+
+## 28.1 A. Ligne, zone morte et flèche : un seul dessin
+
+- `calibration.draw_line_overlay(frame, line, dead_zone_px)` : **seul** dessin
+  de la ligne (verte, 3 px), de la zone morte (bande jaune à 12 %,
+  ±`dead_zone_px` de part et d'autre de la ligne, comme `geometry.zone_of`) et
+  de la flèche INTERIEUR / EXTERIEUR (celle de la fenêtre de calibration,
+  extraite dans `draw_inside_side`). Utilisé par
+  `OccupancyManager.draw_overlay` (fenêtre de traitement, `--write-video`), par
+  la vue web et par la relecture.
+- **Changement visible côté OpenCV** : la flèche et ses deux libellés
+  n'apparaissaient avant que dans la fenêtre de calibration ; ils sont
+  désormais aussi dans la fenêtre de traitement et la vidéo écrite (condition
+  de l'identité au pixel demandée).
+- Vue web : ligne + zone morte + flèche seulement (ni boîtes, ni identifiants,
+  ni ancres, ni « ? », ni HUD). Test : identité **pixel pour pixel** avec
+  `draw_overlay` privé des boîtes et du HUD, sur deux lignes.
+- Calibration web : la page ne dessine plus rien (zone teintée et prolongement
+  en pointillés retirés). Chaque clic et chaque touche (C, G, I, Échap, et les
+  choix « Avec ligne » / « Sans ligne ») part en `POST /calibration/action` ;
+  le serveur l'applique à une `LineSelection` — celle de la fenêtre OpenCV — et
+  renvoie l'image redessinée par `draw_mode_question` / `LineSelection.draw`, à
+  la taille de la fenêtre (côté ≤ 1080). Test : identité au pixel avec la
+  fenêtre OpenCV à chaque action, et ligne validée identique (points,
+  `display_scale`, clics). Échap revient à la question (dans la fenêtre
+  OpenCV, il annule le programme) ; un refus de validation s'affiche dans
+  l'image (« Ligne refusee : … ») et dans le panneau.
+- Page : mise en page, compteurs, couleurs, polices et boutons inchangés ; seul
+  le libellé d'aide de I passe de « (la zone teintée) » à « (sens de la
+  flèche) », la zone teintée n'existant plus.
+
+## 28.2 B. Lenteur : mesures avant / après
+
+Mesure par un client HTTP qui fait ce que fait la page (image de calibration,
+validation, flux `/video` ouvert dès la validation, `/stats`), `fort_occ4`,
+ligne de référence, CPU seul.
+
+| | Avant (`ad81e12`) | Après |
+|---|---|---|
+| Lancement → image de calibration servie | 2,7 s | 2,3 à 2,7 s |
+| Poids de l'image de calibration | 85 Kio (1280 px, q80) | 62 Kio (1080 px, q75) |
+| Validation → 1re image traitée affichée | **600,9 s** | **5,1 s** si validation immédiate ; **0,4 s** après 20 s de tracé |
+| Cadence de traitement (`summary.json`, moyenne) | 3,65 ips | 3,57 à 3,85 ips |
+| Cadence affichée (images distinctes reçues) | 3,64 ips | 3,63 à 3,68 ips |
+| JPEG du flux, par image | 3,1 ms, 90 Kio (1280 × 720, q80) | 3,3 ms, 51 Kio (960 × 540, q75) |
+
+**Cause des 10 minutes** : avant la première image publiée,
+`WebState.wait_frame` rendait la main immédiatement (condition vraie dès
+`seq = -1`) ; le générateur `/video`, ouvert par la page dès la validation,
+tournait en **boucle active** et privait le pipeline de l'interpréteur Python.
+Mesuré : 242 s pour le seul premier `next()` du générateur YOLO, contre 3,1 s
+hors web (démarrage hors web : import torch 4,6 s, OSNet 5,5 s, 1re image
+3,1 s). Corrigé : l'attente exige une image publiée.
+
+Autres corrections :
+- YOLO (import, poids, prédicteur préparé par une inférence sur la première
+  image, mêmes paramètres que `model.track`) et la session ONNX d'OSNet sont
+  chargés pendant la calibration, dans un thread (`ModelPreloader`) ; la
+  session ONNX est gardée dans un cache par chemin (`identity_manager`).
+  Préchargement mesuré : 5,4 à 5,8 s.
+- Serveur : déjà multi-thread (`threaded=True`), vérifié.
+- Dernière image seulement, sans file ; JPEG encodé **une fois** par image
+  (partagé entre lecteurs), réduit à 960 px de large (INTER_LINEAR : même poids
+  qu'INTER_AREA pour 3,3 ms au lieu de 5,5), qualité 75 ; ni rendu ni encodage
+  sans navigateur connecté au flux.
+- États affichés à la place de l'écran vide : « Chargement des modèles… »,
+  puis « Démarrage du traitement… », jusqu'à la première image.
+
+## 28.3 C. Relecture (`--replay <dossier de session>`)
+
+- Aucune détection ni suivi : la vidéo source (`calibration.json`, ou
+  `--source`) est relue à sa cadence réelle ; ligne et flèche de
+  `calibration.json`, zone morte à la largeur relevée pendant la session,
+  dessinées par `draw_line_overlay` ; compteurs reconstruits depuis
+  `events.jsonl` à l'horloge de la vidéo (IN / OUT / NEW, `WARMUP_END`,
+  relevés `OCCUPANCY_SNAPSHOT` qui font foi) ; `SESSION_END` et
+  `SOURCE_END_OF_STREAM` (horloge murale) appliqués à la fin. Arrêt au nombre
+  d'images de la session (`summary.json`).
+- **Nouveau fichier de session** `dead_zone.jsonl` (écrit à chaque changement
+  de largeur, au centième de pixel), hors du journal d'événements. Les
+  sessions antérieures n'en ont pas : la relecture le signale et ne dessine
+  pas la zone morte.
+- La page affiche « Relecture » (puis « Relecture terminée ») à la place de
+  « En cours », et le titre de l'onglet commence par « Relecture : ».
+- Vérifié sur une session réelle de `fort_occ4` : compteurs finaux de la
+  relecture 12 / IN 12 / OUT 0 / NEW 0, égaux à ceux de la session ; 608
+  relevés de zone morte ; flux à 30 ips (299 images en 10 s).
+
+## 28.4 Comptage inchangé
+
+`fort_occ4`, ligne de référence, journaux comparés hors identifiants de
+session et champs à l'horloge murale : **identiques** (1 077 événements, 12 IN,
+0 OUT, 0 NEW, fin 12), à la seule exception de `confirmed_at` (heure de
+validation de la ligne) :
+- sans `--web` / avec `--web` et un lecteur du flux connecté tout le long
+  (1 057 images reçues) ;
+- sans `--web` / avec la calibration web (clics envoyés au serveur,
+  préchargement actif ; `line_origin` et `display_scale` ignorés en plus) ;
+- sans `--web` / référence `soutenance-web2` (`results/w2/ref_noweb_fort_occ4`).
+
+## 28.5 Tests
+
+`tests/test_web_view.py` : identité au pixel rendu web ↔ `draw_overlay` sans
+boîtes ni HUD (deux lignes), zone morte et flèche présentes, aperçu de
+calibration identique à la fenêtre OpenCV à chaque action, recommencer /
+retour / refus, flèche vers l'intérieur compté pour les deux orientations,
+route `/calibration/action`, absence de boucle active, JPEG unique et réduit,
+rendu omis sans lecteur, étapes de démarrage. `tests/test_web_interface_js.py` :
+textes « Relecture », étapes, page sans dessin. Nouveau `tests/test_replay.py` :
+reconstruction des compteurs, vitesse réelle, zone morte à l'instant de
+l'image, arrêt au nombre d'images de la session, sans ligne, session
+incomplète, session produite par `main` puis relue (compteurs finaux égaux),
+option `--replay`. Test remplacé :
+`test_calibration_web_inversion_et_cote_teinte_coherents` (formule de la zone
+teintée de `app.js`, supprimée) par la vérification de la flèche dessinée par
+OpenCV. Suite : 795 réussis, 1 ignoré, couverture 94,34 %.

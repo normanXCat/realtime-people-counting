@@ -186,6 +186,12 @@ class DeepAppearanceUnavailable(RuntimeError):
     différente, moteur indisponible). Déclenche le repli sur l'histogramme."""
 
 
+#: Sessions ONNX ouvertes, par chemin de modèle : l'ouverture (plusieurs
+#: secondes) n'est payée qu'une fois par processus, et peut l'être pendant la
+#: calibration web (préchargement). L'inférence d'une session est déterministe.
+_ONNX_SESSIONS: dict[str, Any] = {}
+
+
 class DeepAppearanceExtractor:
     """Descripteur d'apparence profond (lot 3.a).
 
@@ -243,14 +249,21 @@ class DeepAppearanceExtractor:
                 raise DeepAppearanceUnavailable(
                     f"empreinte du modèle ReID différente : {digest} (attendue {expected})"
                 )
-        try:
-            import onnxruntime as ort  # import local : dépendance du seul chemin profond
-        except ImportError as error:  # pragma: no cover - dépend de l'environnement
-            raise DeepAppearanceUnavailable(f"onnxruntime indisponible : {error}") from error
-        try:
-            self._session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-        except Exception as error:  # modèle illisible
-            raise DeepAppearanceUnavailable(f"modèle ReID illisible : {error}") from error
+        cached = _ONNX_SESSIONS.get(str(path))
+        if cached is not None:
+            # Session déjà ouverte (préchargement pendant la calibration web) :
+            # même fichier, même empreinte vérifiée ci-dessus, même moteur.
+            self._session = cached
+        else:
+            try:
+                import onnxruntime as ort  # import local : dépendance du seul chemin profond
+            except ImportError as error:  # pragma: no cover - dépend de l'environnement
+                raise DeepAppearanceUnavailable(f"onnxruntime indisponible : {error}") from error
+            try:
+                self._session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            except Exception as error:  # modèle illisible
+                raise DeepAppearanceUnavailable(f"modèle ReID illisible : {error}") from error
+            _ONNX_SESSIONS[str(path)] = self._session
         self._input_name = self._session.get_inputs()[0].name
         self.name = f"onnx_{path.stem}"
 

@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from importlib import metadata
@@ -71,6 +72,7 @@ from config import (
     ALLOWED_INSIDE_SIDES,
     ConfigError,
     FrameBudget,
+    REPO_ROOT,
     PipelineConfig,
     coherence_warnings,
     load_config,
@@ -88,6 +90,7 @@ from geometry import (
 from metrics import FpsEstimator, LatencyProfiler, Timer
 from occupancy_manager import Detection, OccupancyManager
 from preprocessing import ClaheNormalizer, make_predict_callback
+from replay import DEAD_ZONE_FILENAME
 from second_trace import SecondTraceUnavailable, SecondTracer, source_fps
 from track_diagnostics import (
     BOXES_EMPTY,
@@ -161,10 +164,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--web", action="store_true",
         help="Interface web (http://127.0.0.1:PORT/, machine locale uniquement) : "
              "calibration dans le navigateur si ni --line ni --no-line, puis vidéo "
-             "avec la seule ligne virtuelle et les compteurs Personnes présentes / "
+             "avec la ligne virtuelle, la zone morte et la flèche, et les compteurs Personnes présentes / "
              "Entrées / Sorties / Nouvelles présences. Aucune fenêtre OpenCV.",
     )
     parser.add_argument("--port", type=int, default=8000, help="Port de l'interface web (défaut : 8000)")
+    parser.add_argument(
+        "--replay", default=None, metavar="DOSSIER_DE_SESSION",
+        help="Relecture dans l'interface web d'une session déjà calculée (dossier "
+             "contenant calibration.json et events.jsonl) : vidéo source à sa vitesse "
+             "réelle, ligne, zone morte et flèche, compteurs selon events.jsonl. "
+             "Aucune détection ni suivi. --source remplace la vidéo de la session.",
+    )
     parser.add_argument(
         "--trace-per-second", action="store_true",
         help="Outillage de mesure : relevé de l'état du pipeline à la première "
@@ -626,8 +636,104 @@ def abort_line_selection(
 # ---------------------------------------------------------------------------
 # Boucle principale
 # ---------------------------------------------------------------------------
+class ModelPreloader:
+    """Charge YOLO et OSNet pendant la calibration web (thread d'arrière-plan).
+
+    Charger après la validation laissait l'opérateur devant un écran vide
+    pendant l'import de torch, l'ouverture d'OSNet et la préparation du
+    prédicteur. Le prédicteur est préparé par une inférence sur la première
+    image, avec les mêmes paramètres que ``model.track`` ; aucun tracker n'est
+    encore créé (il l'est par ``model.track``). Un échec n'est pas fatal : le
+    chargement habituel est alors refait après la validation.
+    """
+
+    def __init__(self, config: PipelineConfig, model_path: Path, first_frame: Any) -> None:
+        self.model: Any = None
+        self.error: BaseException | None = None
+        self.seconds = 0.0
+        self._thread = threading.Thread(
+            target=self._run, args=(config, model_path, first_frame),
+            name="model-preload", daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, config: PipelineConfig, model_path: Path, first_frame: Any) -> None:
+        start = time.perf_counter()
+        try:
+            from ultralytics import YOLO
+
+            model = YOLO(str(model_path))
+            model.predict(
+                first_frame,
+                classes=list(config.model.classes),
+                conf=config.model.confidence,
+                iou=config.model.nms_iou,
+                imgsz=config.model.image_size,
+                device=config.model.device,
+                verbose=False,
+            )
+            if config.reid.external_reid.enabled and config.reid.external_reid.backend == "onnxruntime":
+                from identity_manager import DeepAppearanceExtractor
+
+                DeepAppearanceExtractor(config.reid.external_reid).load()
+            self.model = model
+        except Exception as error:  # repli : chargement habituel après validation
+            self.error = error
+        finally:
+            self.seconds = time.perf_counter() - start
+
+    def wait(self) -> Any:
+        """Attend la fin du chargement ; renvoie le modèle, ou ``None`` en cas d'échec."""
+        self._thread.join()
+        return self.model
+
+
+def run_replay(args: argparse.Namespace) -> int:
+    """``--replay`` : relecture d'une session dans l'interface web, sans calcul."""
+    from replay import ReplayError, load_session, replay
+    from web_view import HOST, WebState, render_line_overlay, start_server
+
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    try:
+        session = load_session(args.replay, source=args.source)
+    except (ReplayError, OSError, ValueError, KeyError) as error:
+        print(f"[REPLAY] Session illisible : {error}", file=sys.stderr)
+        return 2
+    source = Path(session.source)
+    if not source.is_absolute() and not source.exists() and (REPO_ROOT / source).exists():
+        session.source = str(REPO_ROOT / source)
+    if not session.dead_zone and session.line is not None:
+        print(f"[REPLAY] {DEAD_ZONE_FILENAME} absent (session antérieure à son "
+              "enregistrement) : zone morte non dessinée.", file=sys.stderr)
+    state = WebState()
+    try:
+        server = start_server(state, args.port)
+    except OSError as error:
+        print(f"[WEB] Démarrage du serveur impossible sur {HOST}:{args.port} : {error}",
+              file=sys.stderr)
+        return 2
+    print(f"[REPLAY] Relecture de {session.root} ({session.source}) : http://{HOST}:{args.port}/")
+    try:
+        counters = replay(session, state, render=render_line_overlay)
+        print(f"[REPLAY] Fin : présentes={counters.confirmed} IN={counters.total_in} "
+              f"OUT={counters.total_out} NEW={counters.total_new} ; interface toujours "
+              f"servie sur http://{HOST}:{args.port}/ (Ctrl+C pour quitter)")
+        while True:
+            time.sleep(1.0)
+    except ReplayError as error:
+        print(f"[REPLAY] {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.replay is not None:
+        return run_replay(args)
     try:
         config = load_config(args.config)
         config = apply_cli_overrides(config, args)
@@ -819,9 +925,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # OpenCV, et lit ensuite l'état publié.
     web_state = None
     web_server = None
+    preloader: ModelPreloader | None = None
     web_calibration = bool(args.web and args.line is None and not args.no_line)
     if args.web:
-        from web_view import HOST, WebState, render_line_only, start_server
+        from web_view import (
+            HOST,
+            STEP_LOADING,
+            STEP_STARTING,
+            WebState,
+            render_line_overlay,
+            start_server,
+        )
 
         web_state = WebState()
         try:
@@ -839,8 +953,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # jamais silencieux).
     try:
         if web_calibration:
+            first_frame = read_first_frame(source)
+            # YOLO et OSNet se chargent pendant que l'opérateur trace la ligne.
+            preloader = ModelPreloader(config, model_path, first_frame)
             web_state.open_calibration(
-                read_first_frame(source),
+                first_frame,
                 inside_side=config.line.inside_side,
                 min_length_ratio=config.line.min_length_ratio,
             )
@@ -990,6 +1107,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # de l'image avec la seule ligne, et les quatre compteurs affichés.
     if web_state is not None:
         web_state.start_demo(no_line=line is None)
+        web_state.set_step(STEP_LOADING)
+    preloaded_model = None
+    if preloader is not None:
+        waited = time.perf_counter()
+        preloaded_model = preloader.wait()
+        print(
+            f"[WEB] Modèles préchargés pendant la calibration en {preloader.seconds:.1f} s "
+            f"(attente après validation : {time.perf_counter() - waited:.1f} s)"
+            if preloaded_model is not None
+            else f"[WEB] Préchargement impossible ({preloader.error}) : chargement habituel"
+        )
 
     print(
         f"[SESSION] {session_id} | source={source} | modèle={model_path.name} "
@@ -1004,7 +1132,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         from ultralytics import YOLO  # import tardif : évite de charger torch pour --help
 
-        model = YOLO(str(model_path))
+        model = preloaded_model if preloaded_model is not None else YOLO(str(model_path))
         if config.preprocessing.clahe.enabled:
             # Lot 7 : CLAHE en place avant le letterbox d'Ultralytics, donc vu
             # à l'identique par YOLO, le tracker (GMC) et l'extracteur ReID.
@@ -1074,6 +1202,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     display_window_name = sanitize_window_name(config.display.window_name)
     window_ready = False
     exit_code = 0
+    if web_state is not None:
+        web_state.set_step(STEP_STARTING)
+    #: Largeur de la zone morte relevée à chaque changement, pour la relecture
+    #: (--replay). Hors du journal d'événements, que ce relevé ne modifie pas.
+    dead_zone_trace = (session_root / DEAD_ZONE_FILENAME).open("w", encoding="utf-8")
+    last_dead_zone: Any = object()
     try:
         while True:
             with Timer() as capture_timer:
@@ -1317,9 +1451,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 occupancy.draw_overlay(rendered)
             profiler.record("render", render_timer.ms)
 
+            dead_zone_px = occupancy.dead_zone_px()
+            dead_zone_px = None if dead_zone_px is None else round(dead_zone_px, 2)
+            if dead_zone_px != last_dead_zone:
+                last_dead_zone = dead_zone_px
+                dead_zone_trace.write(json.dumps({
+                    "timestamp_s": round(timestamp_s, 4),
+                    "frame_index": frame_index,
+                    "dead_zone_px": dead_zone_px,
+                }) + "\n")
+
             if web_state is not None:
+                # Rendu seulement si un navigateur lit le flux ; même dessin
+                # que la fenêtre OpenCV (ligne, zone morte, flèche).
                 web_state.publish(
-                    render_line_only(frame, line),
+                    render_line_overlay(frame, line, occupancy.dead_zone_px())
+                    if web_state.has_viewer
+                    else None,
                     confirmed=occupancy.occupancy_confirmed,
                     total_in=occupancy.total_in,
                     total_out=occupancy.total_out,
@@ -1391,6 +1539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[CONTROL] Interruption clavier : arrêt propre")
     finally:
+        dead_zone_trace.close()
         if second_tracer is not None:
             second_tracer.close()
         if writer is not None:

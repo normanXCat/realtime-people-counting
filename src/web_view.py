@@ -2,16 +2,18 @@
 
 Aucune influence sur le comptage, le suivi ni les seuils :
 
-- **calibration** (si ni ``--line`` ni ``--no-line``) : la page montre la
-  première image ; l'opérateur choisit « Tracer une ligne » ou « Compter sans
-  ligne ». La ligne reçue passe par :func:`geometry.validate_line`, la même
-  validation que la calibration OpenCV, et devient une
-  :class:`calibration.ValidatedLine`. Le pipeline attend cette validation
+- **calibration** (si ni ``--line`` ni ``--no-line``) : la page envoie chaque
+  clic et chaque touche (C, G, I, Échap) au serveur, qui les applique à une
+  :class:`calibration.LineSelection` — la même que la fenêtre OpenCV — et
+  renvoie l'image redessinée par les fonctions OpenCV
+  (:func:`calibration.draw_mode_question`, :meth:`LineSelection.draw`). La
+  page ne dessine rien. Le pipeline attend la validation
   (:meth:`WebState.wait_calibration`) avant de traiter la première image ;
-- **démonstration** : :func:`render_line_only` (rendu **dédié** : la ligne,
-  rien d'autre ; ``OccupancyManager.draw_overlay`` reste inchangé),
-  :class:`WebState` (objet partagé sous verrou), flux MJPEG et Server-Sent
-  Events des quatre compteurs affichés.
+- **démonstration** : :func:`render_line_overlay` (la ligne, la zone morte et
+  la flèche, par :func:`calibration.draw_line_overlay`, le dessin même de la
+  fenêtre OpenCV ; ni boîtes, ni identifiants, ni HUD), :class:`WebState`
+  (objet partagé sous verrou), flux MJPEG et Server-Sent Events des quatre
+  compteurs affichés. La relecture (``--replay``) publie dans le même objet.
 
 Le serveur n'écoute que sur 127.0.0.1 : la vidéo montre des personnes
 identifiables.
@@ -29,7 +31,13 @@ from typing import Any, Iterator
 import cv2
 import numpy as np
 
-from calibration import ValidatedLine
+from calibration import (
+    LineSelection,
+    ValidatedLine,
+    display_canvas,
+    draw_line_overlay,
+    draw_mode_question,
+)
 from geometry import LineError, validate_line
 
 #: Dossier de la page (HTML, CSS, JavaScript), sans ressource externe.
@@ -38,12 +46,12 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 #: Adresse d'écoute, fixe : machine locale uniquement.
 HOST = "127.0.0.1"
 
-#: Couleur et épaisseur de la ligne dans le rendu dédié (BGR). Présentation seule.
-LINE_COLOR_BGR = (0, 200, 255)
-LINE_THICKNESS = 4
-
 #: Qualité JPEG du flux MJPEG et de l'image de calibration. Présentation seule.
-JPEG_QUALITY = 80
+JPEG_QUALITY = 75
+
+#: Largeur maximale des images du flux MJPEG (réduites avant encodage).
+#: Présentation seule : le dessin est fait à pleine résolution, puis réduit.
+VIDEO_MAX_WIDTH = 960
 
 #: Délai d'attente d'un changement avant un commentaire de maintien SSE (s).
 KEEPALIVE_SECONDS = 15.0
@@ -58,34 +66,38 @@ PHASE_WAITING = "attente"          # serveur prêt, première image pas encore l
 PHASE_CALIBRATION = "calibration"  # choix du mode / tracé de la ligne
 PHASE_DEMO = "demonstration"       # traitement en cours ou terminé
 
+#: Étapes affichées entre la validation et la première image traitée.
+STEP_LOADING = "chargement_modeles"
+STEP_STARTING = "demarrage"
+
 #: Modes reçus du navigateur.
 MODE_LINE = "ligne"
 MODE_NO_LINE = "sans_ligne"
 
 
-def render_line_only(frame: np.ndarray, line: Any | None) -> np.ndarray:
-    """Copie de ``frame`` avec, pour seul ajout, la ligne virtuelle.
+def render_line_overlay(
+    frame: np.ndarray, line: Any | None, dead_zone_px: float | None
+) -> np.ndarray:
+    """Copie de ``frame`` avec la ligne, la zone morte et la flèche, rien d'autre.
 
-    ``line`` expose ``to_pixels(width, height)`` (``VirtualLine``) ; ``None``
-    (mode sans ligne) renvoie l'image intacte. L'image source n'est jamais
-    modifiée.
+    Dessin délégué à :func:`calibration.draw_line_overlay`, celui de la fenêtre
+    OpenCV. ``line`` à ``None`` (mode sans ligne) renvoie l'image intacte.
+    L'image source n'est jamais modifiée.
     """
     rendered = frame.copy()
     if line is not None:
-        height, width = rendered.shape[:2]
-        start, end = line.to_pixels(width, height)
-        cv2.line(
-            rendered,
-            (int(round(start[0])), int(round(start[1]))),
-            (int(round(end[0])), int(round(end[1]))),
-            LINE_COLOR_BGR,
-            LINE_THICKNESS,
-            cv2.LINE_AA,
-        )
+        draw_line_overlay(rendered, line, dead_zone_px)
     return rendered
 
 
-def encode_jpeg(frame: np.ndarray) -> bytes | None:
+def encode_jpeg(frame: np.ndarray, max_width: int | None = None) -> bytes | None:
+    """JPEG (qualité :data:`JPEG_QUALITY`), réduit à ``max_width`` si plus large."""
+    width = frame.shape[1]
+    if max_width is not None and width > max_width:
+        height = int(round(frame.shape[0] * max_width / width))
+        # INTER_LINEAR : 3,3 ms par image de fort_occ4 contre 5,5 ms en INTER_AREA,
+        # même poids (51 Kio), à peine plus que l'ancien encodage pleine taille.
+        frame = cv2.resize(frame, (max_width, height), interpolation=cv2.INTER_LINEAR)
     ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
     return buffer.tobytes() if ok else None
 
@@ -106,11 +118,20 @@ class WebState:
         self._phase = PHASE_WAITING
         self._frame: np.ndarray | None = None
         self._frame_seq = 0
+        #: JPEG de l'image courante, encodé une seule fois (au premier lecteur).
+        self._jpeg: bytes | None = None
+        self._jpeg_seq = 0
+        self._viewers = 0
         self._stats: dict[str, Any] = {}
         self._stats_seq = 0
         self._set_mode_stats(no_line)
         # Calibration web.
         self._calibration_jpeg: bytes | None = None
+        self._calibration_render: np.ndarray | None = None
+        self._calibration_version = 0
+        self._canvas: np.ndarray | None = None
+        self._selection: LineSelection | None = None
+        self._choosing_mode = True
         self._frame_size = (0, 0)
         self._inside_side = "negative"
         self._min_length_ratio = 0.05
@@ -120,34 +141,131 @@ class WebState:
     def open_calibration(
         self, frame: np.ndarray, *, inside_side: str, min_length_ratio: float
     ) -> None:
-        """Première image affichée dans la page, en attente du choix de l'opérateur."""
-        payload = encode_jpeg(frame)
+        """Première image affichée dans la page, en attente du choix de l'opérateur.
+
+        Même état initial que :func:`calibration.select_line` : image à la taille
+        de la fenêtre de sélection, question « ligne ou pas » posée d'abord.
+        """
+        canvas = display_canvas(frame)
+        selection = LineSelection(
+            frame_width=int(frame.shape[1]),
+            frame_height=int(frame.shape[0]),
+            display_width=int(canvas.shape[1]),
+            display_height=int(canvas.shape[0]),
+            inside_side=inside_side,
+            min_length_ratio=min_length_ratio,
+        )
+        selection.set_message("Cliquer l'extremite 1 de la ligne.", error=False)
         with self._cond:
-            self._calibration_jpeg = payload
+            self._canvas = canvas
+            self._selection = selection
+            self._choosing_mode = True
             self._frame_size = (int(frame.shape[1]), int(frame.shape[0]))
             self._inside_side = inside_side
             self._min_length_ratio = float(min_length_ratio)
+            self._render_calibration()
             self._phase = PHASE_CALIBRATION
             self._update_stats(phase=PHASE_CALIBRATION)
             self._cond.notify_all()
 
+    def _render_calibration(self) -> None:
+        """Redessine l'aperçu par les fonctions OpenCV (appelé sous verrou)."""
+        if self._canvas is None or self._selection is None:
+            return
+        if self._choosing_mode:
+            image = draw_mode_question(self._canvas.copy())
+        else:
+            image = self._selection.draw(self._canvas.copy())
+        self._calibration_render = image
+        self._calibration_jpeg = encode_jpeg(image)
+        self._calibration_version += 1
+
     def calibration_info(self) -> dict[str, Any]:
         with self._cond:
             width, height = self._frame_size
+            selection = self._selection
             return {
                 "phase": self._phase,
                 "largeur": width,
                 "hauteur": height,
-                "cote_interieur": self._inside_side,
+                "cote_interieur": selection.inside_side if selection else self._inside_side,
                 "longueur_min": self._min_length_ratio,
+                "version": self._calibration_version,
+                "question": self._choosing_mode,
+                "points": len(selection.clicks_px) if selection else 0,
             }
 
     def calibration_image(self) -> bytes | None:
         with self._cond:
             return self._calibration_jpeg
 
+    def calibration_render(self) -> np.ndarray | None:
+        """Dernier aperçu de calibration, avant encodage (tests)."""
+        with self._cond:
+            return self._calibration_render
+
+    def calibration_action(self, data: Any) -> tuple[bool, str]:
+        """Applique un clic ou une touche reçus du navigateur. Renvoie ``(accepté, message)``.
+
+        Mêmes effets que dans la fenêtre OpenCV (:func:`calibration.select_line`) :
+        « ligne » (O), « sans_ligne » (N), « clic » (coordonnées normalisées dans
+        l'image affichée), « valider » (C), « recommencer » (G), « inverser » (I).
+        « retour » (Échap) revient à la question « ligne ou pas », ligne effacée —
+        dans la fenêtre OpenCV, Échap annule le programme.
+        """
+        if not isinstance(data, dict):
+            return False, "Requête invalide."
+        action = data.get("action")
+        with self._cond:
+            selection = self._selection
+            if (
+                self._phase != PHASE_CALIBRATION
+                or self._calibration_result is not None
+                or selection is None
+            ):
+                return False, "La calibration n'est pas attendue (déjà validée ou pas encore prête)."
+            accepted, message = True, ""
+            if action == "ligne":
+                self._choosing_mode = False
+            elif action == "sans_ligne":
+                self._calibration_result = (MODE_NO_LINE, None)
+                message = "Calibration validée : traitement lancé."
+            elif action == "retour":
+                selection.reset()
+                selection.set_message("Cliquer l'extremite 1 de la ligne.", error=False)
+                self._choosing_mode = True
+            elif self._choosing_mode:
+                return False, "Choisissez d'abord : avec ou sans ligne."
+            elif action == "clic":
+                try:
+                    x, y = _point((data.get("x"), data.get("y")), "cliqué")
+                except LineError as error:
+                    return False, str(error)
+                if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                    return False, "Point hors de l'image : cliquez à l'intérieur de l'image."
+                accepted = selection.click(x * selection.display_width, y * selection.display_height)
+                message = selection.message
+            elif action == "valider":
+                try:
+                    self._calibration_result = (MODE_LINE, selection.confirm())
+                    message = "Calibration validée : traitement lancé."
+                except LineError as error:
+                    selection.set_message(f"Ligne refusee : {error}", error=True)
+                    accepted, message = False, _message_fr(str(error), self._min_length_ratio)
+            elif action == "recommencer":
+                selection.reset()
+                message = selection.message
+            elif action == "inverser":
+                selection.invert_inside_side()
+                message = selection.message
+            else:
+                return False, "Action inconnue."
+            self._render_calibration()
+            self._cond.notify_all()
+            return accepted, message
+
     def submit_calibration(self, data: Any) -> tuple[bool, str]:
-        """Valide le choix reçu du navigateur. Renvoie ``(accepté, message)``.
+        """Valide une ligne transmise directement (sans clics). Renvoie ``(accepté, message)``.
 
         Mêmes règles que la calibration OpenCV (:func:`geometry.validate_line`) :
         coordonnées normalisées, points distincts, longueur minimale.
@@ -208,11 +326,18 @@ class WebState:
                 self._cond.wait(timeout=poll_seconds)
 
     # -- Démonstration (pipeline) ---------------------------------------------
-    def start_demo(self, *, no_line: bool) -> None:
+    def start_demo(self, *, no_line: bool, replay: bool = False) -> None:
         """Passage à la vue de démonstration, une fois le mode connu."""
         with self._cond:
             self._phase = PHASE_DEMO
             self._set_mode_stats(no_line)
+            self._stats["relecture"] = bool(replay)
+            self._cond.notify_all()
+
+    def set_step(self, step: str | None) -> None:
+        """Étape affichée avant la première image (chargement, démarrage)."""
+        with self._cond:
+            self._update_stats(etape=step)
             self._cond.notify_all()
 
     def _set_mode_stats(self, no_line: bool) -> None:
@@ -224,35 +349,57 @@ class WebState:
             "sans_ligne": bool(no_line),
             "etat": self._stats.get("etat", "en_cours"),
             "phase": self._phase,
+            "etape": self._stats.get("etape"),
+            "relecture": self._stats.get("relecture", False),
         }
         self._stats_seq += 1
 
+    @property
+    def has_viewer(self) -> bool:
+        """Un navigateur lit-il le flux vidéo ? Sans lecteur, rien n'est rendu."""
+        with self._cond:
+            return self._viewers > 0
+
+    def add_viewer(self) -> None:
+        with self._cond:
+            self._viewers += 1
+
+    def remove_viewer(self) -> None:
+        with self._cond:
+            self._viewers = max(0, self._viewers - 1)
+
     def publish(
         self,
-        frame: np.ndarray,
+        frame: np.ndarray | None,
         *,
         confirmed: int,
         total_in: int,
         total_out: int,
         total_new: int,
     ) -> None:
-        """Dépose l'image rendue et les quatre compteurs (IN/OUT ignorés sans ligne)."""
+        """Dépose l'image rendue et les quatre compteurs (IN/OUT ignorés sans ligne).
+
+        ``frame`` à ``None`` (aucun lecteur du flux) : compteurs seuls, la
+        dernière image reste en place.
+        """
         with self._cond:
-            self._frame = frame
-            self._frame_seq += 1
+            if frame is not None:
+                self._frame = frame
+                self._frame_seq += 1
             no_line = self._stats["sans_ligne"]
             self._update_stats(
                 presentes=int(confirmed),
                 entrees=None if no_line else int(total_in),
                 sorties=None if no_line else int(total_out),
                 nouvelles=int(total_new),
+                etape=None,
             )
             self._cond.notify_all()
 
     def finish(self) -> None:
         """Fin de la vidéo : la dernière image et les valeurs finales restent servies."""
         with self._cond:
-            self._update_stats(etat="termine")
+            self._update_stats(etat="termine", etape=None)
             self._cond.notify_all()
 
     def _update_stats(self, **values: Any) -> None:
@@ -277,10 +424,37 @@ class WebState:
             return self._stats_seq, dict(self._stats)
 
     def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, np.ndarray | None]:
-        """Attend une image postérieure à ``after_seq`` (ou le délai)."""
+        """Attend une image postérieure à ``after_seq`` (ou le délai).
+
+        Sans aucune image encore publiée, l'attente dure jusqu'au délai : un
+        retour immédiat ferait tourner le flux en boucle active et priverait le
+        pipeline de l'interpréteur (défaut mesuré : ~10 min avant la 1re image).
+        """
         with self._cond:
-            self._cond.wait_for(lambda: self._frame_seq != after_seq, timeout=timeout)
+            self._cond.wait_for(
+                lambda: self._frame is not None and self._frame_seq != after_seq,
+                timeout=timeout,
+            )
             return self._frame_seq, self._frame
+
+    def wait_jpeg(self, after_seq: int, timeout: float) -> tuple[int, bytes | None]:
+        """Comme :meth:`wait_frame`, mais renvoie le JPEG de la **dernière** image.
+
+        Encodé une seule fois par image, quel que soit le nombre de lecteurs,
+        réduit à :data:`VIDEO_MAX_WIDTH`. Aucune file : une image remplacée
+        avant d'être lue n'est jamais encodée.
+        """
+        seq, frame = self.wait_frame(after_seq, timeout)
+        if frame is None:
+            return seq, None
+        with self._cond:
+            if self._jpeg_seq == seq and self._jpeg is not None:
+                return seq, self._jpeg
+        payload = encode_jpeg(frame, VIDEO_MAX_WIDTH)
+        with self._cond:
+            if seq >= self._jpeg_seq:
+                self._jpeg, self._jpeg_seq = payload, seq
+        return seq, payload
 
 
 def _message_fr(message: str, min_ratio: float) -> str:
@@ -303,7 +477,7 @@ def create_app(
     keepalive_seconds: float = KEEPALIVE_SECONDS,
     video_resend_seconds: float = VIDEO_RESEND_SECONDS,
 ):
-    """Application Flask ; seule la route POST /calibration écrit (le choix de l'opérateur)."""
+    """Application Flask ; seules les routes POST /calibration[/action] écrivent (choix de l'opérateur)."""
     from flask import Flask, Response, jsonify, request, send_from_directory
 
     app = Flask(__name__, static_folder=None)
@@ -327,6 +501,14 @@ def create_app(
             return Response("Image de calibration indisponible.", status=404)
         return Response(payload, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
+    @app.post("/calibration/action")
+    def calibration_action():
+        # JSON exigé, comme POST /calibration.
+        if not request.is_json:
+            return jsonify({"accepte": False, "message": "Requête JSON attendue."}), 415
+        accepted, message = state.calibration_action(request.get_json(silent=True))
+        return jsonify({"accepte": accepted, "message": message, **state.calibration_info()})
+
     @app.post("/calibration")
     def calibration_submit():
         # JSON exigé : une page d'une autre origine ne peut pas l'envoyer sans
@@ -340,23 +522,26 @@ def create_app(
     def video():
         def stream() -> Iterator[bytes]:
             # Chaque partie est suivie de sa délimitation ; sans image nouvelle,
-            # la dernière est renvoyée (voir VIDEO_RESEND_SECONDS).
-            yield b"--frame\r\n"
-            seq = -1
-            part: bytes | None = None
-            while True:
-                new_seq, frame = state.wait_frame(seq, video_resend_seconds)
-                if frame is not None and new_seq != seq:
-                    seq = new_seq
-                    payload = encode_jpeg(frame)
-                    if payload is not None:
+            # la dernière est renvoyée (voir VIDEO_RESEND_SECONDS). Le pipeline
+            # ne rend les images que tant qu'un lecteur est connecté.
+            state.add_viewer()
+            try:
+                yield b"--frame\r\n"
+                seq = 0
+                part: bytes | None = None
+                while True:
+                    new_seq, payload = state.wait_jpeg(seq, video_resend_seconds)
+                    if payload is not None and new_seq != seq:
+                        seq = new_seq
                         part = (
                             b"Content-Type: image/jpeg\r\nContent-Length: "
                             + str(len(payload)).encode()
                             + b"\r\n\r\n" + payload + b"\r\n--frame\r\n"
                         )
-                if part is not None:
-                    yield part
+                    if part is not None:
+                        yield part
+            finally:
+                state.remove_viewer()
 
         return Response(stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
 

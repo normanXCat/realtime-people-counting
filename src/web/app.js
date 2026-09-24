@@ -1,6 +1,7 @@
 // Interface web : calibration dans le navigateur, puis vue de démonstration.
-// Aucune logique de comptage ici : la page envoie la ligne (ou « sans ligne »)
-// au serveur, qui la valide comme la calibration OpenCV, puis affiche l'état publié.
+// Aucune logique de comptage ni aucun dessin ici : la page envoie clics et
+// touches au serveur, qui applique la calibration OpenCV et renvoie les images,
+// puis elle affiche l'état publié (traitement en direct ou relecture).
 (function () {
   "use strict";
 
@@ -19,23 +20,11 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Géométrie : même convention que geometry.signed_perpendicular_distance.
-  // d(P) = ((px - x1) * dy - (py - y1) * dx) / |AB| ; P est à l'intérieur si
-  // d(P) * signe(côté) > 0, avec signe(« positive ») = +1, signe(« negative ») = -1.
-  // Le signe ne dépend pas de l'échelle d'affichage (coordonnées positives).
+  // Calibration : la page ne dessine rien. Chaque clic et chaque touche est
+  // envoyé au serveur, qui l'applique à la sélection de la fenêtre OpenCV et
+  // renvoie l'image redessinée par les fonctions OpenCV (src/calibration.py).
   // ---------------------------------------------------------------------------
-  function signeCote(cote) { return cote === "positive" ? 1 : -1; }
-
-  function directionInterieure(a, b, cote) {
-    var dx = b.x - a.x, dy = b.y - a.y, n = Math.hypot(dx, dy) || 1;
-    var s = signeCote(cote);
-    return { x: s * dy / n, y: -s * dx / n };
-  }
-
-  // ---------------------------------------------------------------------------
-  // Calibration
-  // ---------------------------------------------------------------------------
-  var calib = { info: null, points: [], cote: "negative", enCours: false, prete: false };
+  var calib = { info: null, points: 0, enCours: false, prete: false };
   var image = $("image-calibration");
   var toile = $("trace");
   var message = $("message");
@@ -45,178 +34,100 @@
     message.classList.toggle("erreur", !!erreur);
   }
 
+  function rafraichirImage(version) {
+    image.src = "/calibration/image?v=" + encodeURIComponent(version);
+  }
+
   function demarrerCalibration() {
     if (calib.prete) { return; }
     calib.prete = true;
-    image.src = "/calibration/image?t=" + Date.now();
-    image.onload = dessiner;
-    if (window.ResizeObserver) { new ResizeObserver(dessiner).observe(image); }
-    else { window.addEventListener("resize", dessiner); }
-  }
-
-  function taillesToile() {
-    var r = window.devicePixelRatio || 1;
-    var w = image.clientWidth, h = image.clientHeight;
-    if (toile.width !== Math.round(w * r) || toile.height !== Math.round(h * r)) {
-      toile.width = Math.round(w * r);
-      toile.height = Math.round(h * r);
-    }
-    return { w: w, h: h, r: r };
-  }
-
-  function versPixels(p, t) { return { x: p.x * t.w, y: p.y * t.h }; }
-
-  function dessiner() {
-    var t = taillesToile();
-    var ctx = toile.getContext("2d");
-    ctx.setTransform(t.r, 0, 0, t.r, 0, 0);
-    ctx.clearRect(0, 0, t.w, t.h);
-    var accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#ffc800";
-    var pts = calib.points.map(function (p) { return versPixels(p, t); });
-
-    if (pts.length === 2) {
-      var a = pts[0], b = pts[1];
-      var dx = b.x - a.x, dy = b.y - a.y, n = Math.hypot(dx, dy);
-      if (n > 0) {
-        var ux = dx / n, uy = dy / n, grand = 4 * Math.hypot(t.w, t.h);
-        var ext1 = { x: a.x - ux * grand, y: a.y - uy * grand };
-        var ext2 = { x: b.x + ux * grand, y: b.y + uy * grand };
-        var d = directionInterieure(a, b, calib.cote);
-
-        // Côté intérieur légèrement teinté : demi-plan limité par la droite prolongée.
-        ctx.beginPath();
-        ctx.moveTo(ext1.x, ext1.y);
-        ctx.lineTo(ext2.x, ext2.y);
-        ctx.lineTo(ext2.x + d.x * grand, ext2.y + d.y * grand);
-        ctx.lineTo(ext1.x + d.x * grand, ext1.y + d.y * grand);
-        ctx.closePath();
-        ctx.fillStyle = "rgba(255, 200, 0, 0.16)";
-        ctx.fill();
-
-        // Prolongement en pointillés sur toute l'image.
-        ctx.save();
-        ctx.setLineDash([10, 8]);
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-        ctx.beginPath();
-        ctx.moveTo(ext1.x, ext1.y);
-        ctx.lineTo(ext2.x, ext2.y);
-        ctx.stroke();
-        ctx.restore();
-
-        // Segment tracé.
-        ctx.lineWidth = 4;
-        ctx.strokeStyle = accent;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
-        ctx.stroke();
-
-        // Étiquettes des deux côtés.
-        var m = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, off = 0.1 * Math.min(t.w, t.h);
-        etiquette(ctx, "Intérieur", m.x + d.x * off, m.y + d.y * off, accent);
-        etiquette(ctx, "Extérieur", m.x - d.x * off, m.y - d.y * off, "#ffffff");
-      }
-    }
-
-    pts.forEach(function (p, i) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 7, 0, 2 * Math.PI);
-      ctx.fillStyle = accent;
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "#111";
-      ctx.stroke();
-      etiquette(ctx, String(i + 1), p.x + 16, p.y - 16, "#ffffff");
-    });
-  }
-
-  function etiquette(ctx, texte, x, y, couleur) {
-    ctx.font = "600 16px system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    var w = ctx.measureText(texte).width + 16;
-    ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
-    ctx.fillRect(x - w / 2, y - 14, w, 28);
-    ctx.fillStyle = couleur;
-    ctx.fillText(texte, x, y);
+    var info = calib.info || {};
+    // Page rechargée pendant le tracé : reprendre l'état du serveur.
+    calib.points = info.points || 0;
+    $("choix-mode").hidden = info.question === false;
+    $("outils-ligne").hidden = info.question !== false;
+    majOutils();
+    rafraichirImage(info.version !== undefined ? info.version : Date.now());
   }
 
   function majOutils() {
-    var n = calib.points.length;
+    var n = calib.points;
     $("btn-inverser").disabled = n < 2;
     $("btn-valider").disabled = n < 2 || calib.enCours;
     $("consigne").textContent = n === 0 ? "Cliquez le premier point de la ligne."
       : n === 1 ? "Cliquez le second point de la ligne."
       : "Ligne tracée. Vérifiez le côté intérieur, puis validez.";
-    dessiner();
   }
+
+  // Envoie une action ; l'image et le nombre de points viennent du serveur.
+  function agir(corps, suite) {
+    calib.enCours = true;
+    majOutils();
+    return fetch("/calibration/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(corps)
+    }).then(function (r) { return r.json(); }).then(function (rep) {
+      calib.enCours = false;
+      if (typeof rep.points === "number") { calib.points = rep.points; }
+      if (rep.version !== undefined) { rafraichirImage(rep.version); }
+      majOutils();
+      if (!rep.accepte) { dire(rep.message, true); return; }
+      dire("");
+      if (suite) { suite(rep); }
+    }).catch(function () {
+      calib.enCours = false;
+      dire("Serveur injoignable : l'action n'a pas été envoyée.", true);
+      majOutils();
+    });
+  }
+
+  function lancer(rep) { dire(rep.message, false); montrer("demo"); }
 
   toile.addEventListener("click", function (ev) {
     if ($("outils-ligne").hidden) { return; }
-    if (calib.points.length >= 2) {
-      dire("Deux points sont déjà placés : G (Recommencer) pour tracer une autre ligne.", true);
-      return;
-    }
     var rect = toile.getBoundingClientRect();
-    // Coordonnées normalisées : indépendantes de la taille d'affichage,
-    // rapportées par le serveur à la taille réelle de l'image.
-    var p = {
+    // Coordonnées normalisées dans l'image affichée : le serveur les rapporte
+    // à la taille de l'image de la fenêtre de sélection.
+    agir({
+      action: "clic",
       x: Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width)),
       y: Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height))
-    };
-    calib.points.push(p);
-    dire("");
-    majOutils();
+    });
   });
 
   function traceActif() { return vueCourante === "calibration" && !$("outils-ligne").hidden; }
 
   $("btn-ligne").addEventListener("click", function () {
-    $("choix-mode").hidden = true;
-    $("outils-ligne").hidden = false;
-    calib.points = [];
-    calib.cote = (calib.info && calib.info.cote_interieur) || "negative";
-    dire("");
-    majOutils();
+    agir({ action: "ligne" }, function () {
+      $("choix-mode").hidden = true;
+      $("outils-ligne").hidden = false;
+    });
   });
 
   function inverser() {
-    if (calib.points.length < 2) { return; }
-    calib.cote = calib.cote === "positive" ? "negative" : "positive";
-    dessiner();
+    if (calib.points < 2) { return; }
+    agir({ action: "inverser" });
   }
 
-  function recommencer() {
-    calib.points = [];
-    dire("");
-    majOutils();
-  }
+  function recommencer() { agir({ action: "recommencer" }); }
 
   function retour() {
     // Échap : retour à la question « ligne ou pas », ligne effacée.
-    calib.points = [];
-    dire("");
-    $("outils-ligne").hidden = true;
-    $("choix-mode").hidden = false;
-    dessiner();
-    $("btn-ligne").focus();
+    agir({ action: "retour" }, function () {
+      $("outils-ligne").hidden = true;
+      $("choix-mode").hidden = false;
+      $("btn-ligne").focus();
+    });
   }
 
   function valider() {
-    if (calib.points.length < 2) {
+    if (calib.points < 2) {
       dire("Placez d'abord les deux extrémités de la ligne.", true);
       return;
     }
     if (calib.enCours) { return; }
-    var a = calib.points[0], b = calib.points[1];
-    envoyer({
-      mode: "ligne",
-      p1: [a.x, a.y],
-      p2: [b.x, b.y],
-      cote_interieur: calib.cote,
-      largeur_affichee: image.clientWidth
-    });
+    agir({ action: "valider" }, lancer);
   }
 
   var actions = { valider: valider, recommencer: recommencer, inverser: inverser, retour: retour };
@@ -235,26 +146,8 @@
     actions[action]();
   });
 
-  function envoyer(corps) {
-    calib.enCours = true;
-    majOutils();
-    return fetch("/calibration", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(corps)
-    }).then(function (r) { return r.json(); }).then(function (rep) {
-      calib.enCours = false;
-      if (rep.accepte) { dire(rep.message, false); montrer("demo"); }
-      else { dire(rep.message, true); majOutils(); }
-    }).catch(function () {
-      calib.enCours = false;
-      dire("Serveur injoignable : la calibration n'a pas été envoyée.", true);
-      majOutils();
-    });
-  }
-
   $("btn-sans-ligne").addEventListener("click", function () {
-    envoyer({ mode: "sans_ligne" });
+    agir({ action: "sans_ligne" }, lancer);
   });
 
   // ---------------------------------------------------------------------------
@@ -262,11 +155,11 @@
   // ---------------------------------------------------------------------------
   var demoLancee = false;
   var termine = false;
-  var textesEtat = { en_cours: "En cours", termine: "Terminé", hors_ligne: "Connexion perdue" };
+  var relecture = false;
 
   function afficherEtat(valeur) {
     $("etat").setAttribute("data-etat", valeur);
-    $("etat-texte").textContent = textesEtat[valeur] || valeur;
+    $("etat-texte").textContent = Interface.texteEtat(valeur, relecture);
   }
 
   function afficher(nom, valeur) {
@@ -300,6 +193,10 @@
     afficher("sorties", v.sorties);
     afficher("nouvelles", v.nouvelles);
     $("mode-texte").textContent = Interface.texteMode(v.sans_ligne);
+    // Avant la première image : « Chargement des modèles… », puis « Démarrage… ».
+    if (v.etape) { $("demarrage").textContent = Interface.texteEtape(v.etape); }
+    if (v.relecture && !relecture) { document.title = "Relecture : " + document.title; }
+    relecture = !!v.relecture;
     termine = v.etat === "termine";
     afficherEtat(v.etat);
   };

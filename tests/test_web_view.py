@@ -21,16 +21,23 @@ import web_view  # noqa: E402
 from geometry import Side, VirtualLine  # noqa: E402
 from main import apply_cli_overrides, build_argument_parser  # noqa: E402
 from config import load_config  # noqa: E402
+from calibration import (  # noqa: E402
+    LineSelection,
+    display_canvas,
+    draw_line_overlay,
+    draw_mode_question,
+)
 from web_view import (  # noqa: E402
     HOST,
-    LINE_COLOR_BGR,
     PHASE_CALIBRATION,
     PHASE_DEMO,
     PHASE_WAITING,
+    STEP_LOADING,
+    VIDEO_MAX_WIDTH,
     WebState,
     create_app,
     encode_jpeg,
-    render_line_only,
+    render_line_overlay,
 )
 
 
@@ -51,25 +58,59 @@ def _calibrating_state(width: int = 160, height: int = 120) -> WebState:
 
 
 # ---------------------------------------------------------------------------
-# Rendu dédié : la ligne, et rien d'autre
+# Rendu web : ligne, zone morte et flèche, dessin de la fenêtre OpenCV
 # ---------------------------------------------------------------------------
-def test_rendu_dedie_ne_dessine_que_la_ligne():
-    frame = _frame()
-    rendered = render_line_only(frame, _line())
-    changed = np.any(rendered != frame, axis=2)
-    rows = np.nonzero(changed.any(axis=1))[0]
-    cols = np.nonzero(changed.any(axis=0))[0]
-    # Tous les pixels modifiés sont dans la bande de la ligne (y = 60, x 16..144).
-    assert rows.min() >= 60 - 4 and rows.max() <= 60 + 4
-    assert cols.min() >= 16 - 4 and cols.max() <= 144 + 4
-    assert tuple(int(c) for c in rendered[60, 80]) == LINE_COLOR_BGR
-    # L'image source n'est jamais modifiée.
-    assert np.all(frame == 40)
+def _manager_with_scale(line, heights=(200.0,) * 5):
+    from occupancy_manager import OccupancyManager
+
+    manager = OccupancyManager(load_config(), line=line)
+    for height in heights:
+        manager.scale.observe(height)
+    return manager
+
+
+@pytest.mark.parametrize("line", [
+    VirtualLine(p1=(0.383, 1.0), p2=(0.56, 0.55), inside_side="negative"),
+    VirtualLine(p1=(0.05, 0.6), p2=(0.95, 0.6), inside_side="positive"),
+])
+def test_rendu_web_identique_au_pixel_a_draw_overlay_sans_boites_ni_hud(monkeypatch, line):
+    """Même image, même état : le rendu web de la ligne, de la zone morte et de
+    la flèche est celui de draw_overlay privé des boîtes, marqueurs et HUD."""
+    frame = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+    manager = _manager_with_scale(line)
+    assert manager.dead_zone_px() == pytest.approx(0.15 * 200.0)
+    monkeypatch.setattr(manager, "_draw_hud", lambda _frame: None)
+    assert not manager._views and not manager.tracks  # aucune boîte ni « ? »
+    opencv = frame.copy()
+    manager.draw_overlay(opencv)
+    web = render_line_overlay(frame, line, manager.dead_zone_px())
+    assert np.array_equal(web, opencv)
+    # Les trois éléments sont bien dessinés, et l'image source reste intacte.
+    assert not np.array_equal(web, frame)
+    assert np.array_equal(frame, np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8))
+
+
+def test_rendu_web_contient_zone_morte_et_fleche():
+    """La zone morte (bande teintée) et la flèche changent l'image : sans elles,
+    le rendu diffère."""
+    line = VirtualLine(p1=(0.1, 0.5), p2=(0.9, 0.5), inside_side="negative")
+    frame = _frame(shape=(360, 640, 3))
+    with_zone = render_line_overlay(frame, line, 40.0)
+    without_zone = render_line_overlay(frame, line, None)
+    assert not np.array_equal(with_zone, without_zone)
+    # Bande de la zone morte : au-dessus de la ligne, hors flèche et libellés,
+    # l'image est teintée (jaune translucide).
+    assert not np.array_equal(with_zone[170, 100], frame[170, 100])
+    assert np.array_equal(without_zone[170, 100], frame[170, 100])
+    # Flèche vers l'intérieur (côté negative = sous la ligne en y image) : pixels
+    # verts sous le milieu de la ligne.
+    column = with_zone[190:220, 320]
+    assert (column[:, 1] > 200).any()
 
 
 def test_rendu_dedie_sans_ligne_laisse_l_image_intacte():
     frame = _frame()
-    rendered = render_line_only(frame, None)
+    rendered = render_line_overlay(frame, None, 30.0)
     assert rendered is not frame
     assert np.array_equal(rendered, frame)
 
@@ -92,6 +133,53 @@ def test_objet_partage_publie_image_et_quatre_compteurs():
     assert (values1["presentes"], values1["entrees"], values1["sorties"], values1["nouvelles"]) == (5, 4, 1, 2)
     frame_seq, published = state.frame()
     assert frame_seq == 1 and published is frame
+
+
+def test_objet_partage_sans_lecteur_compteurs_seuls():
+    """Sans navigateur, le pipeline ne rend pas d'image (frame None) : les
+    compteurs avancent, l'image précédente reste."""
+    state = WebState()
+    assert state.has_viewer is False
+    frame = _frame()
+    state.publish(frame, confirmed=1, total_in=1, total_out=0, total_new=0)
+    state.publish(None, confirmed=2, total_in=2, total_out=0, total_new=0)
+    assert state.frame() == (1, frame)
+    assert state.stats()[1]["presentes"] == 2
+    state.add_viewer()
+    assert state.has_viewer is True
+    state.remove_viewer()
+    assert state.has_viewer is False
+
+
+def test_attente_d_image_sans_boucle_active():
+    """Avant toute image, l'attente dure jusqu'au délai (pas de retour
+    immédiat : la boucle active privait le pipeline de l'interpréteur)."""
+    import time as _time
+
+    state = WebState()
+    started = _time.perf_counter()
+    assert state.wait_jpeg(0, timeout=0.2) == (0, None)
+    assert _time.perf_counter() - started >= 0.18
+
+
+def test_jpeg_encode_une_fois_et_reduit():
+    state = WebState()
+    big = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+    state.publish(big, confirmed=0, total_in=0, total_out=0, total_new=0)
+    seq, payload = state.wait_jpeg(0, timeout=1.0)
+    assert seq == 1
+    decoded = __import__("cv2").imdecode(np.frombuffer(payload, np.uint8), 1)
+    assert decoded.shape[1] == VIDEO_MAX_WIDTH and decoded.shape[0] == 540
+    assert state.wait_jpeg(0, timeout=1.0)[1] is payload  # même objet : pas de ré-encodage
+
+
+def test_etapes_avant_la_premiere_image():
+    state = WebState()
+    state.start_demo(no_line=False)
+    state.set_step(STEP_LOADING)
+    assert state.stats()[1]["etape"] == STEP_LOADING
+    state.publish(None, confirmed=0, total_in=0, total_out=0, total_new=0)
+    assert state.stats()[1]["etape"] is None
 
 
 def test_objet_partage_ne_change_de_version_que_si_une_valeur_change():
@@ -185,27 +273,97 @@ def test_calibration_web_normalisee_sur_la_taille_reelle_de_l_image():
     assert line.inside_side == "negative"
 
 
+def _opencv_window(frame, inside_side="negative"):
+    """Même état initial que la fenêtre de select_line."""
+    canvas = display_canvas(frame)
+    selection = LineSelection(
+        frame_width=frame.shape[1], frame_height=frame.shape[0],
+        display_width=canvas.shape[1], display_height=canvas.shape[0],
+        inside_side=inside_side,
+    )
+    selection.set_message("Cliquer l'extremite 1 de la ligne.", error=False)
+    return canvas, selection
+
+
+def test_calibration_web_apercu_identique_a_la_fenetre_opencv():
+    """À chaque action, l'aperçu servi est l'image de la fenêtre OpenCV pour la
+    même suite de clics et de touches, au pixel près."""
+    frame = np.random.default_rng(1).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+    state = WebState()
+    state.open_calibration(frame, inside_side="negative", min_length_ratio=0.05)
+    canvas, selection = _opencv_window(frame)
+    assert canvas.shape[:2] == (607, 1080)
+    # Question « ligne ou pas » d'abord, comme dans la fenêtre.
+    assert np.array_equal(state.calibration_render(), draw_mode_question(canvas.copy()))
+
+    steps = [
+        ({"action": "ligne"}, lambda: None),
+        ({"action": "clic", "x": 0.383, "y": 0.99},
+         lambda: selection.click(0.383 * 1080, 0.99 * 607)),
+        ({"action": "clic", "x": 0.56, "y": 0.55},
+         lambda: selection.click(0.56 * 1080, 0.55 * 607)),
+        ({"action": "inverser"}, selection.invert_inside_side),
+        ({"action": "clic", "x": 0.1, "y": 0.1},  # troisième clic refusé
+         lambda: selection.click(0.1 * 1080, 0.1 * 607)),
+        ({"action": "inverser"}, selection.invert_inside_side),
+    ]
+    for data, opencv_action in steps:
+        state.calibration_action(data)
+        opencv_action()
+        assert np.array_equal(state.calibration_render(), selection.draw(canvas.copy())), data
+    assert state.calibration_info()["points"] == 2
+
+    accepted, _ = state.calibration_action({"action": "valider"})
+    assert accepted
+    mode, validated = state.wait_calibration()
+    expected = selection.confirm()
+    assert mode == "ligne"
+    assert (validated.p1, validated.p2, validated.inside_side) == (expected.p1, expected.p2, "negative")
+    assert validated.display_scale == pytest.approx(1080 / 1280)
+    assert validated.clicks_px == expected.clicks_px
+
+
+def test_calibration_web_recommencer_retour_et_refus():
+    state = _calibrating_state(width=640, height=480)
+    assert not state.calibration_action({"action": "clic", "x": 0.5, "y": 0.5})[0]  # question d'abord
+    state.calibration_action({"action": "ligne"})
+    state.calibration_action({"action": "clic", "x": 0.5, "y": 0.5})
+    state.calibration_action({"action": "clic", "x": 0.51, "y": 0.5})
+    accepted, message = state.calibration_action({"action": "valider"})
+    assert not accepted and "trop courte" in message
+    # Refus affiché aussi dans l'image, comme dans la fenêtre OpenCV.
+    assert state._selection.message.startswith("Ligne refusee")
+    state.calibration_action({"action": "recommencer"})
+    assert state.calibration_info()["points"] == 0
+    state.calibration_action({"action": "clic", "x": 0.2, "y": 0.5})
+    state.calibration_action({"action": "retour"})
+    info = state.calibration_info()
+    assert info["question"] is True and info["points"] == 0
+    assert not state.calibration_action({"action": "clic", "x": 1.5, "y": 0.5})[0]
+    assert not state.calibration_action({"action": "inconnue"})[0]
+    assert state.calibration_action({"action": "sans_ligne"})[0]
+    assert state.wait_calibration() == ("sans_ligne", None)
+    assert not state.calibration_action({"action": "ligne"})[0]  # déjà validée
+
+
 @pytest.mark.parametrize("cote", ["negative", "positive"])
-def test_calibration_web_inversion_et_cote_teinte_coherents(cote):
-    """Le côté teinté par la page (formule de app.js) est l'intérieur du pipeline."""
-    state = _calibrating_state()
-    assert state.submit_calibration(
-        {"mode": "ligne", "p1": [0.2, 0.3], "p2": [0.8, 0.6], "cote_interieur": cote}
-    )[0]
+def test_calibration_web_fleche_vers_l_interieur_du_pipeline(cote):
+    """La flèche de l'aperçu (dessin OpenCV) pointe vers le côté compté intérieur."""
+    frame = _frame(shape=(480, 640, 3))
+    state = WebState()
+    state.open_calibration(frame, inside_side=cote, min_length_ratio=0.05)
+    for data in ({"action": "ligne"}, {"action": "clic", "x": 0.2, "y": 0.5},
+                 {"action": "clic", "x": 0.8, "y": 0.5}):
+        state.calibration_action(data)
+    image = state.calibration_render()
+    # Pointe de la flèche verte : 0,12 x 480 px du milieu, du côté intérieur.
+    above = (image[290:300, 320, 1] > 200).any() and (image[290:300, 320, 2] < 60).any()
+    below = (image[180:190, 320, 1] > 200).any() and (image[180:190, 320, 2] < 60).any()
+    state.calibration_action({"action": "valider"})
     _, validated = state.wait_calibration()
-    assert validated.inside_side == cote
     line = VirtualLine(p1=validated.p1, p2=validated.p2, inside_side=cote)
-    # directionInterieure (app.js) : signe(côté) * (dy, -dx), en pixels affichés.
-    width, height = 160, 120
-    ax, ay = 0.2 * width, 0.3 * height
-    bx, by = 0.8 * width, 0.6 * height
-    sign = 1 if cote == "positive" else -1
-    dx, dy = bx - ax, by - ay
-    mid = ((ax + bx) / 2, (ay + by) / 2)
-    teinte = (mid[0] + sign * dy * 0.2, mid[1] - sign * dx * 0.2)
-    oppose = (mid[0] - sign * dy * 0.2, mid[1] + sign * dx * 0.2)
-    assert line.side(teinte, width, height) is Side.INTERIEURE
-    assert line.side(oppose, width, height) is Side.EXTERIEURE
+    inside_down = line.side((320, 400), 640, 480) is Side.INTERIEURE
+    assert (above, below) == ((True, False) if inside_down else (False, True))
 
 
 def test_calibration_web_sans_ligne_et_validation_unique():
@@ -260,6 +418,7 @@ def test_routes_de_calibration(client_and_state):
     assert info == {
         "phase": PHASE_CALIBRATION, "largeur": 128, "hauteur": 72,
         "cote_interieur": "negative", "longueur_min": 0.05,
+        "version": 1, "question": True, "points": 0,
     }
     image = client.get("/calibration/image")
     assert image.status_code == 200 and image.mimetype == "image/jpeg"
@@ -274,6 +433,20 @@ def test_routes_de_calibration(client_and_state):
     assert state.wait_calibration()[1].inside_side == "positive"
 
 
+def test_route_action_de_calibration(client_and_state):
+    client, state = client_and_state
+    state.open_calibration(_frame(shape=(72, 128, 3)), inside_side="negative", min_length_ratio=0.05)
+    assert client.post("/calibration/action", data="action=ligne").status_code == 415
+    reponse = client.post("/calibration/action", json={"action": "ligne"}).get_json()
+    assert reponse["accepte"] is True and reponse["question"] is False and reponse["version"] == 2
+    reponse = client.post("/calibration/action", json={"action": "clic", "x": 0.1, "y": 0.5}).get_json()
+    assert reponse["points"] == 1
+    client.post("/calibration/action", json={"action": "clic", "x": 0.9, "y": 0.5})
+    reponse = client.post("/calibration/action", json={"action": "valider"}).get_json()
+    assert reponse["accepte"] is True
+    assert state.wait_calibration()[0] == "ligne"
+
+
 def test_route_video_flux_mjpeg(client_and_state):
     client, state = client_and_state
     state.publish(_frame(), confirmed=0, total_in=0, total_out=0, total_new=0)
@@ -285,7 +458,8 @@ def test_route_video_flux_mjpeg(client_and_state):
     part = next(chunks)
     assert part.startswith(b"Content-Type: image/jpeg")
     # Délimitation émise juste après l'image : la dernière image s'affiche aussi.
-    assert part.endswith(encode_jpeg(state.frame()[1]) + b"\r\n--frame\r\n")
+    assert part.endswith(encode_jpeg(state.frame()[1], VIDEO_MAX_WIDTH) + b"\r\n--frame\r\n")
+    assert state.has_viewer is True
     # Sans image nouvelle (fin de vidéo), la dernière est renvoyée.
     assert next(chunks) == part
     response.close()

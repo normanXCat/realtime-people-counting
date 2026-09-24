@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 import cv2
+import numpy as np
 
 from geometry import LineError, Point, line_length_normalized, sign_of_side, validate_line
 
@@ -341,52 +342,7 @@ class LineSelection:
         start = (int(round(points[0][0])), int(round(points[0][1])))
         end = (int(round(points[1][0])), int(round(points[1][1])))
         cv2.line(canvas, start, end, (0, 255, 0), 3, cv2.LINE_AA)
-
-        dx = float(end[0] - start[0])
-        dy = float(end[1] - start[1])
-        norm = (dx * dx + dy * dy) ** 0.5
-        if norm < 1e-9:
-            return  # ligne dégénérée : la validation la refuse, aucun sens à dessiner
-        # Normale unitaire : signe négatif de la distance signée dans ce sens,
-        # d'où le facteur `-sign_of_side` pour viser l'intérieur (voir geometry).
-        normal = (-dy / norm, dx / norm)
-        inside_sign = sign_of_side(self.inside_side)
-        mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
-        offset = 0.12 * min(canvas.shape[:2])
-
-        inside_point = (
-            int(round(mid[0] - inside_sign * normal[0] * offset)),
-            int(round(mid[1] - inside_sign * normal[1] * offset)),
-        )
-        outside_point = (
-            int(round(mid[0] + inside_sign * normal[0] * offset)),
-            int(round(mid[1] + inside_sign * normal[1] * offset)),
-        )
-        self._label(canvas, inside_point, f"INTERIEUR (IN, cote {self.inside_side})", (0, 255, 0))
-        self._label(canvas, outside_point, "EXTERIEUR (OUT)", (0, 165, 255))
-        cv2.arrowedLine(
-            canvas,
-            (int(round(mid[0])), int(round(mid[1]))),
-            inside_point,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-            tipLength=0.25,
-        )
-
-    @staticmethod
-    def _label(canvas: Any, point: Point, text: str, colour: tuple[int, int, int]) -> None:
-        safe_text = _clean_ascii(text)
-        height, width = canvas.shape[:2]
-        size, _ = cv2.getTextSize(safe_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        x = max(5, min(int(point[0]) - size[0] // 2, width - size[0] - 5))
-        y = max(size[1] + 5, min(int(point[1]), height - 5))
-        cv2.putText(
-            canvas, safe_text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA
-        )
-        cv2.putText(
-            canvas, safe_text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA
-        )
+        draw_inside_side(canvas, start, end, self.inside_side)
 
     def _draw_help(self, canvas: Any, width: int, height: int) -> None:
         lines = [
@@ -413,6 +369,109 @@ class LineSelection:
                 canvas, safe_text, (15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, active, 2, cv2.LINE_AA
             )
             y += 26
+
+
+def _draw_label(canvas: Any, point: Point, text: str, colour: tuple[int, int, int]) -> None:
+    safe_text = _clean_ascii(text)
+    height, width = canvas.shape[:2]
+    size, _ = cv2.getTextSize(safe_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    x = max(5, min(int(point[0]) - size[0] // 2, width - size[0] - 5))
+    y = max(size[1] + 5, min(int(point[1]), height - 5))
+    cv2.putText(
+        canvas, safe_text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA
+    )
+    cv2.putText(
+        canvas, safe_text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA
+    )
+
+
+def draw_inside_side(
+    canvas: Any, start: tuple[int, int], end: tuple[int, int], inside_side: str
+) -> None:
+    """Flèche vers l'intérieur et libellés INTERIEUR / EXTERIEUR (pixels entiers)."""
+    dx = float(end[0] - start[0])
+    dy = float(end[1] - start[1])
+    norm = (dx * dx + dy * dy) ** 0.5
+    if norm < 1e-9:
+        return  # ligne dégénérée : la validation la refuse, aucun sens à dessiner
+    # Normale unitaire : signe négatif de la distance signée dans ce sens,
+    # d'où le facteur `-sign_of_side` pour viser l'intérieur (voir geometry).
+    normal = (-dy / norm, dx / norm)
+    inside_sign = sign_of_side(inside_side)
+    mid = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+    offset = 0.12 * min(canvas.shape[:2])
+
+    inside_point = (
+        int(round(mid[0] - inside_sign * normal[0] * offset)),
+        int(round(mid[1] - inside_sign * normal[1] * offset)),
+    )
+    outside_point = (
+        int(round(mid[0] + inside_sign * normal[0] * offset)),
+        int(round(mid[1] + inside_sign * normal[1] * offset)),
+    )
+    _draw_label(canvas, inside_point, f"INTERIEUR (IN, cote {inside_side})", (0, 255, 0))
+    _draw_label(canvas, outside_point, "EXTERIEUR (OUT)", (0, 165, 255))
+    cv2.arrowedLine(
+        canvas,
+        (int(round(mid[0])), int(round(mid[1]))),
+        inside_point,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+        tipLength=0.25,
+    )
+
+
+def draw_dead_zone(
+    frame: Any, start: tuple[float, float], end: tuple[float, float], dead_zone_px: float | None
+) -> None:
+    """Bande translucide de la zone morte, de demi-largeur ``dead_zone_px``."""
+    if not dead_zone_px:
+        return
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = max(float(np.hypot(dx, dy)), 1.0)
+    nx, ny = dy / length, -dx / length
+    points = np.array(
+        [
+            [start[0] + nx * dead_zone_px, start[1] + ny * dead_zone_px],
+            [end[0] + nx * dead_zone_px, end[1] + ny * dead_zone_px],
+            [end[0] - nx * dead_zone_px, end[1] - ny * dead_zone_px],
+            [start[0] - nx * dead_zone_px, start[1] - ny * dead_zone_px],
+        ],
+        dtype=np.int32,
+    )
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [points], (0, 255, 255))
+    cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+
+
+def draw_line_overlay(frame: Any, line: Any, dead_zone_px: float | None) -> Any:
+    """Ligne, zone morte et flèche intérieur/extérieur : dessin **unique**.
+
+    Seul dessin de ces trois éléments, partagé par la fenêtre de traitement
+    OpenCV (``OccupancyManager.draw_overlay``), la vue web et la relecture :
+    les trois affichages sont donc identiques au pixel près. ``line`` expose
+    ``to_pixels(width, height)`` et ``inside_side`` (``VirtualLine`` ou
+    :class:`ValidatedLine`). Dessine en place et retourne ``frame``.
+    """
+    height, width = frame.shape[:2]
+    start, end = line.to_pixels(width, height)
+    cv2.line(
+        frame,
+        (int(start[0]), int(start[1])),
+        (int(end[0]), int(end[1])),
+        (0, 255, 0),
+        3,
+        cv2.LINE_AA,
+    )
+    draw_dead_zone(frame, start, end, dead_zone_px)
+    draw_inside_side(
+        frame,
+        (int(round(start[0])), int(round(start[1]))),
+        (int(round(end[0])), int(round(end[1]))),
+        line.inside_side,
+    )
+    return frame
 
 
 def mode_for_key(key: int) -> str | None:
@@ -467,6 +526,19 @@ def read_first_frame(source: int | str) -> Any:
     return frame
 
 
+def display_canvas(frame: Any, max_display_side: int = MAX_DISPLAY_SIDE) -> Any:
+    """Première image à la taille de la fenêtre de sélection (côté le plus long borné)."""
+    frame_height, frame_width = frame.shape[:2]
+    scale = min(1.0, float(max_display_side) / max(frame_width, frame_height))
+    if scale < 1.0:
+        return cv2.resize(
+            frame,
+            (int(frame_width * scale), int(frame_height * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    return frame.copy()
+
+
 def select_line(
     source: int | str,
     *,
@@ -503,15 +575,7 @@ def select_line(
             "définie manuellement, le comptage ne peut donc pas démarrer."
         )
 
-    scale = min(1.0, float(max_display_side) / max(frame_width, frame_height))
-    if scale < 1.0:
-        canvas = cv2.resize(
-            frame,
-            (int(frame_width * scale), int(frame_height * scale)),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        canvas = frame.copy()
+    canvas = display_canvas(frame, max_display_side)
     display_height, display_width = canvas.shape[:2]
 
     selection = LineSelection(

@@ -56,6 +56,7 @@ import numpy as np
 
 from anchor_stabilizer import AnchorStabilizer
 from bbox_height_locker import BBoxHeightLocker
+from calibration import draw_line_overlay
 from config import FrameBudget, PipelineConfig
 from events import EventSink
 from fsm import Action, Approach, Decision, FsmContext, StateMachine, TrackState
@@ -1765,18 +1766,7 @@ class OccupancyManager:
     # ------------------------------------------------------------------
     def draw_overlay(self, frame: np.ndarray) -> None:
         """Dessine la ligne, la zone morte relative, les boîtes et le HUD."""
-        height, width = frame.shape[:2]
-        if self.line is not None:
-            start, end = self.line.to_pixels(width, height)
-            cv2.line(
-                frame,
-                (int(start[0]), int(start[1])),
-                (int(end[0]), int(end[1])),
-                (0, 255, 0),
-                3,
-                cv2.LINE_AA,
-            )
-            self._draw_dead_zone(frame, start, end)
+        self.draw_line_overlay(frame)
 
         for view in self._views:
             color = STATE_COLORS.get(view.state, (255, 255, 255))
@@ -1804,27 +1794,18 @@ class OccupancyManager:
 
         self._draw_hud(frame)
 
-    def _draw_dead_zone(
-        self, frame: np.ndarray, start: tuple[float, float], end: tuple[float, float]
-    ) -> None:
-        dead_zone_px = self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
-        if not dead_zone_px:
-            return
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        length = max(float(np.hypot(dx, dy)), 1.0)
-        nx, ny = dy / length, -dx / length
-        points = np.array(
-            [
-                [start[0] + nx * dead_zone_px, start[1] + ny * dead_zone_px],
-                [end[0] + nx * dead_zone_px, end[1] + ny * dead_zone_px],
-                [end[0] - nx * dead_zone_px, end[1] - ny * dead_zone_px],
-                [start[0] - nx * dead_zone_px, start[1] - ny * dead_zone_px],
-            ],
-            dtype=np.int32,
-        )
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [points], (0, 255, 255))
-        cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+    def dead_zone_px(self) -> float | None:
+        """Demi-largeur courante de la zone morte, en pixels (``None`` sans échelle)."""
+        return self.scale.ratio_to_px(self.config.geometry.dead_zone_ratio)
+
+    def draw_line_overlay(self, frame: np.ndarray) -> None:
+        """Ligne, zone morte et flèche seules : même dessin que la vue web.
+
+        Délègue à :func:`calibration.draw_line_overlay`, dessin unique de ces
+        trois éléments (fenêtre OpenCV, vue web, relecture).
+        """
+        if self.line is not None:
+            draw_line_overlay(frame, self.line, self.dead_zone_px())
 
     def _draw_hud(self, frame: np.ndarray) -> None:
         _height, width = frame.shape[:2]

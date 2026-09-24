@@ -11,7 +11,7 @@
     ["Clic", "placer les deux extrémités de la ligne"],
     ["C", "valider la ligne et lancer le comptage"],
     ["G", "effacer la ligne et recommencer"],
-    ["I", "inverser le côté intérieur (la zone teintée)"],
+    ["I", "inverser le côté intérieur (sens de la flèche)"],
     ["Échap", "revenir à la question « ligne ou pas »"]
   ];
 
@@ -35,12 +35,27 @@
   /** Mode affiché discrètement dans la vue de démonstration. */
   function texteMode(sansLigne) { return sansLigne ? "Sans ligne" : "Avec ligne"; }
 
+  var ETATS = { en_cours: "En cours", termine: "Terminé", hors_ligne: "Connexion perdue" };
+  var ETATS_RELECTURE = { en_cours: "Relecture", termine: "Relecture terminée" };
+
+  /** État affiché ; en relecture, « Relecture » pour ne pas confondre avec le direct. */
+  function texteEtat(etat, relecture) {
+    return (relecture && ETATS_RELECTURE[etat]) || ETATS[etat] || etat;
+  }
+
+  var ETAPES = { chargement_modeles: "Chargement des modèles…", demarrage: "Démarrage du traitement…" };
+
+  /** Texte d'attente avant la première image traitée. */
+  function texteEtape(etape) { return ETAPES[etape] || ETAPES.demarrage; }
+
   var api = {
     AIDE: AIDE,
     NON_ASSIGNE: NON_ASSIGNE,
     actionPourTouche: actionPourTouche,
     texteCompteur: texteCompteur,
-    texteMode: texteMode
+    texteMode: texteMode,
+    texteEtat: texteEtat,
+    texteEtape: texteEtape
   };
   if (typeof module !== "undefined" && module.exports) { module.exports = api; }
   else { racine.Interface = api; }
